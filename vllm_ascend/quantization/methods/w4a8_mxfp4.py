@@ -192,6 +192,15 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             tid2eid=tid2eid,
         )
 
+        # Mirror the capture hook in fused_moe.py apply(): record the real
+        # (pre-load-balance-shuffle) topk ids when routed-experts return is on.
+        model_config = getattr(layer, "vllm_config", None)
+        model_config = model_config.model_config if model_config is not None else None
+        if model_config is not None and model_config.enable_return_routed_experts:
+            capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
+            if capturer is not None:
+                capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
+
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.

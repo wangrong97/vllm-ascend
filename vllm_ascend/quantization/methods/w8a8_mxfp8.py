@@ -191,6 +191,43 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         layer._mxfp8_transformed = False
 
 
+class AscendW8A8MXFP8DSWoADynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
+    """W8A8_MXFP8 linear method for DeepSeek-V4 ``wo_a`` loaded via ModelSlim.
+
+    The DSA attention impl consumes ``wo_a.weight`` directly through
+    ``npu_transpose_quant_batchmatmul``, which requires a grouped 3D weight
+    ``[n_local_groups, K, o_lora_rank]`` and a matching E8M0 scale
+    ``[n_local_groups, K // 64, o_lora_rank, 2]``. ModelSlim checkpoints store
+    the weight as 2D ``[n_groups * o_lora_rank, K]`` with per-32 E8M0 scales
+    ``[n_groups * o_lora_rank, K // 32]`` (already uint8, unlike the FP8
+    checkpoint's fp32 128x128 block scales), so on top of the generic MXFP8
+    post-processing this scheme only adds the grouped reshape.
+    """
+
+    def __init__(self):
+        super().__init__()
+        vllm_config = get_current_vllm_config()
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        hf_config = vllm_config.model_config.hf_config
+        self.n_local_groups = hf_config.o_groups // tp_size
+        self.o_lora_rank = hf_config.o_lora_rank
+
+    def process_weights_after_loading(self, layer):
+        # Generic 2D transforms: weight -> (K, G*R), scale -> (K//64, G*R, 2)
+        super().process_weights_after_loading(layer)
+        # weight: (K, G*R) -> (G, R, K) -> (G, K, R)
+        layer.weight.data = (
+            layer.weight.data.T.reshape(self.n_local_groups, self.o_lora_rank, -1).transpose(1, 2).contiguous()
+        )
+        # scale: (K//64, G*R, 2) -> (G, R, K//64, 2) -> (G, K//64, R, 2)
+        layer.weight_scale.data = (
+            layer.weight_scale.data.transpose(0, 1)
+            .reshape(self.n_local_groups, self.o_lora_rank, -1, 2)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+
 @register_scheme("W8A8_MXFP8", "moe")
 class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
     """FusedMoe method for Ascend W8A8_DYNAMIC."""

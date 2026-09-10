@@ -638,6 +638,20 @@ class AscendModelSlimConfig(QuantizationConfig):
 
                 logger.debug("Select AscendUnquantizedLinearMethod for %s (layer=%s)", prefix, "LinearBase")
                 return AscendUnquantizedLinearMethod()
+            # DeepSeek-V4's DSA attention consumes wo_a.weight directly via
+            # npu_transpose_quant_batchmatmul, which requires a grouped 3D
+            # [n_local_groups, K, o_lora_rank] layout. The generic W8A8_MXFP8
+            # scheme keeps the weight 2D, so use the wo_a-aware scheme instead.
+            if (
+                model_type == "deepseek_v4"
+                and prefix.endswith("wo_a")
+                and get_linear_quant_type(self.quant_description, prefix, self.packed_modules_mapping)
+                == "W8A8_MXFP8"
+            ):
+                from .methods.w8a8_mxfp8 import AscendW8A8MXFP8DSWoADynamicLinearMethod
+
+                logger.debug("Select AscendW8A8MXFP8DSWoADynamicLinearMethod for %s (layer=%s)", prefix, "LinearBase")
+                return AscendLinearMethod(AscendW8A8MXFP8DSWoADynamicLinearMethod())
             scheme = create_scheme_for_layer(self.quant_description, prefix, "linear", self.packed_modules_mapping)
             logger.debug("Select AscendLinearMethod for %s (layer=%s)", prefix, "LinearBase")
             return AscendLinearMethod(scheme)

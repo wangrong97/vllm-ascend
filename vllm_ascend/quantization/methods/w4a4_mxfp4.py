@@ -75,7 +75,7 @@ class AscendW4A4MXFP4DynamicLinearMethod(AscendLinearScheme):
         if x.dim() > 2:
             x = x.view(-1, x.shape[-1])
         quantized_x, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
-            x, dst_type=torch_npu.float4_e2m1fn_x2, round_mode="round"
+            x, dst_type=torch_npu.float4_e2m1fn_x2, round_mode="round", scale_alg=2, dst_type_max=7.25
         )
         pertoken_scale = dynamic_scale
         output_dtype = x.dtype
