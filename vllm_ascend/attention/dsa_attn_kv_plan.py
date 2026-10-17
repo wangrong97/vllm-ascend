@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import torch_npu
 
+from vllm_ascend.attention.dsa_kv_quant import kv_quant_sparse_attn, kv_quant_sparse_attn_metadata
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
@@ -173,8 +174,8 @@ def get_dsa_attn_kv_plan(vllm_config) -> DsaAttnKvPlan:
         layout_kv="PA_ND",
         compressor_slot_mapping_format=DSA_COMPRESSOR_SLOT_MAPPING_FLAT,
         requires_block_offset_slots=False,
-        sparse_attn_op=torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv,
-        sparse_attn_metadata_op=torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv_metadata,
+        sparse_attn_op=kv_quant_sparse_attn,
+        sparse_attn_metadata_op=kv_quant_sparse_attn_metadata,
         sparse_attn_base_kwargs={"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64},
         sparse_attn_metadata_kwargs={"kv_quant_mode": 1},
         include_metadata_device=False,

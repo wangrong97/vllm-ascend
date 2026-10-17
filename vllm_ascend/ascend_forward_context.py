@@ -330,12 +330,23 @@ def _select_a5_moe_comm_method(
     return MoECommType.ALLTOALL
 
 
+def gs32_ep_uses_allgather(vllm_config: VllmConfig) -> bool:
+    """GS32 retains replicated TP tokens and computes complete local experts."""
+    parallel = vllm_config.parallel_config
+    return (
+        getattr(vllm_config.model_config, "quantization", None) == "vq2a8"
+        and getattr(getattr(vllm_config, "quant_config", None), "is_gs32", False)
+        and parallel.enable_expert_parallel
+        and parallel.tensor_parallel_size > 1
+    )
+
+
 def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, and token count.
 
     1. Non-MoE models return `None`.
-    2. Without expert parallel, fall back to all-gather.
+    2. GS32 whole-expert EP and non-EP execution use all-gather.
     3. On A2 with expert parallel, pick MC2 when tokens fit the MC2 capacity
        and the DP size is large enough; otherwise use all-gather.
     4. On A3 with expert parallel, prefer fused MC2 when enabled and the EP
@@ -363,7 +374,12 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommT
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     soc_version = get_ascend_device_type()
     lora_config = getattr(vllm_config, "lora_config", None)
-    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
+    if gs32_ep_uses_allgather(vllm_config):
+        # MC2/AlltoAll use a different token partition and native weight ABI.
+        # ALLGATHER keeps TP-replicated inputs and filters local expert routes;
+        # the common MoE runner sums the partial expert outputs exactly once.
+        moe_comm_type = MoECommType.ALLGATHER
+    elif not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
     elif lora_config is not None and vllm_config.parallel_config.enable_expert_parallel:
         # LoRA + EP requires AlltoAll because the MC2/FusedMC2 paths

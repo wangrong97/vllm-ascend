@@ -464,7 +464,7 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         reshape_bf16_wo_a = (
             "wo_a" in self.prefix
             and supports_dynamic_mx_quant_fusion
-            and self.quant_config is None
+            and isinstance(self.quant_method, UnquantizedLinearMethod)
             and loaded_weight.dtype == torch.bfloat16
         )
         if "wo_a" in self.prefix and (not supports_dynamic_mx_quant_fusion or reshape_bf16_wo_a):

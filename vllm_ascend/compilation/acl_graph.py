@@ -55,6 +55,7 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    num_replays: int = 0
 
 
 class ACLGraphWrapper:
@@ -264,6 +265,7 @@ class ACLGraphWrapper:
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
+        entry.num_replays += 1
         return entry.output
 
 
