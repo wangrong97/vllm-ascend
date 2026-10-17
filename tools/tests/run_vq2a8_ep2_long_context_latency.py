@@ -97,23 +97,40 @@ def case_log(path):
             yield
 
 
+def write_json(path, record):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def save_case(directory, record):
-    (directory / f"{record['case']}.json").write_text(
-        json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    write_json(directory / f"{record['case']}.json", record)
 
 
-def measure_case(args, record, directory):
+def measure_case(args, record, directory, *, summary_prefix="LONG_CONTEXT_SUMMARY", on_update=None):
+    def save_progress():
+        save_case(directory, record)
+        if on_update is not None:
+            on_update()
+
     record["status"] = "running"
-    save_case(directory, record)
+    save_progress()
     with case_log(directory / f"{record['case']}.log"):
         try:
             for index in range(args.warmups):
-                bench.run_request(args, "WARMUP", index + 1, args.warmups)
+                record["active_request"] = {"phase": "warmup", "index": index + 1}
+                save_progress()
+                result = bench.run_request(args, "WARMUP", index + 1, args.warmups)
+                record.setdefault("warmup_requests", []).append(result)
+                del record["active_request"]
+                save_progress()
             for index in range(args.repeats):
+                record["active_request"] = {"phase": "request", "index": index + 1}
+                save_progress()
                 result = bench.run_request(args, "REQUEST", index + 1, args.repeats)
                 record["requests"].append(result)
-                save_case(directory, record)
+                del record["active_request"]
+                save_progress()
                 print(
                     f"CASE={record['case']} REQUEST={index + 1} "
                     f"TTFT_MS={result['ttft_ms']:.3f} TPOT_MS={result['tpot_ms']:.3f} "
@@ -125,7 +142,7 @@ def measure_case(args, record, directory):
                 for metric in ("ttft_ms", "tpot_ms")
             }
             record["status"] = "passed"
-            print("LONG_CONTEXT_SUMMARY=" + json.dumps(record["summary"]))
+            print(summary_prefix + "=" + json.dumps(record["summary"]))
         except (HTTPException, OSError, ValueError) as error:
             record.update(status="failed", error=str(error))
             print(f"CASE={record['case']} FAILED: {error}")
@@ -133,7 +150,7 @@ def measure_case(args, record, directory):
             record.update(status="interrupted", error="Interrupted by user")
             print(f"CASE={record['case']} INTERRUPTED")
         finally:
-            save_case(directory, record)
+            save_progress()
 
 
 def main(argv=None):

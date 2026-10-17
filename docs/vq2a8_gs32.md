@@ -122,6 +122,75 @@ not be reported as end-to-end TTFT improvement. The development branch's
 long-prefill performance regression remains unresolved; this migration does
 not claim a measured serving speedup or successful 1M acceptance.
 
+## One-command performance suite
+
+After starting the service, run the serving latency suite with one command:
+
+```bash
+python tools/tests/run_vq2a8_performance_suite.py \
+  --base-url http://127.0.0.1:8000 --model vq2a8 \
+  --suite standard --label mrv1-ep2-chunk8192-none \
+  --result-dir benchmark-results/performance
+```
+
+The client connects to the existing service and sends one request at a time.
+It does not start or restart workers. Select the runner, devices, chunk size,
+fusion and KV budget when launching the service. The label is your annotation;
+the client cannot verify these settings. Keep prefix caching disabled for
+these repeated synthetic prompts, and avoid other traffic during comparisons.
+
+| Suite | Cases, in execution order |
+| --- | --- |
+| `quick` | 128/127/129/224 input tokens, each with 32 output; then 128-to-128 |
+| `standard` (default) | `quick`, 64K-to-1K, 256K-to-1K, then short recovery |
+| `full` | `quick`, 64K-to-1K, 256K-to-1K, 1M-to-1K, then short recovery |
+
+Boundary cases use no warmup and two measured requests each. The 128-to-128
+case uses one warmup and ten measured requests. Long cases use no warmup and
+two measured requests. Recovery repeats 128-to-128 three times without a
+warmup, so its first request can expose latency left by the long workload.
+Recovery here checks completion and latency, not answer correctness.
+
+Every case is checked against the server's reported context capacity before
+any generation. If one preflight fails, this suite sends no generation
+requests and exits nonzero. It never shortens an input to fit. The standard
+suite requires at least **263168** context tokens; full requires **1049600**
+because `1m` means **1048576 input plus 1024 output tokens**. Enough reported
+context does not guarantee sufficient runtime memory or successful execution.
+The existing long-context-only entry point keeps its original behavior of
+running other valid cases even if one length fails preflight.
+
+Use `--check-only` for capacity checks without generation, or `--dry-run` for
+an offline plan without HTTP requests or result files. Select a subset or
+override request counts when needed:
+
+```bash
+python tools/tests/run_vq2a8_performance_suite.py --suite full --check-only
+python tools/tests/run_vq2a8_performance_suite.py \
+  --cases 128x128 256k recovery --warmups 0 --repeats 2 \
+  --label mrv2-ep2-chunk8192-none
+```
+
+The explicit `1m-window` case instead uses 1047552 input tokens plus 1024
+output tokens inside a 1048576-token window. It is never substituted for `1m`.
+`--timeout` controls each HTTP socket timeout, not a total suite deadline.
+
+Each invocation creates a unique result directory with `summary.json`,
+`summary.csv`, and per-case JSON and live logs. Reports retain individual
+warmup and measured requests; means and medians exclude warmups and are
+computed separately for each case. CSV `first_ttft_ms` is the first actual
+request of that case, including a warmup if configured. It does not establish
+a cold server or an empty compilation cache. `client_git_revision` identifies
+the benchmark checkout, not the server revision.
+
+TTFT and TPOT reuse the existing client-visible SSE timing implementation.
+TPOT uses reported completion token counts, not SSE chunk counts. Tokenization
+and prompt construction occur outside timed requests. Returned input/output
+counts must match exactly. A failed request stops subsequent generation and
+leaves the remaining cases marked `not_run`; incomplete cases have no success
+average. Ctrl+C saves partial results and returns 130. Closing the client
+connection does not prove the server has already cancelled its computation.
+
 ## Correctness and regression validation
 
 CPU contract tests can run without a vLLM installation or NPU initialization:
