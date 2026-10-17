@@ -193,6 +193,12 @@ connection does not prove the server has already cancelled its computation.
 
 ## Correctness and regression validation
 
+For model answer accuracy, use the separate
+[one-command GPQA Diamond / AIME24 / AIME25 evaluation suite](../tools/tests/README.evalscope.md).
+It supports dataset selection, offline dataset bundles, native per-question
+grading and JSON/CSV score summaries against an existing service. Numeric NPU
+regression, serving latency and benchmark answer accuracy are separate checks.
+
 CPU contract tests can run without a vLLM installation or NPU initialization:
 
 ```bash
