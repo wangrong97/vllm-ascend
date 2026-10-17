@@ -839,6 +839,16 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     activation_situ_beta = mlp_compute_input.activation_situ_beta
     activation_situ_linear_beta = mlp_compute_input.activation_situ_linear_beta
 
+    if mlp_compute_input.quant.quant_type == QuantType.VQ2A8:
+        vq2a8 = mlp_compute_input.weights.vq2a8
+        if vq2a8 is None:
+            raise ValueError("VQ2A8 expert payload is required.")
+        if dynamic_scale is not None or dynamic_eplb or mlp_compute_input.lora_context is not None:
+            raise ValueError("VQ2A8 requires BF16 dispatch without EPLB or LoRA.")
+        if getattr(activation, "value", activation) != "silu":
+            raise ValueError("VQ2A8 experts currently support silu activation only.")
+        return vq2a8.apply(hidden_states, group_list, group_list_type, swiglu_limit)
+
     if not mlp_compute_input.quant.is_quant:
         return unquant_apply_mlp(
             hidden_states=hidden_states,

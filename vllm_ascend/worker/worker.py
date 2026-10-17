@@ -776,6 +776,18 @@ class NPUWorker(WorkerBase):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size)
 
+        if (
+            self.model_config.quantization == "vq2a8"
+            and getattr(self.vllm_config.quant_config, "is_gs32", False)
+            and self.model_config.hf_text_config.model_type == "deepseek_v4"
+        ):
+            num_tokens = min(self.scheduler_config.max_num_batched_tokens, self.model_config.max_model_len)
+            # Every EP rank must execute this forward, including empty expert ranks.
+            with self.model_runner._gs32_prefill_warmup(num_tokens) as num_tokens:
+                logger.info("Warming up GS32 fresh prefill with %d tokens before graph capture.", num_tokens)
+                latency_ms = self.profile_prefill_latency(num_tokens)
+            logger.info("GS32 fresh prefill warmup finished in %.3fs.", latency_ms / 1000)
+
         from vllm_ascend.model_executor.warmup.kernel_warmup import kernel_warmup
 
         kernel_warmup(self)

@@ -100,6 +100,18 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--vq2a8-gs32-library", type=str, default=None, help="GS32 native Torch bridge .so")
     parser.addoption("--vq2a8-gs32-binary", type=str, default=None, help="GS32 mixed kernel ELF")
     parser.addoption(
+        "--vq2a8-gs32-ep-skip-single-card",
+        action="store_true",
+        default=False,
+        help="Skip the EP1 full-model reference when it cannot fit; retain same-EP eager/graph checks",
+    )
+    parser.addoption(
+        "--vq2a8-gs32-execution",
+        choices=("serial", "batched", "fused"),
+        default="serial",
+        help="GS32 full-model smoke execution mode",
+    )
+    parser.addoption(
         "--msa-m3-sparse-backend",
         action="store",
         default=os.environ.get("MINIMAX_M3_SPARSE_BACKEND", "all"),

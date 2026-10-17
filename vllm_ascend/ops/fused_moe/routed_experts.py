@@ -477,12 +477,16 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             topk_weights = torch.cat([topk_weights, shared_expert_weights], dim=1)
         # MXFP4 packs activations as uint8; skip the cast so topk_weights stays
         # fp32, which is what npu_moe_token_unpermute expects for its `probs` arg.
-        if hidden_states.dtype not in [torch.uint8, torch.float8_e4m3fn]:
+        if self.quant_type != QuantType.VQ2A8 and hidden_states.dtype not in [torch.uint8, torch.float8_e4m3fn]:
             topk_weights = topk_weights.to(hidden_states.dtype)
         # This is a naive implementation for experts load balance so as to
         # avoid accumulating too much tokens on a single rank. It is only
         # activated when doing profile runs.
-        if enable_force_load_balance:
+        if enable_force_load_balance and self.quant_type == QuantType.VQ2A8:
+            stored_ids = torch.tensor(self.vq2a8_expert_ids, device=topk_ids.device, dtype=topk_ids.dtype)
+            slots = torch.randint(len(self.vq2a8_expert_ids), topk_ids.shape, device=topk_ids.device)
+            topk_ids = stored_ids[slots]
+        elif enable_force_load_balance:
             random_matrix = torch.rand(
                 topk_ids.size(0),
                 num_logical_experts,

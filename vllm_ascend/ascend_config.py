@@ -1440,6 +1440,9 @@ def init_ascend_config(vllm_config):
         # Removed upstream option: warn above, but do not pass it into the
         # strict AscendConfig schema where it would be reported as a typo.
         "enable_flashcomm1",
+        # Quantization-owned options: preserve on VllmConfig for
+        # validate_vq2a8_config rather than passing to this platform schema.
+        "vq2a8",
         # injected fields (factory passes explicitly; a copy in additional_config would conflict)
         "scheduler_config",
         "sparse_kv_offload_config",

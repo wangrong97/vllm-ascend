@@ -27,6 +27,7 @@ import math
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -78,6 +79,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsv4_attn_kv_dtype
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -89,6 +91,7 @@ from vllm_ascend.models.deepseek_v4.indexer import DeepseekV4Indexer
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
+from vllm_ascend.quantization.methods.w2a8.vq2a8_gs32_format import parse_vq2a8_expert_name
 from vllm_ascend.utils import (
     enable_dsa_cp,
     extract_dsv4_layer_index,
@@ -292,7 +295,13 @@ class DeepseekV4MoE(nn.Module):
             raise ValueError(f"Unsupported activation: {config.hidden_act}. Only silu is supported for now.")
 
         self.gate = ReplicatedLinear(
-            config.hidden_size, config.n_routed_experts, bias=False, quant_config=None, prefix=f"{prefix}.gate"
+            config.hidden_size,
+            config.n_routed_experts,
+            bias=False,
+            quant_config=None,
+            # Preserve FP32 checkpoint routers before the usual post-load cast.
+            params_dtype=torch.float32 if quant_config is not None and quant_config.get_name() == "vq2a8" else None,
+            prefix=f"{prefix}.gate",
         )
         self.gate.precast_fp32_weight = True
 
@@ -359,6 +368,8 @@ class DeepseekV4MoE(nn.Module):
             # DeepSeek V4: normalize top-k weights, then scale routed output.
             # AITER applies routed_scaling_factor internally.
             routed_scaling_factor=self.routed_scaling_factor,
+            # VQ preserves BF16 expert rounding before scaling the routed sum.
+            apply_routed_scale_to_output=quant_config is not None and quant_config.get_name() == "vq2a8",
             swiglu_limit=self.swiglu_limit,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
@@ -1007,6 +1018,29 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        if quant_config is not None and quant_config.get_name() == "vq2a8":
+            # Schemes allocate FP8 roots and typed expert banks from the v3
+            # inventory, so bind it before constructing any model parameters.
+            quant_config.bind_checkpoint(vllm_config.model_config)
+            # DefaultModelLoader uses non-recursive glob and stops after its
+            # first matching pattern. One depth-aware pattern must find both
+            # rest/ and vq2_mixed_gs32/ before the standard index filter runs.
+            shard_depths = {len(Path(shard).parts) - 1 for shard in quant_config.weight_map.values()}
+            if len(shard_depths) != 1:
+                raise ValueError(
+                    "Source-v3 safetensors shards must use a uniform directory depth for the default vLLM loader."
+                )
+            self.allow_patterns_overrides = ["*/" * shard_depths.pop() + "*.safetensors"]
+
+        if getattr(quant_config, "is_gs32", False) or get_current_hardware_profile().supports(
+            HardwareCapability.DSV4_COMPRESSED_CACHE
+        ):
+            # A5 disables generic custom-op replacements; this model still
+            # needs its HC/attention bindings in each executing worker,
+            # including original checkpoints without GS32 quantization.
+            from vllm_ascend.models.deepseek_v4.native_ops import require_deepseek_v4_native_ops
+
+            require_deepseek_v4_native_ops()
 
         self.model = self.model_cls(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
@@ -1027,7 +1061,8 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
     def set_moe_parameters(self):
         self.expert_weights = []
 
-        self.num_expert_groups = getattr(self.config, "n_group", 1)
+        num_expert_groups = getattr(self.config, "n_group", None)
+        self.num_expert_groups = 1 if num_expert_groups is None else num_expert_groups
 
         self.moe_layers = []
         self.moe_mlp_layers = []
@@ -1087,7 +1122,133 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model._set_aux_hidden_state_layers(layers)
 
+    def _prepare_vq2a8_root(self, param, value, name, spec):
+        dtypes = {
+            "BF16": torch.bfloat16,
+            "F32": torch.float32,
+            "I64": torch.int64,
+            "F8_E4M3": torch.float8_e4m3fn,
+            "F8_E8M0": torch.float8_e8m0fnu,
+        }
+        if value.dtype != dtypes.get(spec["dtype"]) or tuple(value.shape) != tuple(spec["shape"]):
+            raise ValueError(f"Source-v3 root tensor disagrees with its header: {spec['source_name']}.")
+        if name.endswith(".weight_scale"):
+            if value.dtype not in (torch.float8_e8m0fnu, torch.float32) or param.dtype != torch.float32:
+                raise ValueError(f"Invalid source-v3 FP8 block scale {name}.")
+            # Convert scale *values*, not raw exponent bytes. DS's existing
+            # post-load transform recovers the exponent and expands block128
+            # scales to K32. The E4M3 weight itself is never dequantized here.
+            value = value.to(torch.float32)
+            mantissa, _ = torch.frexp(value)
+            if not bool((torch.isfinite(value) & (value > 0) & (mantissa == 0.5)).all()):
+                raise ValueError(f"Source-v3 FP8 scale must contain finite positive powers of two: {name}.")
+        if name.endswith(".gate.tid2eid"):
+            layer_index = int(name.split(".")[2])
+            inventory = value.new_tensor(self.quant_config.layer_spec(layer_index).expert_ids)
+            if param.dtype not in (torch.int32, torch.int64) or not bool(torch.isin(value, inventory).all()):
+                raise ValueError(f"Hash table {name} refers to an invalid source-v3 expert.")
+            return value.to(param.dtype)
+        if (
+            value.dtype == torch.float32
+            and param.dtype == torch.bfloat16
+            and name.endswith(
+                (
+                    ".norm.weight",
+                    ".q_norm.weight",
+                    ".kv_norm.weight",
+                    ".input_layernorm.weight",
+                    ".post_attention_layernorm.weight",
+                )
+            )
+        ):
+            # Keep the Parameter and its TP loader attributes intact.
+            param.data = param.data.float()
+        if value.dtype != param.dtype and not (
+            value.dtype == torch.bfloat16
+            and param.dtype == torch.float32
+            and (".gate." in name or ".compressor.norm." in name)
+        ):
+            raise ValueError(f"Unsupported source-v3 root dtype conversion for {name}.")
+        return value
+
+    def _load_vq2a8_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params = dict(self.named_parameters())
+        expert_layers = {}
+        for layer_index, decoder in enumerate(self.model.layers):
+            experts = decoder.mlp.experts
+            routed = getattr(experts, "routed_experts", experts)
+            prefix = f"model.layers.{layer_index}.mlp.experts"
+            if routed is not experts:
+                prefix += ".routed_experts"
+            expert_layers[layer_index] = (prefix, routed, routed.quant_method.quant_method)
+
+        loaded_params: set[str] = set()
+        loaded_sources: set[str] = set()
+        root_shards: dict[int, set[int | None]] = {}
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        heads_per_rank = self.config.num_attention_heads // tp_size
+        for source_name, value in weights:
+            if source_name not in self.quant_config.weight_map:
+                raise ValueError(f"Unknown source-v3 checkpoint tensor {source_name}.")
+            if source_name in loaded_sources:
+                raise ValueError(f"Duplicate source-v3 tensor {source_name}.")
+            loaded_sources.add(source_name)
+            expert = parse_vq2a8_expert_name(source_name)
+            if expert is not None:
+                layer_index, expert_id, projection, field = expert
+                if layer_index not in expert_layers:
+                    raise ValueError(f"Unknown source-v3 expert layer {layer_index}.")
+                _, layer, scheme = expert_layers[layer_index]
+                if scheme.is_local_expert(expert_id):
+                    if not scheme.load_expert_tensor(layer, expert_id, projection, field, value):
+                        raise ValueError(f"Failed to load local source-v3 expert tensor {source_name}.")
+                continue
+
+            spec = self.quant_config.root_tensor_spec(source_name)
+            name = self.quant_config.normalize_root_name(source_name)
+            shard_id = None
+            for projection, shard in (("gate_proj", 0), ("up_proj", 1)):
+                fragment = f".shared_experts.{projection}."
+                if fragment in name:
+                    name = name.replace(fragment, ".shared_experts.gate_up_proj.")
+                    shard_id = shard
+                    break
+            if name not in params:
+                raise ValueError(f"Source-v3 root has no model parameter: {source_name} -> {name}.")
+            param = params[name]
+            shards = root_shards.setdefault(id(param), set())
+            if shard_id in shards or None in shards or shard_id is None and shards:
+                raise ValueError(f"Duplicate source-v3 root parameter {name}.")
+            value = self._prepare_vq2a8_root(param, value, name, spec)
+            if name.endswith(".attn_sink"):
+                param.data.copy_(value.narrow(0, tp_rank * heads_per_rank, heads_per_rank))
+            else:
+                loader = getattr(param, "weight_loader", default_weight_loader)
+                if shard_id is None:
+                    loader(param, value)
+                else:
+                    loader(param, value, shard_id)
+            shards.add(shard_id)
+            loaded_params.add(name)
+
+        for prefix, layer, scheme in expert_layers.values():
+            loaded_params.update(f"{prefix}.{name}" for name in scheme.validate_loaded(layer))
+        missing = set(params) - loaded_params
+        missing.update(
+            name for name, param in params.items() if id(param) in root_shards and root_shards[id(param)] == {0}
+        )
+        missing.update(
+            name for name, param in params.items() if id(param) in root_shards and root_shards[id(param)] == {1}
+        )
+        missing.update(set(self.quant_config.weight_map) - loaded_sources)
+        if missing:
+            raise ValueError(f"Incomplete source-v3 checkpoint: {sorted(missing)}.")
+        return loaded_params
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self.quant_config is not None and self.quant_config.get_name() == "vq2a8":
+            return self._load_vq2a8_weights(weights)
         rocm_aiter_moe_shared_expert_enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         rocm_aiter_moe_shared_expert_enabled = getattr(get_ascend_config(), "mix_placement", False)
         stacked_params_mapping = [

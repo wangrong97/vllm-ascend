@@ -122,14 +122,14 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 input_ids = None
                 tid2eid_ones = None
             topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
-                x=router_logits,
+                x=router_logits.float(),
                 k=self.top_k,
                 bias=self.e_score_correction_bias,
                 input_ids=input_ids,
                 tid2eid=tid2eid_ones,
                 k_group=topk_group,
                 group_count=num_expert_group,
-                routed_scaling_factor=self.routed_scaling_factor,
+                routed_scaling_factor=1.0,
                 eps=1e-20,
                 group_select_mode=1,
                 # The hash custom op currently rejects renorm != 0. Apply
@@ -138,7 +138,8 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 norm_type=2,
                 out_flag=False,
             )
-            return topk_weights, topk_ids
+            topk_weights = self._renormalize_topk_weights(topk_weights.float())
+            return topk_weights * self.routed_scaling_factor, topk_ids
         norm_type = 0 if self.scoring_func == "softmax" else 1
         if self.e_score_correction_bias is not None and self.e_score_correction_bias.dtype != router_logits.dtype:
             self.e_score_correction_bias = self.e_score_correction_bias.to(router_logits.dtype)

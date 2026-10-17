@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -26,6 +26,9 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEQuantParams, build_quant_params
 from vllm_ascend.ops.fused_moe.dataclass.router_input import MoeRouterInput
 from vllm_ascend.quantization.quant_type import QuantType
+
+if TYPE_CHECKING:
+    from vllm_ascend.ops.fused_moe.vq2a8_gs32 import GS32ExpertWeights
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +45,7 @@ class MoEWeights:
     w2_scale_bias: torch.Tensor | list[torch.Tensor] | None = None
     w1_offset: torch.Tensor | None = None
     w2_offset: torch.Tensor | None = None
+    vq2a8: GS32ExpertWeights | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +99,7 @@ def build_fused_experts_input(
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
     lora_context=None,
+    vq2a8: GS32ExpertWeights | None = None,
 ) -> MoEFusedExpertsInput:
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
@@ -111,6 +116,7 @@ def build_fused_experts_input(
             w2_scale_bias=w2_scale_bias,
             w1_offset=w1_offset,
             w2_offset=w2_offset,
+            vq2a8=vq2a8,
         ),
         routing=MoeRouterInput(
             expert_map=expert_map,

@@ -103,6 +103,7 @@ class NPUPlatform(Platform):
         "deepseek_v4_fp8",
         "modelopt_mxfp8",
         "mxfp8",
+        "vq2a8",
     ]
 
     @property
@@ -303,8 +304,9 @@ class NPUPlatform(Platform):
         if parser is not None:
             quant_action = parser._option_string_actions.get("--quantization")
             if quant_action and hasattr(quant_action, "choices") and quant_action.choices:
-                if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
-                    quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
+                for method in (ASCEND_QUANTIZATION_METHOD, "vq2a8"):
+                    if method not in quant_action.choices:
+                        quant_action.choices.append(method)
 
         if get_current_hardware_profile().quantization_backend_family is QuantizationBackendFamily.STANDARD:
             from vllm_ascend.quantization import (  # noqa: F401
@@ -312,6 +314,7 @@ class NPUPlatform(Platform):
                 AscendFp8Config,
                 AscendModelOptMxFp8Config,
                 AscendModelSlimConfig,
+                AscendVQ2A8Config,
             )
         else:
             from vllm_ascend._310p.quantization import AscendModelSlimConfig310  # noqa: F401
