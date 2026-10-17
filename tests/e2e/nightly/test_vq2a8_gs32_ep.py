@@ -89,14 +89,40 @@ def runner_options(execution, library, binary, ep_size):
     return options
 
 
-class GS32EPWorkerExtension:
-    """Named worker RPCs inspect all ranks without adding model hot-path hooks."""
+class _ReplayCounter:
+    """Test-only graph proxy counting successful replay submissions, never captures."""
 
-    def vq2a8_gs32_ep_state(self):
-        from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+    def __init__(self, graph):
+        self.graph = graph
+        self.num_replays = 0
 
-        runner = self.model_runner
-        state = {name: {"captures": 0, "replays": 0} for name in ("prefill", "decode", "other")}
+    def replay(self, *args, **kwargs):
+        result = self.graph.replay(*args, **kwargs)
+        self.num_replays += 1
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self.graph, name)
+
+
+def _runner_graph_state(runner):
+    runner_class = type(runner)
+    runner_name = f"{runner_class.__module__}.{runner_class.__name__}"
+    use_v2 = any(cls.__module__ == "vllm_ascend.worker.v2.model_runner" for cls in runner_class.__mro__)
+    state = {name: {"captures": 0, "replays": 0} for name in ("prefill", "decode", "other")}
+    if use_v2:
+        # V2 owns graphs on its manager rather than the model wrapper. Install
+        # counters once, after capture and before this probe's first request.
+        # Upstream run_fullgraph invokes graphs[descriptor].replay() directly.
+        manager = runner.cudagraph_manager
+        for descriptor, graph in manager.graphs.items():
+            assert callable(getattr(graph, "replay", None)), "Unsupported V2 graph entry: cannot verify replay."
+            if not isinstance(graph, _ReplayCounter):
+                graph = manager.graphs[descriptor] = _ReplayCounter(graph)
+            phase = "decode" if descriptor.num_tokens == 1 else "other"
+            state[phase]["captures"] += 1
+            state[phase]["replays"] += graph.num_replays
+    else:
         for entry in getattr(runner.model, "concrete_aclgraph_entries", {}).values():
             if entry.aclgraph is None:
                 continue
@@ -104,6 +130,18 @@ class GS32EPWorkerExtension:
             phase = "prefill" if tokens == 32 else "decode" if tokens == 1 else "other"
             state[phase]["captures"] += 1
             state[phase]["replays"] += entry.num_replays
+    state.update(model_runner=runner_name, model_runner_version=2 if use_v2 else 1)
+    return state
+
+
+class GS32EPWorkerExtension:
+    """Named test RPCs inspect all ranks and count actual graph replay submissions."""
+
+    def vq2a8_gs32_ep_state(self):
+        from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+        runner = self.model_runner
+        state = _runner_graph_state(runner)
         state.update(
             rank=get_tensor_model_parallel_rank(),
             ep_size=get_tensor_model_parallel_world_size(),

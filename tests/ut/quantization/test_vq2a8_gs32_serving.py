@@ -191,8 +191,9 @@ def server_assets(tmp_path):
     ],
 )
 @pytest.mark.parametrize("ep_size", [1, 2])
+@pytest.mark.parametrize("use_v2_model_runner", [False, True])
 def test_scheduler_budget_controls_prefill_without_changing_decode_graph(
-    modules, server_assets, context, budget, expected, chunked, ep_size
+    modules, server_assets, context, budget, expected, chunked, ep_size, use_v2_model_runner
 ):
     arguments = server_assets + [
         "--gs32-execution",
@@ -214,6 +215,7 @@ def test_scheduler_budget_controls_prefill_without_changing_decode_graph(
     assert compilation["cudagraph_capture_sizes"] == [1]
     assert compilation["max_cudagraph_capture_size"] == 1
     runtime = runtime_config_from_command(command)
+    runtime.use_v2_model_runner = use_v2_model_runner
     assert modules.config.validate_vq2a8_config(runtime) == runtime.additional_config["vq2a8"]
 
 

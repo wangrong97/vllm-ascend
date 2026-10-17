@@ -3044,52 +3044,15 @@ class NPUModelRunner(GPUModelRunner):
             )
 
     def _initialize_quantization_validity(self) -> None:
-        """Bind GS32 layer status outside the full-model graph's memory pool."""
-        self._quantization_validity = None
-        self._quantization_validity_buffers = ()
-        options = (self.vllm_config.additional_config or {}).get("vq2a8", {})
-        if (
-            self.model_config.quantization != "vq2a8"
-            or not getattr(self.vllm_config.quant_config, "is_gs32", False)
-            or options.get("gs32_execution", "serial") != "full_graph"
-        ):
-            return
-        if (
-            self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            and breakable_cudagraph.is_breakable_cudagraph_enabled()
-        ):
-            raise ValueError("GS32 full decode graphs require VLLM_USE_BREAKABLE_CUDAGRAPH=0.")
-        states = {}
-        for module in self.model.modules():
-            weights = getattr(module, "vq2a8_weights", None)
-            if weights is None:
-                continue
-            index = module.vq2a8_layer_index
-            if index in states and states[index] is not weights:
-                raise RuntimeError(f"Duplicate quantization validity owner for layer {index}.")
-            states[index] = weights
-        if set(states) != set(self.vllm_config.quant_config.layers):
-            raise RuntimeError("Quantization validity must cover every configured expert layer.")
-        owners = tuple(states[index] for index in sorted(states))
-        if len({id(weights) for weights in owners}) != len(owners):
-            raise RuntimeError("Quantization validity owners must be distinct for each expert layer.")
-        for weights in owners:
-            flag = weights.validity_buffer
-            if (
-                not isinstance(flag, torch.Tensor)
-                or flag.dtype != torch.bool
-                or flag.shape != ()
-                or flag.device != self.device
-            ):
-                raise RuntimeError("Quantization validity requires a device-resident boolean scalar per layer.")
-        # Validate the complete inventory before changing any owner. Every
-        # captured layer writes one stable view; zero_ below detects missed
-        # writes rather than reusing success from a previous request.
-        self._quantization_validity = torch.zeros(len(owners), dtype=torch.bool, device=self.device)
-        self._quantization_validity_buffers = self._quantization_validity.unbind()
-        for weights, flag in zip(owners, self._quantization_validity_buffers):
-            weights.validity_buffer = flag
-            weights.defer_validity = True
+        from vllm_ascend.ops.fused_moe.vq2a8_gs32 import initialize_quantization_validity
+
+        initialize_quantization_validity(
+            self,
+            breakable=(
+                self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                and breakable_cudagraph.is_breakable_cudagraph_enabled()
+            ),
+        )
 
     def _model_forward(
         self,
@@ -3135,11 +3098,11 @@ class NPUModelRunner(GPUModelRunner):
         return hidden_states
 
     def _check_quantization_validity(self) -> None:
-        validity = getattr(self, "_quantization_validity", None)
-        if validity is not None:
+        from vllm_ascend.ops.fused_moe.vq2a8_gs32 import check_quantization_validity
+
+        if getattr(self, "_quantization_validity", None) is not None:
             with record_function_or_nullcontext("quantization validity"):
-                if not bool(validity.all()):
-                    raise RuntimeError("Quantized expert forward failed validity checks.")
+                check_quantization_validity(self)
 
     def _compute_logits(
         self, hidden_states: torch.Tensor, *, check_quantization_validity: bool = False

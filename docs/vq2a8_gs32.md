@@ -6,10 +6,10 @@ registry. Each routed expert projection independently selects VQ2 or MXFP4.
 Attention, shared experts and other model components retain their checkpoint
 dtypes and use the ordinary model implementation.
 
-The initial integration targets DeepSeek-V4 on Ascend950 with Model Runner V1.
-It was extracted from development commit `592a69733`; the runtime behavior is
-based on `0a8761f07`. The migration excludes the experimental fixed I32 prefill
-graph and the separate Model Runner V2 adaptation.
+The integration targets DeepSeek-V4 on Ascend950 with Model Runner V1 or V2.
+It was extracted from development commit `592a69733`; the framework behavior
+is based on `0a8761f07`, with the V2 adaptation from `d4b4e6157`. The migration
+excludes the experimental fixed I32 prefill graph.
 
 ## Supported execution
 
@@ -163,3 +163,53 @@ compares against a single-card reference; use
 Same-topology eager/decode-graph comparisons remain required. Validate both
 EP ranks, all mixed projection pairs, empty experts, padded rows, group-list
 counts and prefixes, nondefault streams, and invalid-input recovery.
+
+## Model Runner V2
+
+Select V2 with the existing upstream `VLLM_USE_V2_MODEL_RUNNER=1` environment
+variable before starting the process. Set it to `0` to run the V1 comparison.
+The launchers preserve this choice; the integration does not change the
+upstream default or introduce a new runner-selection flag. Both runners use
+the same checkpoint, native artifacts and GS32 execution options. In
+`full_graph` mode, prefill still runs eagerly and only B1 decode is captured.
+
+The runners share validity ownership: each expert layer writes a stable
+device status view, and one aggregate check rejects invalid output before
+sampling. V2 resets these views before each forward, checks generation after
+LM Head submission, and checks dummy/profile forwards before returning.
+An interrupted GS32 forward clears its pending state so a later sampling
+call cannot consume a partial result. Capture warmups validate output outside
+capture; captured execution records device writes without a host read.
+
+V2 reuses the worker's existing startup prefill entry point. It temporarily
+borrows non-null KV pages while the runner is idle, forces eager execution,
+and restores the borrowed pages, input buffers, block tables and attention
+metadata on both success and failure. This avoids leaving startup data in
+the first real request's buffers. No extra per-layer device-to-host check is
+added to the serving path.
+
+Run the same-topology eager/decode-graph comparison above with
+`VLLM_USE_V2_MODEL_RUNNER=1`. Then verify the actual runner and decode replay
+on every rank across short, 16K and recovery requests:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=4,5 VLLM_USE_V2_MODEL_RUNNER=1 \
+python -m pytest -vv -s -x \
+  tests/e2e/nightly/test_vq2a8_gs32_ep_long_context.py -k ep2 \
+  --vq2a8-model "$MODEL" \
+  --vq2a8-gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
+  --vq2a8-gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o"
+```
+
+The report includes each worker's runner class, validity-owner count and
+actual decode replay count. V2 replay counters are installed only by the
+test RPC; they are not production hooks. A configuration claiming V2 while
+running V1 fails this probe.
+
+For latency comparisons, restart the service command above with V2 selected,
+then repeat the short 128-to-128 and 256K-to-1024 commands with otherwise
+identical settings. Compare startup, first-request TTFT and steady-state
+TTFT/TPOT separately. Local CPU tests cover lifecycle and failure contracts;
+NPU compilation, graph execution, numerical parity and serving performance
+must be validated on the target stack. This adaptation makes no measured
+speedup claim and does not resolve the recorded long-prefill regression.

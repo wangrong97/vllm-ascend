@@ -32,8 +32,10 @@ def test_gs32_ep_config_accepts_whole_expert_parallelism(modules, size):
 
 
 @pytest.mark.parametrize("size", [2, 4, 8])
-def test_gs32_ep_long_context_uses_existing_eager_config(modules, size):
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_gs32_ep_long_context_uses_existing_eager_config(modules, size, use_v2):
     config = ep_config(size)
+    config.use_v2_model_runner = use_v2
     config.additional_config["vq2a8"]["gs32_execution"] = "fused"
     config.model_config.enforce_eager = True
     config.model_config.max_model_len = 17408
@@ -47,8 +49,10 @@ def test_gs32_ep_long_context_uses_existing_eager_config(modules, size):
 @pytest.mark.parametrize(
     "fault", ["tp_only", "dp", "pp", "cp", "size", "uneven", "round_robin", "eplb", "sp", "shared_dp", "dsa_cp"]
 )
-def test_gs32_ep_config_rejects_incompatible_parallel_layouts(modules, fault):
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_gs32_ep_config_rejects_incompatible_parallel_layouts(modules, fault, use_v2):
     config = ep_config(4)
+    config.use_v2_model_runner = use_v2
     parallel = config.parallel_config
     if fault == "tp_only":
         parallel.enable_expert_parallel = False
@@ -132,8 +136,10 @@ def test_gs32_ep_rejects_indirect_expert_remapping(modules, field, value):
 
 @pytest.mark.parametrize("size", [2, 4, 8])
 @pytest.mark.parametrize("budget", [128, 4096, 8192, 98304])
-def test_gs32_ep_long_context_reuses_b1_decode_graph(modules, size, budget):
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_gs32_ep_long_context_reuses_b1_decode_graph(modules, size, budget, use_v2):
     config = long_graph_config()
+    config.use_v2_model_runner = use_v2
     config.model_config.max_model_len = 263168
     config.scheduler_config.max_num_batched_tokens = budget
     config.model_config.hf_config.n_routed_experts = 256
@@ -203,3 +209,15 @@ def test_long_context_probe_requires_each_rank_to_replay_decode(long_context_pro
             long_context_probe.check_graph_progress(before, after, 1, 1024)
     else:
         long_context_probe.check_graph_progress(before, after, 1, 1024)
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_long_context_probe_requires_requested_runner_on_every_rank(long_context_probe, version):
+    states = [
+        {"rank": rank, "model_runner_version": version, "model_runner": f"runner_v{version}.NPUModelRunner"}
+        for rank in (0, 1)
+    ]
+    long_context_probe.check_runner_selection(states, version)
+    states[-1]["model_runner_version"] = 3 - version
+    with pytest.raises(AssertionError, match="Rank 1 selected"):
+        long_context_probe.check_runner_selection(states, version)

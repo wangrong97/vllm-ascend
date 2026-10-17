@@ -34,8 +34,10 @@ def graph_config():
 
 
 @pytest.mark.parametrize("fusion", ["none", "swiglu_quant"])
-def test_gs32_full_graph_requires_explicit_decode_graph_scope(modules, fusion):
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_gs32_full_graph_requires_explicit_decode_graph_scope(modules, fusion, use_v2):
     config = graph_config()
+    config.use_v2_model_runner = use_v2
     config.additional_config["vq2a8"]["gs32_fusion"] = fusion
     assert modules.config.validate_vq2a8_config(config) == config.additional_config["vq2a8"]
 
@@ -59,8 +61,10 @@ def test_gs32_full_graph_requires_explicit_decode_graph_scope(modules, fusion):
         "fused",
     ],
 )
-def test_gs32_graph_rejects_unvalidated_execution_before_weight_allocation(modules, fault):
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_gs32_graph_rejects_unvalidated_execution_before_weight_allocation(modules, fault, use_v2):
     config = graph_config()
+    config.use_v2_model_runner = use_v2
     compilation = config.compilation_config
     if fault == "eager":
         config.model_config.enforce_eager = True
@@ -106,8 +110,10 @@ def long_graph_config():
 
 @pytest.mark.parametrize("context", [129, 17408, 263168, 1049600])
 @pytest.mark.parametrize("budget", [1, 128, 129, 4096, 8192, 98304])
-def test_gs32_long_context_keeps_decode_capture_shape_bounded(modules, context, budget):
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_gs32_long_context_keeps_decode_capture_shape_bounded(modules, context, budget, use_v2):
     config = long_graph_config()
+    config.use_v2_model_runner = use_v2
     config.model_config.max_model_len = context
     config.scheduler_config.max_num_batched_tokens = budget
     assert modules.config.validate_vq2a8_config(config) == config.additional_config["vq2a8"]
