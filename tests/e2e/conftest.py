@@ -95,6 +95,11 @@ _LONG_PROMPTS = [os.path.join(_TEST_DIR, "prompts", "long_prompt.txt")]
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
+        "--vq2a8-model", type=str, default=None, help="Source-v3 mixed GS32 checkpoint for opt-in Ascend950 tests"
+    )
+    parser.addoption("--vq2a8-gs32-library", type=str, default=None, help="GS32 native Torch bridge .so")
+    parser.addoption("--vq2a8-gs32-binary", type=str, default=None, help="GS32 mixed kernel ELF")
+    parser.addoption(
         "--msa-m3-sparse-backend",
         action="store",
         default=os.environ.get("MINIMAX_M3_SPARSE_BACKEND", "all"),
