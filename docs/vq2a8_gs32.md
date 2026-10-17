@@ -199,6 +199,77 @@ It supports dataset selection, offline dataset bundles, native per-question
 grading and JSON/CSV score summaries against an existing service. Numeric NPU
 regression, serving latency and benchmark answer accuracy are separate checks.
 
+### One-command NPU regression
+
+The NPU CI driver reuses the existing nightly tests and starts each stage in
+an isolated process. Run it on an idle Linux Ascend950 host with the source-v3
+checkpoint, the rebuilt GS32 artifacts, and the complete `vllm_ascend_C`
+extension (including SAS/QLI metadata operators). The tests load their own
+models; they do not use an HTTP server. Stop serving on the selected cards
+before running this suite.
+
+```bash
+python tools/tests/run_vq2a8_npu_ci.py \
+  --devices 4,5 \
+  --model "$MODEL" \
+  --gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
+  --gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o" \
+  --suite pr \
+  --result-dir benchmark-results/npu-ci
+```
+
+| Suite | Devices | Coverage |
+| --- | --- | --- |
+| `kernels` | Exactly one, e.g. `--devices 4` | Nine component test files: activation, async validity, routes, native/grouped projections, mixed banks/FFN, EP bank geometry and attention |
+| `pr` (default) | Exactly two | Components, then real EP2 eager/decode-graph comparison under both MRV1 and MRV2 |
+| `nightly` | Exactly two | PR coverage plus short/16K/short decode-graph replay and recovery under both runners |
+
+The component stage includes large-M boundaries, both local EP2 rank banks
+at 4096/8192 tokens, and both activation fusion settings where parameterized
+by the existing tests. Local EP-shaped tests do not execute HCCL; the separate
+EP2 model stage checks actual dispatch/combine/collectives and expert ownership.
+Running both runners checks each against its own eager reference, not direct
+V1-versus-V2 numerical parity. `--model-runners v1` or `--model-runners v2`
+selects one runner for a focused run. The recovery probe checks each worker's
+actual runner class and decode replay count, using its existing 128-token
+prefill chunks; it is not 256K/1M acceptance.
+
+By default the EP2 test omits its optional EP1 full-model reference because
+the checkpoint may not fit on one card. The same-topology EP2 eager/graph
+comparison remains mandatory. Add `--single-card-reference` only when the
+entire reference model fits on one card. The summary records this coverage
+choice explicitly; EP1-only model tests are not run by default.
+
+Add `--dry-run` to print the commands and device/runner assignments without
+initializing an NPU or creating result files. Normal runs produce a unique
+directory containing `summary.json`, `environment.log`, per-stage logs and
+JUnit XML, and retained pytest temporary directories with model subprocess
+logs/reports. Each stage prints its log path; use `tail -f` on that file to
+watch detailed progress. The summary records the checkout commit, commands,
+selected environment overrides, test counts, elapsed time and result status.
+
+Exit zero requires every selected stage to execute at least one test with
+no failures, errors, skipped cases or expected failures. Missing quantization
+pairs in a checkpoint therefore prevent complete CI acceptance, even if
+pytest would normally skip those cases. Inspect the JUnit skip reasons and
+use a checkpoint covering all required pairs. Failures stop later stages,
+which remain `not_run`. Missing/malformed JUnit reports also fail the run.
+Timeout or cancellation cleans up the stage's owned process group; Ctrl+C
+and SIGTERM save the partial report and return 130. `--timeout` defaults to
+7200 seconds per stage; existing model probes retain their own shorter
+1800-second child-process timeout.
+
+The command is suitable as a job step on a private NPU CI runner; archive
+the unique result directory and use the process exit code as the job result.
+No GitHub-triggered NPU job or self-hosted runner registration is installed
+by this script. If piping output to `tee`, enable `set -o pipefail` so shell
+pipelines preserve failures. Existing component timing records stay in the
+logs, but there is no automatic timing regression threshold. Use the serving
+performance suite separately for TTFT/TPOT and compare equivalent hardware,
+artifacts, runner, chunk size and fusion settings.
+
+### Individual test entry points
+
 CPU contract tests can run without a vLLM installation or NPU initialization:
 
 ```bash
