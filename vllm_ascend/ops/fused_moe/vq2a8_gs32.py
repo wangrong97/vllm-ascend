@@ -18,6 +18,59 @@ MAX_GROUPED_EXPERTS = 256  # Imported mixed kernel host validation limit.
 MAX_GRAPH_ROUTED_ROWS = 8  # B1 decode with up to eight routed experts.
 
 
+def initialize_quantization_validity(runner, *, breakable=False):
+    """Bind every GS32 layer to status storage shared by either model runner."""
+    runner._quantization_validity = None
+    runner._quantization_validity_buffers = ()
+    config = runner.vllm_config
+    options = (config.additional_config or {}).get("vq2a8", {})
+    if (
+        runner.model_config.quantization != "vq2a8"
+        or not getattr(config.quant_config, "is_gs32", False)
+        or options.get("gs32_execution", "serial") != "full_graph"
+    ):
+        return
+    if breakable:
+        raise ValueError("GS32 full decode graphs require VLLM_USE_BREAKABLE_CUDAGRAPH=0.")
+    states = {}
+    for module in runner.model.modules():
+        weights = getattr(module, "vq2a8_weights", None)
+        if weights is None:
+            continue
+        index = module.vq2a8_layer_index
+        if index in states and states[index] is not weights:
+            raise RuntimeError(f"Duplicate quantization validity owner for layer {index}.")
+        states[index] = weights
+    if set(states) != set(config.quant_config.layers):
+        raise RuntimeError("Quantization validity must cover every configured expert layer.")
+    owners = tuple(states[index] for index in sorted(states))
+    if len({id(weights) for weights in owners}) != len(owners):
+        raise RuntimeError("Quantization validity owners must be distinct for each expert layer.")
+    for weights in owners:
+        flag = weights.validity_buffer
+        if (
+            not isinstance(flag, torch.Tensor)
+            or flag.dtype != torch.bool
+            or flag.shape != ()
+            or flag.device != runner.device
+        ):
+            raise RuntimeError("Quantization validity requires a device-resident boolean scalar per layer.")
+    # Validate all owners before mutating any. Stable views live outside graph
+    # pools; zeroing at each forward detects missed writes on graph replay.
+    runner._quantization_validity = torch.zeros(len(owners), dtype=torch.bool, device=runner.device)
+    runner._quantization_validity_buffers = runner._quantization_validity.unbind()
+    for weights, flag in zip(owners, runner._quantization_validity_buffers):
+        weights.validity_buffer = flag
+        weights.defer_validity = True
+
+
+def check_quantization_validity(runner):
+    """Consume one aggregate device status before sampling, never in capture."""
+    validity = getattr(runner, "_quantization_validity", None)
+    if validity is not None and not bool(validity.all()):
+        raise RuntimeError("Quantized expert forward failed validity checks.")
+
+
 class _NativeStageOps:
     def __init__(self, library, binary, device, *, execution="serial"):
         # Extension/runtime registration happens once during worker startup,

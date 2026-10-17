@@ -109,8 +109,6 @@ def validate_vq2a8_config(config) -> dict:
         raise ValueError("VQ2A8 requires compilation mode NONE; native banks are not TorchDynamo inputs.")
     graph_mode = getattr(compilation.cudagraph_mode, "name", str(compilation.cudagraph_mode))
     if options.get("gs32_execution") == "full_graph":
-        if getattr(config, "use_v2_model_runner", False):
-            raise ValueError("GS32 graph execution requires Model Runner V1 for deferred validity ownership.")
         capture_sizes = [1]
         expected_mode = "FULL_DECODE_ONLY"
         if graph_mode != expected_mode:

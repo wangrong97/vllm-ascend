@@ -63,29 +63,44 @@ def check_graph_progress(previous, current, layer_count, output_tokens):
             )
 
 
+def check_runner_selection(states, expected_version):
+    for state in states:
+        assert state["model_runner_version"] == expected_version, (
+            f"Rank {state['rank']} selected {state['model_runner']}, expected model runner V{expected_version}."
+        )
+
+
 def run_variant(model, library, binary, ep_size, output):
     # Engine and NPU initialization stay inside the isolated child process.
-    from vllm import SamplingParams
+    from vllm import SamplingParams, envs
 
     from tests.e2e.conftest import VllmRunner
-    from tests.e2e.nightly.test_vq2a8_gs32_batched import checkpoint_inventory
+    from tests.e2e.nightly.vq2a8_gs32_helpers import checkpoint_inventory
 
     config, _, entries = checkpoint_inventory(model)
     layer_count = config["num_hidden_layers"]
+    expected_version = 2 if envs.VLLM_USE_V2_MODEL_RUNNER else 1
     report = {
         "ep_size": ep_size,
         "execution": "full_graph",
         "max_model_len": MAX_CONTEXT,
         "prefill_chunk_tokens": PREFILL_CHUNK_TOKENS,
+        "model_runner_version": expected_version,
         "requests": [],
         "scope": "long-context graph replay and recovery; not eager parity or serving performance",
     }
     with VllmRunner(str(model), **runner_options(library, binary, ep_size)) as runner:
         llm = runner.model
         previous = graph_state(llm, ep_size)
+        check_runner_selection(previous, expected_version)
         check_inventory(previous, config, ep_size, entries)
         check_graph_progress(previous, previous, layer_count, 1)
         report["graph_before"] = previous
+        print(
+            "VQ2A8_GS32_EP_RUNNER="
+            + json.dumps({"ranks": [{key: state[key] for key in ("rank", "model_runner")} for state in previous]}),
+            flush=True,
+        )
         seed_tokens = llm.get_tokenizer().encode("中国首都是", add_special_tokens=False)
         assert seed_tokens
         for input_tokens, output_tokens in REQUEST_SHAPES:
@@ -110,6 +125,7 @@ def run_variant(model, library, binary, ep_size, output):
             ]
             assert all(math.isfinite(value) for value in logprobs)
             current = graph_state(llm, ep_size)
+            check_runner_selection(current, expected_version)
             check_graph_progress(previous, current, layer_count, output_tokens)
             record = {
                 "input_tokens": input_tokens,
@@ -173,6 +189,25 @@ def test_gs32_ep_long_context_decode_graph_and_recovery(request, tmp_path, ep_si
     report = json.loads(output.read_text())
     assert report["status"] == "PASS"
     assert [(entry["input_tokens"], entry["output_tokens"]) for entry in report["requests"]] == list(REQUEST_SHAPES)
+    print(
+        "VQ2A8_GS32_EP_LONG_CONTEXT_RESULT="
+        + json.dumps(
+            {
+                "status": report["status"],
+                "model_runner_version": report["model_runner_version"],
+                "ranks": [
+                    {
+                        key: state[key]
+                        for key in ("rank", "model_runner", "validity_owners", "decode", "prefill", "other")
+                    }
+                    for state in report["requests"][-1]["graph_state"]
+                ],
+                "report": str(output),
+                "log": str(log),
+            }
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
