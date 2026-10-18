@@ -52,6 +52,7 @@ def test_defaults_preserve_existing_accuracy_conditions(runner, tmp_path, profil
     assert "top_p" not in generation
     assert "reasoning_effort" not in generation
     assert "chat_template_kwargs" not in generation["extra_body"]
+    assert args.thinking_mode == "service_default"
     assert json.loads(command[command.index("--judge") + 1]) == {"strategy": "rule"}
 
 
@@ -99,6 +100,59 @@ def test_explicit_reasoning_and_sampling_reach_service(runner, effort):
     assert generation["temperature"] == 1
     assert generation["top_p"] == 1
     assert generation["max_tokens"] == 32768
+
+
+@pytest.mark.parametrize(
+    "options,effort",
+    [
+        (["--thinking"], "high"),
+        (["--no-thinking"], "none"),
+        (["--thinking", "--reasoning-effort", "low"], "low"),
+        (["--thinking", "--reasoning-effort", "high"], "high"),
+        (["--thinking", "--reasoning-effort", "max"], "max"),
+        (["--no-thinking", "--reasoning-effort", "none"], "none"),
+    ],
+)
+def test_thinking_switches_reach_evalscope_request_config(runner, tmp_path, options, effort):
+    args = runner.parse_args(["vq2a8", *options])
+    command = runner.build_command(args, tmp_path / "run")
+    generation = json.loads(command[command.index("--generation-config") + 1])
+    assert generation["reasoning_effort"] == effort
+    assert generation["extra_body"]["chat_template_kwargs"] == {
+        "thinking": effort != "none",
+        "reasoning_effort": effort,
+    }
+    # A mode switch does not implicitly change sampling or the output budget.
+    assert generation["temperature"] == 0.0
+    assert generation["max_tokens"] == 8192
+    assert "top_p" not in generation
+
+
+@pytest.mark.parametrize(
+    "options,message",
+    [
+        (["--thinking", "--no-thinking"], "not allowed with argument --thinking"),
+        (["--thinking", "--reasoning-effort", "none"], "--thinking conflicts"),
+        (["--no-thinking", "--reasoning-effort", "low"], "--no-thinking requires"),
+        (["--no-thinking", "--reasoning-effort", "high"], "--no-thinking requires"),
+        (["--no-thinking", "--reasoning-effort", "max"], "--no-thinking requires"),
+    ],
+)
+def test_conflicting_thinking_options_rejected(runner, capsys, options, message):
+    with pytest.raises(SystemExit) as exc:
+        runner.parse_args(["vq2a8", *options])
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_help_documents_thinking_defaults(runner, capsys):
+    with pytest.raises(SystemExit) as exc:
+        runner.parse_args(["--help"])
+    assert exc.value.code == 0
+    output = " ".join(capsys.readouterr().out.split())
+    assert "--thinking" in output and "--no-thinking" in output
+    assert "defaults --reasoning-effort to high" in output
+    assert "equivalent to --reasoning-effort none" in output
 
 
 @pytest.mark.parametrize(
@@ -195,6 +249,32 @@ def test_success_records_audit_and_complete_child_log(runner, fake_evaluation, t
     assert manifest["status"] == "finished"
     assert manifest["log"] == str(log) == str(run_dir / "evalscope.log")
     assert log.read_text() == "Evaluator fixture stdout/stderr\n"
+
+
+@pytest.mark.parametrize(
+    "options,mode,effort",
+    [
+        ([], "service_default", None),
+        (["--thinking"], "thinking", "high"),
+        (["--no-thinking"], "no_thinking", "none"),
+        (["--thinking", "--reasoning-effort", "max"], "thinking", "max"),
+        (["--reasoning-effort", "low"], "thinking", "low"),
+        (["--reasoning-effort", "none"], "no_thinking", "none"),
+    ],
+)
+def test_thinking_mode_and_request_settings_recorded_consistently(
+    runner, fake_evaluation, tmp_path, capsys, options, mode, effort
+):
+    assert runner.main(["vq2a8", "--result-dir", str(tmp_path), *options]) == 0
+    command = fake_evaluation[0][0]
+    generation = json.loads(command[command.index("--generation-config") + 1])
+    run_dir = Path(command[command.index("--work-dir") + 1])
+    for filename in ("run.json", "summary.json"):
+        recorded = json.loads((run_dir / filename).read_text())
+        assert recorded["thinking_mode"] == mode
+        assert recorded["generation_config"] == generation
+        assert recorded["generation_config"].get("reasoning_effort") == effort
+    assert f"Thinking mode: {mode}; reasoning effort: {effort or 'service_default'}" in capsys.readouterr().out
 
 
 def test_repeated_invocations_do_not_reuse_or_overwrite_results(runner, fake_evaluation, tmp_path):

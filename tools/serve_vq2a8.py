@@ -55,6 +55,16 @@ def parse_args(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
+        "--tokenizer-mode",
+        choices=("auto", "deepseek_v4"),
+        help="optional chat tokenizer override; omitted by default",
+    )
+    parser.add_argument(
+        "--reasoning-parser",
+        choices=("deepseek_v4",),
+        help="separate reasoning from final answers; thinking mode is selected per request",
+    )
+    parser.add_argument(
         "--profile-dir", type=Path, help="enable vLLM's Torch profiler controls for a separate trace run"
     )
     check_mode = parser.add_mutually_exclusive_group()
@@ -166,6 +176,10 @@ def build_command(args):
         json.dumps(additional),
     ]
     command.extend(["--quantization", "vq2a8"])
+    if args.tokenizer_mode is not None:
+        command.extend(["--tokenizer-mode", args.tokenizer_mode])
+    if args.reasoning_parser is not None:
+        command.extend(["--reasoning-parser", args.reasoning_parser])
     if args.ep_size > 1:
         command.extend(
             [

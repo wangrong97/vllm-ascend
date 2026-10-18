@@ -2,8 +2,9 @@
 
 完整说明已移至 [docs/vq2a8_accuracy.md](../../docs/vq2a8_accuracy.md)。
 
-新文档包含 GPQA Diamond / AIME24 / AIME25 选择、EvalScope 依赖安装、
-内网离线数据、运行命令、结果审计和 baseline 对比。本目录中的脚本路径保持不变。
+新文档包含指定 NPU 卡启动服务、上下文与采样参数、`--thinking` / `--no-thinking`、
+GPQA Diamond / AIME24 / AIME25 选择、EvalScope 依赖安装、内网离线数据、结果审计和 baseline 对比。
+本目录中的脚本路径保持不变。
 
 其他测试指南：
 

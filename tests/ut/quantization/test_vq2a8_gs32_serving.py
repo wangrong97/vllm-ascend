@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: F811  # Imported pytest fixture is injected by parameter name.
 import json
+import shlex
 from types import SimpleNamespace
 
 import pytest
@@ -172,6 +173,45 @@ def server_assets(tmp_path):
     library.touch()
     binary.touch()
     return ["--model", str(tmp_path), "--gs32-library", str(library), "--gs32-binary", str(binary)]
+
+
+def test_chat_frontend_defaults_preserve_existing_service_command(server_assets):
+    command = serve.build_command(serve.parse_args(server_assets))
+    assert "--tokenizer-mode" not in command
+    assert "--reasoning-parser" not in command
+
+
+@pytest.mark.parametrize(
+    "frontend_options",
+    [
+        ["--tokenizer-mode", "auto"],
+        ["--tokenizer-mode", "deepseek_v4"],
+        ["--reasoning-parser", "deepseek_v4"],
+        ["--tokenizer-mode", "deepseek_v4", "--reasoning-parser", "deepseek_v4"],
+    ],
+)
+def test_chat_frontend_options_reach_dry_run_without_native_loading(
+    server_assets, frontend_options, monkeypatch, capsys
+):
+    def fail_native_loading():
+        pytest.fail("A serving dry run must not initialize native model dependencies.")
+
+    monkeypatch.setattr(serve, "check_native_dependencies", fail_native_loading)
+    assert serve.main(server_assets + frontend_options + ["--dry-run"]) == 0
+    command = shlex.split(capsys.readouterr().out)
+    for option, value in zip(frontend_options[::2], frontend_options[1::2]):
+        assert command.count(option) == 1
+        assert command[command.index(option) + 1] == value
+    # Frontend extraction does not set the model's reasoning mode or sampling policy.
+    assert "--default-chat-template-kwargs" not in command
+    assert command[command.index("--generation-config") + 1] == "vllm"
+
+
+@pytest.mark.parametrize("option", ["--tokenizer-mode", "--reasoning-parser"])
+def test_chat_frontend_rejects_unknown_names_before_loading(server_assets, option):
+    with pytest.raises(SystemExit) as error:
+        serve.parse_args(server_assets + [option, "unknown"])
+    assert error.value.code == 2
 
 
 @pytest.mark.parametrize(

@@ -66,7 +66,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=positive_int, default=8192)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, help="Omit to keep the service default")
-    parser.add_argument("--reasoning-effort", choices=("none", "low", "high", "max"), help="Default: service setting")
+    thinking = parser.add_mutually_exclusive_group()
+    thinking.add_argument(
+        "--thinking",
+        dest="thinking",
+        action="store_const",
+        const=True,
+        help="Enable thinking; defaults --reasoning-effort to high when omitted",
+    )
+    thinking.add_argument(
+        "--no-thinking",
+        dest="thinking",
+        action="store_const",
+        const=False,
+        help="Disable thinking; equivalent to --reasoning-effort none",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("none", "low", "high", "max"),
+        help="Default: service setting unless --thinking/--no-thinking is selected",
+    )
     parser.add_argument("--repeats", type=positive_int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -86,6 +105,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Print command without contacting the service")
     args = parser.parse_args(argv)
+    if args.thinking is True:
+        if args.reasoning_effort == "none":
+            parser.error("--thinking conflicts with --reasoning-effort none")
+        args.reasoning_effort = args.reasoning_effort or "high"
+    elif args.thinking is False:
+        if args.reasoning_effort not in (None, "none"):
+            parser.error("--no-thinking requires --reasoning-effort none or no explicit effort")
+        args.reasoning_effort = "none"
+    if args.reasoning_effort is None:
+        args.thinking_mode = "service_default"
+    else:
+        args.thinking_mode = "no_thinking" if args.reasoning_effort == "none" else "thinking"
     if not math.isfinite(args.temperature) or args.temperature < 0:
         parser.error("--temperature must be finite and nonnegative")
     if args.top_p is not None and (not math.isfinite(args.top_p) or not 0 < args.top_p <= 1):
@@ -280,6 +311,7 @@ def write_scores(run_dir: Path, manifest: dict, audit: dict) -> None:
         "server_revision": manifest["server_revision"],
         "evalscope_version": manifest["evalscope_version"],
         "generation_config": manifest["generation_config"],
+        "thinking_mode": manifest["thinking_mode"],
         "repeats": manifest["repeats"],
         "datasets": audit["datasets"],
     }
@@ -340,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             "expected_counts": expected_counts,
             "concurrency": args.concurrency,
             "generation_config": generation_config(args),
+            "thinking_mode": args.thinking_mode,
             "command": command,
             "log": str(run_dir / "evalscope.log"),
             "status": "running",
@@ -347,6 +380,10 @@ def main(argv: list[str] | None = None) -> int:
         write_json(run_dir / "run.json", manifest)
         print(f"EvalScope run: {run_dir}", flush=True)
         print(f"Datasets: {expected_counts}; concurrent requests: {args.concurrency}", flush=True)
+        print(
+            f"Thinking mode: {args.thinking_mode}; reasoning effort: {args.reasoning_effort or 'service_default'}",
+            flush=True,
+        )
         print(f"Live progress below; complete child stdout/stderr: {manifest['log']}", flush=True)
         print(f"Native EvalScope logs: {run_dir / 'logs'}", flush=True)
         returncode = execute_evaluator(command, Path(manifest["log"]))
