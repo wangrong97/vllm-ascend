@@ -14,6 +14,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from queue import Empty, Queue
 from types import SimpleNamespace as NS
 
 import pytest
@@ -48,7 +49,18 @@ def suite_server(tmp_path):
         shutil.copyfile(REPO_ROOT / relative, repo / relative)
     results = tmp_path / "results with spaces"
     requests = []
-    state = NS(context=1049600, failure=None, failure_on=1, generations=0, active=0, peak=0)
+    state = NS(
+        context=1049600,
+        failure=None,
+        failure_on=1,
+        generations=0,
+        active=0,
+        peak=0,
+        pause_stream=False,
+        request_received=threading.Event(),
+        allow_first=threading.Event(),
+        allow_finish=threading.Event(),
+    )
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -81,11 +93,17 @@ def suite_server(tmp_path):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
+                if state.pause_stream:
+                    state.request_received.set()
+                    if not state.allow_first.wait(timeout=10):
+                        return
                 # Send two text chunks, regardless of requested token count.
                 # Usage, rather than SSE chunk count, determines token timing.
                 time.sleep(0.004)
                 self.wfile.write(b'data: {"choices": [{"index": 0, "text": "first"}]}\n\n')
                 self.wfile.flush()
+                if state.pause_stream and not state.allow_finish.wait(timeout=10):
+                    return
                 time.sleep(0.004)
                 events = [
                     {"choices": [{"index": 0, "text": "last", "finish_reason": "length"}]},
@@ -149,12 +167,18 @@ def suite_server(tmp_path):
         try:
             yield NS(run=run, requests=requests, state=state, results=results, repo=repo, base_url=base_url)
         finally:
+            state.allow_first.set()
+            state.allow_finish.set()
             server.shutdown()
             thread.join(timeout=5)
 
 
 def assert_saved_cases(result):
     cases = result.report["cases"]
+    run_log = (result.directory / "run.log").read_text(encoding="utf-8")
+    assert f"RESULT_DIR={result.directory}" in run_log
+    assert f"SUMMARY={result.directory / 'summary.json'}" in run_log
+    assert f"CSV={result.directory / 'summary.csv'}" in run_log
     with (result.directory / "summary.csv").open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == len(cases)
@@ -183,6 +207,116 @@ def assert_saved_cases(result):
         if record["status"] != "not_run":
             assert (result.directory / f"{record['case']}.log").is_file()
     return rows
+
+
+@pytest.mark.parametrize(
+    "script, case",
+    [("run_vq2a8_performance_suite.py", "128x32"), ("run_vq2a8_ep2_long_context_latency.py", "64k")],
+)
+def test_progress_is_live_on_stderr_and_saved_before_stream_finishes(suite_server, script, case):
+    state = suite_server.state
+    state.pause_stream = True
+    lines = Queue()
+    captured = {"stdout": [], "stderr": []}
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(suite_server.repo / "tools/tests" / script),
+            "--base-url",
+            suite_server.base_url,
+            "--result-dir",
+            str(suite_server.results),
+            "--cases",
+            case,
+            "--warmups",
+            "0",
+            "--repeats",
+            "1",
+            "--timeout",
+            "10",
+        ],
+        cwd=suite_server.repo.parent,
+        env={**os.environ, "PYTHONUTF8": "1", "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+
+    def read_stream(name, stream):
+        for line in stream:
+            captured[name].append(line)
+            lines.put((name, line))
+
+    readers = [
+        threading.Thread(target=read_stream, args=(name, getattr(process, name)), daemon=True) for name in captured
+    ]
+    for reader in readers:
+        reader.start()
+
+    def wait_for_line(marker, expected_stream):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                stream, line = lines.get(timeout=max(0.01, deadline - time.monotonic()))
+            except Empty:
+                break
+            if marker in line:
+                assert stream == expected_stream, captured
+                return
+        pytest.fail(f"No live {marker!r} on {expected_stream}: {captured}")
+
+    def assert_logged(marker):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            run_logs = list(suite_server.results.glob("*/run.log"))
+            if len(run_logs) == 1:
+                run_log = run_logs[0]
+                case_log = run_log.with_name(f"{case}.log")
+                if case_log.exists() and all(
+                    marker in path.read_text(encoding="utf-8") for path in (run_log, case_log)
+                ):
+                    return run_log.parent
+            time.sleep(0.01)
+        pytest.fail(f"Live diagnostic not flushed to both logs: {marker}")
+
+    try:
+        assert state.request_received.wait(timeout=10), captured
+        assert process.poll() is None
+        wait_for_line(f"CASE={case} PREFLIGHT", "stdout")
+        wait_for_line("REQUEST=1/1 START", "stderr")
+        directory = assert_logged("REQUEST=1/1 START")
+        assert "FIRST_CONTENT" not in (directory / "run.log").read_text(encoding="utf-8")
+        state.allow_first.set()
+        wait_for_line("REQUEST=1/1 FIRST_CONTENT", "stderr")
+        assert_logged("REQUEST=1/1 FIRST_CONTENT")
+        assert process.poll() is None
+        assert "DONE TOKENS=" not in (directory / "run.log").read_text(encoding="utf-8")
+        state.allow_finish.set()
+        assert process.wait(timeout=10) == 0
+        for reader in readers:
+            reader.join(timeout=5)
+        assert all(not reader.is_alive() for reader in readers)
+        stdout, stderr = "".join(captured["stdout"]), "".join(captured["stderr"])
+        assert "FIRST_CONTENT" not in stdout
+        assert "REQUEST=1/1 DONE TOKENS=" in stderr
+        assert f"CASE={case} REQUEST=1 TTFT_MS=" in stdout
+        run_log = (directory / "run.log").read_text(encoding="utf-8")
+        case_log = (directory / f"{case}.log").read_text(encoding="utf-8")
+        for marker in ("REQUEST=1/1 START", "REQUEST=1/1 FIRST_CONTENT", "REQUEST=1/1 DONE"):
+            assert run_log.count(marker) == case_log.count(marker) == 1
+        assert f"SUMMARY={directory / 'summary.json'}" in run_log
+        assert json.loads((directory / "summary.json").read_text(encoding="utf-8"))["cases"][0]["status"] == "passed"
+    finally:
+        state.allow_first.set()
+        state.allow_finish.set()
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=10)
+        for reader in readers:
+            reader.join(timeout=5)
+        process.stdout.close()
+        process.stderr.close()
 
 
 @pytest.mark.parametrize(

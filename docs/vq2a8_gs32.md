@@ -105,7 +105,15 @@ offline bundles, native grading and baseline score comparisons.
 ### One-command NPU regression
 
 The [NPU CI guide](vq2a8_npu_ci.md) documents the `kernels`, `pr` and `nightly`
-suites, both model runners, artifact requirements, logs and strict pass criteria.
+suites, both model runners, artifact requirements, logs and acceptance criteria.
+If the checkpoint has no real `mxfp4 -> vq2` GateUp-to-Down expert, the default
+command prints a notice, records the untested cases and continues the remaining
+stages automatically. No extra command-line option is needed. Other skips,
+xfails and actual failures still fail CI. See the
+[missing checkpoint pair details](vq2a8_npu_ci.md#checkpoint-缺少真实专家组合时)
+for the exact scope and optional acceptance of other missing pairs. A successful
+run with gaps is reported as `passed_with_coverage_gaps`; the gaps remain visible
+in the report.
 
 ### Individual test entry points
 

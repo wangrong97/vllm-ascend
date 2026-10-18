@@ -2,14 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Validate NPU CI orchestration using CPU child processes and real JUnit files."""
 
+import ast
 import importlib.util
+import io
 import json
 import os
 import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -89,6 +93,116 @@ def read_report(assets):
     return json.loads(paths[0].read_text(encoding="utf-8")), paths[0].parent
 
 
+@pytest.mark.parametrize("returncode", [0, 7])
+def test_child_output_is_live_before_exit_and_preserved_in_log(driver, tmp_path, monkeypatch, returncode):
+    release = tmp_path / "release-child"
+    log = tmp_path / "stream.log"
+    observed = threading.Event()
+
+    class Console(io.StringIO):
+        def write(self, text):
+            count = super().write(text)
+            if "STDOUT-READY" in self.getvalue() and "STDERR-READY" in self.getvalue():
+                observed.set()
+            return count
+
+    console = Console()
+    monkeypatch.setattr(sys, "stdout", console)
+    code = textwrap.dedent("""
+        import os, sys, time
+        from pathlib import Path
+        os.write(1, b'STDOUT-READY\\r')
+        os.write(2, b'STDERR-READY\\n')
+        word = '\u4e2d'.encode('utf-8')
+        os.write(1, word[:2])
+        deadline = time.monotonic() + 10
+        while not Path(sys.argv[1]).exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Parent did not relay output before child exit')
+            time.sleep(0.01)
+        os.write(1, word[2:] + b'-FINAL')
+        sys.exit(int(sys.argv[2]))
+    """)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            driver.execute, [sys.executable, "-u", "-c", code, str(release), str(returncode)], {}, log, 15
+        )
+        try:
+            assert observed.wait(5), "Output was buffered until child exit"
+            assert not future.done(), "Child must still be waiting for the parent"
+            assert b"STDOUT-READY\rSTDERR-READY\n" in log.read_bytes()
+            assert "\ufffd" not in console.getvalue()
+        finally:
+            release.touch()
+        assert future.result(timeout=5) == returncode
+    expected = "STDOUT-READY\rSTDERR-READY\n\u4e2d-FINAL"
+    assert log.read_bytes() == expected.encode("utf-8")
+    assert console.getvalue() == expected + "\n"
+
+
+def test_closed_terminal_does_not_lose_child_log_or_returncode(driver, tmp_path, monkeypatch):
+    class ClosedConsole:
+        def write(self, text):
+            raise BrokenPipeError("terminal disconnected")
+
+    monkeypatch.setattr(sys, "stdout", ClosedConsole())
+    log = tmp_path / "closed-terminal.log"
+    command = [sys.executable, "-u", "-c", "import os, sys; os.write(2, b'child error'); sys.exit(7)"]
+    assert driver.execute(command, {}, log, 10) == 7
+    assert log.read_bytes() == b"child error"
+
+
+@pytest.mark.parametrize("stage_name", ["activation", "ep2-v2", "recovery-v2"])
+def test_real_plan_discovers_e2e_conftest_and_passes_custom_options(assets, driver, tmp_path, monkeypatch, stage_name):
+    repository = tmp_path / "isolated repository"
+    nightly = repository / driver.TEST_ROOT
+    nightly.mkdir(parents=True)
+    (repository / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    # Reuse the real option declarations without importing NPU-dependent fixtures.
+    conftest_source = (REPO_ROOT / "tests/e2e/conftest.py").read_text(encoding="utf-8")
+    option_hook = next(
+        node
+        for node in ast.parse(conftest_source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "pytest_addoption"
+    )
+    (nightly.parent / "conftest.py").write_text(
+        "import os\nimport pytest\n\n" + ast.get_source_segment(conftest_source, option_hook) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(driver, "REPO_ROOT", repository)
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.setenv("PYTHONUTF8", "1")
+    monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
+    args = driver.parse_args([*assets.argv, "--suite", "nightly", "--model-runners", "v2", "--timeout", "20"])
+    stage = next(stage for stage in driver.build_plan(args) if stage["name"] == stage_name)
+    target = next(argument for argument in stage["command"] if argument.startswith(f"{driver.TEST_ROOT}/"))
+    relative_path, _, node_id = target.partition("::")
+    function = node_id.split("[", 1)[0] if node_id else "test_custom_options"
+    parameter = '@pytest.mark.parametrize("parallelism", ["ep2"])\n' if node_id else ""
+    parameters = "request, parallelism" if node_id else "request"
+    (repository / relative_path).write_text(
+        "import os\nimport pytest\n\n"
+        + parameter
+        + f"def {function}({parameters}):\n"
+        + f"    assert request.config.getoption('--vq2a8-model') == {str(assets.model)!r}\n"
+        + f"    assert request.config.getoption('--vq2a8-gs32-library') == {str(assets.library)!r}\n"
+        + f"    assert request.config.getoption('--vq2a8-gs32-binary') == {str(assets.binary)!r}\n"
+        + f"    assert request.config.getoption('--vq2a8-gs32-ep-skip-single-card') is {stage_name == 'ep2-v2'}\n"
+        + f"    assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == {'4' if stage_name == 'activation' else '4,5'!r}\n"
+        + f"    assert os.environ['VLLM_USE_V2_MODEL_RUNNER'] == {'0' if stage_name == 'activation' else '1'!r}\n",
+        encoding="utf-8",
+    )
+    assets.results.mkdir()
+
+    # Keep command ordering and directory-based conftest discovery exactly as planned.
+    driver.run_stage(stage, args, assets.results, lambda: None)
+
+    log = Path(stage["log"]).read_text(encoding="utf-8")
+    assert stage["returncode"] == 0, log
+    assert stage["status"] == "passed", log
+    assert stage["counts"] == {"tests": 1, "passed": 1, "failures": 0, "errors": 0, "skipped": 0}
+    assert Path(stage["junit"]).is_file()
+
+
 @pytest.mark.parametrize("suite, stage_count", [("kernels", 9), ("pr", 11), ("nightly", 13)])
 def test_dry_run_is_offline_and_plans_isolated_stages_with_explicit_devices(assets, suite, stage_count):
     result = run_cli(assets, "--suite", suite, "--devices", "4" if suite == "kernels" else "4,5", "--dry-run")
@@ -147,6 +261,8 @@ def test_kernels_suite_accepts_one_device_but_pr_requires_two(assets):
         ("--timeout", "0"),
         ("--timeout", "nan"),
         ("--model-runners", "v1", "v1"),
+        ("--allow-missing-checkpoint-pairs", "unknown_pair"),
+        ("--allow-missing-checkpoint-pairs", "mxfp4_to_vq2", "mxfp4_to_vq2"),
     ],
 )
 def test_invalid_configuration_is_rejected_before_output_creation(assets, arguments):
@@ -219,6 +335,224 @@ def child_plan(tmp_path, driver, monkeypatch):
         return stages
 
     return NS(configure=configure, trace=trace, helper=helper)
+
+
+@pytest.fixture
+def checkpoint_gap_plan(tmp_path, driver, monkeypatch):
+    """Produce real pytest JUnit records for checkpoint gaps without loading an NPU."""
+    repository = tmp_path / "checkpoint coverage repository"
+    nightly = repository / "tests/e2e/nightly"
+    nightly.mkdir(parents=True)
+    config = repository / "pytest.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
+    monkeypatch.setattr(driver, "REPO_ROOT", repository)
+    monkeypatch.setattr(driver, "preflight", lambda *args: None)
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.setenv("PYTEST_ADDOPTS", "")
+    monkeypatch.setenv("PYTHONUTF8", "1")
+    monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
+
+    def configure(mode="missing", *, pair="mxfp4_to_vq2", stage_name="batched", later_failure=False):
+        filename = "test_other.py" if mode == "wrong_class" else "test_vq2a8_gs32_batched.py"
+        function = "test_unrelated" if mode == "wrong_function" else "test_gs32_real_experts_fusion_compare"
+        executions = ("fused", "unexpected") if mode == "wrong_variant" else ("fused", "full_graph")
+        fusion_reason = (
+            f"No real {pair.replace('_to_', ' -> ')} expert exists in this checkpoint; combination was not tested."
+        )
+        prefill_reason = (
+            f"No real {pair.replace('_to_', ' -> ')} expert exists; this prefill combination was not tested."
+        )
+        source = (
+            "import pytest\n\n"
+            + f"@pytest.mark.parametrize('execution', {executions!r})\n"
+            + f"@pytest.mark.parametrize('pair', [{pair!r}])\n"
+            + f"def {function}(pair, execution):\n"
+        )
+        if mode == "plain":
+            source += "    assert True\n"
+        elif mode == "xfail":
+            source += f"    pytest.xfail({fusion_reason!r})\n"
+        elif mode == "wrong_reason":
+            source += "    pytest.skip('no NPU available')\n"
+        else:
+            source += f"    pytest.skip({fusion_reason!r})\n"
+        source += (
+            "\n@pytest.mark.parametrize('fusion', ('none', 'swiglu_quant'))\n"
+            + f"@pytest.mark.parametrize('pair', [{pair!r}])\n"
+            + "def test_gs32_real_mixed_ffn_device_prefill_compare_and_timing(pair, fusion):\n"
+            + ("    assert True\n" if mode == "plain" else f"    pytest.skip({prefill_reason!r})\n")
+        )
+        if mode != "all_skip":
+            source += "\ndef test_executed_witness():\n    assert True\n"
+        if mode == "other_skip":
+            source += "\ndef test_other_skip():\n    pytest.skip('no NPU available')\n"
+        (nightly / filename).write_text(source, encoding="utf-8")
+        if mode == "nonzero":
+            (repository / "conftest.py").write_text(
+                "def pytest_sessionfinish(session):\n    session.exitstatus = 7\n", encoding="utf-8"
+            )
+        (nightly / "test_later.py").write_text(
+            f"def test_later():\n    assert {not later_failure!r}\n", encoding="utf-8"
+        )
+        (nightly / "test_last.py").write_text("def test_last():\n    assert True\n", encoding="utf-8")
+        stages = [
+            {
+                "name": name,
+                "command": [
+                    sys.executable,
+                    "-u",
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "-c",
+                    str(config),
+                    "-o",
+                    "addopts=",
+                    "-o",
+                    "xfail_strict=True",
+                    f"tests/e2e/nightly/{test}",
+                ],
+                "environment": {"ASCEND_RT_VISIBLE_DEVICES": "4,5", "VLLM_USE_V2_MODEL_RUNNER": "0"},
+            }
+            for name, test in ((stage_name, filename), ("ep2-v1", "test_later.py"), ("ep2-v2", "test_last.py"))
+        ]
+        monkeypatch.setattr(driver, "build_plan", lambda *args: stages)
+        return stages
+
+    return configure
+
+
+def test_known_checkpoint_gap_automatically_continues_with_notice(assets, driver, checkpoint_gap_plan, capsys):
+    checkpoint_gap_plan()
+    assert driver.main(assets.argv) == 0
+    report, _ = read_report(assets)
+    assert report["automatic_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["coverage_complete"] is False
+    assert report["status"] == "passed_with_coverage_gaps"
+    assert [stage["status"] for stage in report["stages"]] == ["passed_with_coverage_gaps", "passed", "passed"]
+    stage = report["stages"][0]
+    assert stage["returncode"] == 0
+    assert stage["counts"] == {"tests": 5, "passed": 1, "failures": 0, "errors": 0, "skipped": 4}
+    assert len(stage["skipped_tests"]) == 4
+    assert {case["type"] for case in stage["skipped_tests"]} == {"pytest.skip"}
+    assert len(stage["coverage_gaps"]) == len(report["coverage_gaps"]) == 4
+    assert all(gap["pair"] == "mxfp4_to_vq2" and gap["model"] == str(assets.model) for gap in report["coverage_gaps"])
+    output = capsys.readouterr().out
+    assert "NOTICE" in output and "mxfp4_to_vq2" in output and str(assets.model) in output
+
+
+@pytest.mark.parametrize("pair", ["vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_mxfp4"])
+def test_other_checkpoint_pairs_remain_rejected_without_explicit_permission(assets, driver, checkpoint_gap_plan, pair):
+    checkpoint_gap_plan(pair=pair)
+    assert driver.main(assets.argv) == 1
+    report, _ = read_report(assets)
+    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["coverage_complete"] is False
+    assert report["status"] == "failed"
+    assert [stage["status"] for stage in report["stages"]] == ["failed", "not_run", "not_run"]
+    assert report["stages"][0]["counts"]["skipped"] == 4
+
+
+def test_explicit_pairs_merge_with_automatic_pair_without_duplicates(assets, driver):
+    args = driver.parse_args(
+        [
+            *assets.argv,
+            "--allow-missing-checkpoint-pairs",
+            "vq2_to_mxfp4",
+            "mxfp4_to_vq2",
+            "vq2_to_vq2",
+        ]
+    )
+    assert args.allow_missing_checkpoint_pairs == ["mxfp4_to_vq2", "vq2_to_mxfp4", "vq2_to_vq2"]
+
+
+@pytest.mark.parametrize("pair", ["vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_vq2", "mxfp4_to_mxfp4"])
+def test_explicit_checkpoint_gap_continues_and_preserves_real_skip_coverage(assets, driver, checkpoint_gap_plan, pair):
+    checkpoint_gap_plan(pair=pair)
+    assert driver.main([*assets.argv, "--allow-missing-checkpoint-pairs", pair]) == 0
+    report, _ = read_report(assets)
+    assert report["status"] == "passed_with_coverage_gaps"
+    assert report["automatic_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2", *([pair] if pair != "mxfp4_to_vq2" else [])]
+    assert report["coverage_complete"] is False
+    assert [stage["status"] for stage in report["stages"]] == ["passed_with_coverage_gaps", "passed", "passed"]
+    stage = report["stages"][0]
+    assert stage["counts"] == {"tests": 5, "passed": 1, "failures": 0, "errors": 0, "skipped": 4}
+    assert len(stage["coverage_gaps"]) == len(stage["skipped_tests"]) == len(report["coverage_gaps"]) == 4
+    expected_names = {
+        f"test_gs32_real_experts_fusion_compare[{pair}-{execution}]" for execution in ("fused", "full_graph")
+    } | {
+        f"test_gs32_real_mixed_ffn_device_prefill_compare_and_timing[{pair}-{fusion}]"
+        for fusion in ("none", "swiglu_quant")
+    }
+    assert {case["name"] for case in stage["skipped_tests"]} == expected_names
+    assert {case["classname"] for case in stage["skipped_tests"]} == {"tests.e2e.nightly.test_vq2a8_gs32_batched"}
+    assert {gap["nodeid"] for gap in stage["coverage_gaps"]} == {
+        f"tests/e2e/nightly/test_vq2a8_gs32_batched.py::{name}" for name in expected_names
+    }
+    assert all(gap["pair"] == pair and "was not tested" in gap["reason"] for gap in stage["coverage_gaps"])
+    assert report["coverage_gaps"] == [
+        {"stage": "batched", "model": str(assets.model), **gap} for gap in stage["coverage_gaps"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "mode,stage_name,pair,allowed",
+    [
+        ("other_skip", "batched", "mxfp4_to_vq2", None),
+        ("xfail", "batched", "mxfp4_to_vq2", None),
+        ("wrong_reason", "batched", "mxfp4_to_vq2", None),
+        ("wrong_class", "batched", "mxfp4_to_vq2", None),
+        ("wrong_function", "batched", "mxfp4_to_vq2", None),
+        ("wrong_variant", "batched", "mxfp4_to_vq2", None),
+        ("all_skip", "batched", "mxfp4_to_vq2", None),
+        ("nonzero", "batched", "mxfp4_to_vq2", None),
+        ("missing", "grouped", "mxfp4_to_vq2", None),
+        ("missing", "batched", "vq2_to_mxfp4", "vq2_to_vq2"),
+    ],
+)
+def test_checkpoint_gap_policy_does_not_allow_other_nonpassing_results(
+    assets, driver, checkpoint_gap_plan, mode, stage_name, pair, allowed
+):
+    checkpoint_gap_plan(mode, stage_name=stage_name, pair=pair)
+    extra = ["--allow-missing-checkpoint-pairs", allowed] if allowed else []
+    assert driver.main([*assets.argv, *extra]) == 1
+    report, _ = read_report(assets)
+    assert report["status"] == "failed" and report["coverage_complete"] is False
+    assert [stage["status"] for stage in report["stages"]] == ["failed", "not_run", "not_run"]
+    stage = report["stages"][0]
+    assert stage["error"]
+    if mode == "all_skip":
+        assert stage["counts"]["passed"] == 0 and stage["counts"]["skipped"] == 4
+    if mode == "nonzero":
+        assert stage["returncode"] == 7
+    if mode == "xfail":
+        assert "pytest.xfail" in {case["type"] for case in stage["skipped_tests"]}
+
+
+def test_downstream_failure_takes_priority_and_preserves_earlier_checkpoint_gaps(assets, driver, checkpoint_gap_plan):
+    checkpoint_gap_plan(later_failure=True)
+    assert driver.main(assets.argv) == 1
+    report, _ = read_report(assets)
+    assert report["status"] == "failed" and report["coverage_complete"] is False
+    assert [stage["status"] for stage in report["stages"]] == ["passed_with_coverage_gaps", "failed", "not_run"]
+    assert len(report["coverage_gaps"]) == 4
+    assert report["stages"][1]["counts"]["failures"] == 1
+
+
+@pytest.mark.parametrize("allow_missing", [False, True])
+def test_no_checkpoint_gaps_retains_full_pass_semantics(assets, driver, checkpoint_gap_plan, allow_missing):
+    checkpoint_gap_plan("plain")
+    extra = ["--allow-missing-checkpoint-pairs", "mxfp4_to_vq2"] if allow_missing else []
+    assert driver.main([*assets.argv, *extra]) == 0
+    report, _ = read_report(assets)
+    assert report["status"] == "passed" and report["coverage_complete"] is True
+    assert report["automatic_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["coverage_gaps"] == []
+    assert all(stage["status"] == "passed" for stage in report["stages"])
+    assert all(stage["skipped_tests"] == [] and stage["coverage_gaps"] == [] for stage in report["stages"])
 
 
 @pytest.mark.parametrize("field", ["tests", "failures", "errors", "skipped"])
@@ -381,12 +715,131 @@ def test_nonpassing_junit_or_child_exit_never_produces_green_and_stops(assets, d
         assert failed["returncode"] == 2
 
 
-def test_timeout_terminates_child_and_prevents_later_stage(assets, driver, child_plan):
+@pytest.mark.parametrize(
+    "failure, diagnostic",
+    [
+        ("arguments", "unrecognized arguments: --vq2a8-unknown-option"),
+        ("conftest", "ImportError: vq2a8_conftest_import_sentinel"),
+    ],
+)
+def test_real_pytest_startup_failure_preserves_diagnostics_and_stops(
+    assets, driver, tmp_path, monkeypatch, capsys, failure, diagnostic
+):
+    isolated = tmp_path / "isolated pytest"
+    isolated.mkdir()
+    config = isolated / "pytest.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
+    test_file = isolated / "test_smoke.py"
+    test_file.write_text("def test_pass():\n    assert True\n", encoding="utf-8")
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "pytest",
+        "-c",
+        str(config),
+        "--confcutdir",
+        str(isolated),
+        str(test_file),
+    ]
+    if failure == "arguments":
+        command += ["--noconftest", "--vq2a8-unknown-option"]
+    else:
+        (isolated / "conftest.py").write_text("raise ImportError('vq2a8_conftest_import_sentinel')\n", encoding="utf-8")
+    marker = tmp_path / "later-started"
+    plan = [
+        {
+            "name": "startup-failure",
+            "command": command,
+            "environment": {"PYTHONUTF8": "1", "PYTEST_ADDOPTS": "", "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        },
+        {
+            "name": "must-not-start",
+            "command": [
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).write_text('started')",
+            ],
+            "environment": {},
+        },
+    ]
+    monkeypatch.setattr(driver, "preflight", lambda *args: None)
+    monkeypatch.setattr(driver, "build_plan", lambda *args: plan)
+
+    assert driver.main([*assets.argv, "--timeout", "20"]) == 1
+    console = capsys.readouterr().out
+    report, _ = read_report(assets)
+    failed, later = report["stages"]
+    assert report["status"] == "failed" and failed["status"] == "failed"
+    assert failed["returncode"] == 4
+    assert not Path(failed["junit"]).exists()
+    assert Path(failed["junit"]).name in failed["junit_error"]
+    assert "return code 4" in failed["error"]
+    assert failed["log"] in failed["error"]
+    assert diagnostic in failed["log_tail"]
+    assert diagnostic in console
+    assert "STAGE=startup-failure RETURN_CODE=4" in console
+    assert f"STAGE=startup-failure LOG_TAIL_BEGIN LOG={failed['log']}" in console
+    assert "STAGE=startup-failure LOG_TAIL_END" in console
+    assert later["status"] == "not_run" and not marker.exists()
+
+
+@pytest.mark.parametrize("shape", ["many_lines", "long_line"])
+def test_failure_log_tail_is_bounded_and_keeps_the_latest_diagnostic(driver, tmp_path, shape):
+    log = tmp_path / "child.log"
+    prefix = "old diagnostic that must be omitted\n"
+    if shape == "many_lines":
+        content = prefix + "detail\n" * (driver.LOG_TAIL_LINES * 2)
+    else:
+        content = prefix + "x" * (driver.LOG_TAIL_BYTES * 2) + "\n"
+    log.write_text(content + "latest diagnostic\n", encoding="utf-8")
+    stage = {"log": str(log), "status": "failed", "error": "original error"}
+
+    driver.capture_failure_log(stage)
+
+    assert stage["status"] == "failed" and stage["error"] == "original error"
+    assert stage["log_tail"].endswith("latest diagnostic")
+    assert "old diagnostic" not in stage["log_tail"]
+    assert len(stage["log_tail"].splitlines()) <= driver.LOG_TAIL_LINES
+    assert len(stage["log_tail"].encode("utf-8")) <= driver.LOG_TAIL_BYTES
+    assert "log_tail_error" not in stage
+
+
+def test_failure_log_tail_replaces_invalid_utf8_without_hiding_the_cause(driver, tmp_path):
+    log = tmp_path / "child.log"
+    log.write_bytes(b"compiler output: \xff\xfe\nactual failure\n")
+    stage = {"log": str(log), "status": "failed", "error": "original error"}
+
+    driver.capture_failure_log(stage)
+
+    assert stage["status"] == "failed" and stage["error"] == "original error"
+    assert "\ufffd" in stage["log_tail"]
+    assert stage["log_tail"].endswith("actual failure")
+    assert "log_tail_error" not in stage
+
+
+@pytest.mark.parametrize("unreadable", ["missing", "directory"])
+def test_unreadable_failure_log_keeps_original_failure(driver, tmp_path, unreadable):
+    log = tmp_path / "child.log"
+    if unreadable == "directory":
+        log.mkdir()
+    stage = {"log": str(log), "status": "failed", "error": "original error"}
+
+    driver.capture_failure_log(stage)
+
+    assert stage["status"] == "failed" and stage["error"] == "original error"
+    assert stage["log_tail_error"]
+    assert "log_tail" not in stage
+
+
+def test_timeout_terminates_child_and_prevents_later_stage(assets, driver, child_plan, capsys):
     child_plan.configure("sleep", "pass")
     assert driver.main([*assets.argv, "--timeout", "1"]) != 0
     report, _ = read_report(assets)
     first, later = report["stages"]
     assert first["status"] == "timeout" and first["error"]
+    assert "child stage: sleep" in first["log_tail"]
+    assert "child stage: sleep" in capsys.readouterr().out
     assert later["status"] == "not_run"
     children = [json.loads(line) for line in child_plan.trace.read_text(encoding="utf-8").splitlines()]
     assert [child["mode"] for child in children] == ["sleep"]

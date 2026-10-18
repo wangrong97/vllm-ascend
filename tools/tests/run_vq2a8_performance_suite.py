@@ -238,26 +238,29 @@ def main(argv=None):
     directory = Path(
         tempfile.mkdtemp(prefix=datetime.now().strftime("vq2a8-performance-%Y%m%d_%H%M%S-"), dir=args.result_dir)
     )
-    print(f"RESULT_DIR={directory}", flush=True)
-    print("Using existing service. Verify prefix caching is disabled and keep runner/chunk/fusion settings fixed.")
-    print("All cases are preflighted before generation. A failure stops the suite; input lengths are never shortened.")
-    save_report(directory, report)
-    try:
-        preflight(variants, records, directory, report)
-        if not args.check_only and all(record["status"] == "ready" for record in records):
-            run_cases(variants, records, directory, report)
-    except KeyboardInterrupt:
-        record = next((record for record in records if record["case"] == report.get("active_case")), None)
-        if record is not None:
-            record.update(status="interrupted", error="Interrupted by user")
-        else:
-            report["interrupted"] = True
-    finally:
-        finish_report(directory, report)
-    if report.get("interrupted") or any(record["status"] == "interrupted" for record in records):
-        return 130
-    expected = "ready" if args.check_only else "passed"
-    return 0 if all(record["status"] == expected for record in records) else 1
+    with long_runner.case_log(directory / "run.log"):
+        print(f"RESULT_DIR={directory}", flush=True)
+        print("Using existing service. Verify prefix caching is disabled and keep runner/chunk/fusion settings fixed.")
+        print(
+            "All cases are preflighted before generation. A failure stops the suite; input lengths are never shortened."
+        )
+        save_report(directory, report)
+        try:
+            preflight(variants, records, directory, report)
+            if not args.check_only and all(record["status"] == "ready" for record in records):
+                run_cases(variants, records, directory, report)
+        except KeyboardInterrupt:
+            record = next((record for record in records if record["case"] == report.get("active_case")), None)
+            if record is not None:
+                record.update(status="interrupted", error="Interrupted by user")
+            else:
+                report["interrupted"] = True
+        finally:
+            finish_report(directory, report)
+        if report.get("interrupted") or any(record["status"] == "interrupted" for record in records):
+            return 130
+        expected = "ready" if args.check_only else "passed"
+        return 0 if all(record["status"] == expected for record in records) else 1
 
 
 if __name__ == "__main__":

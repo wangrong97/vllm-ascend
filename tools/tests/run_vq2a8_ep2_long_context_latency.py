@@ -92,8 +92,8 @@ class Tee:
 @contextmanager
 def case_log(path):
     with path.open("a", encoding="utf-8") as log:
-        tee = Tee(sys.stdout, log)
-        with redirect_stdout(tee), redirect_stderr(tee):
+        stdout, stderr = Tee(sys.stdout, log), Tee(sys.stderr, log)
+        with redirect_stdout(stdout), redirect_stderr(stderr):
             yield
 
 
@@ -161,53 +161,58 @@ def main(argv=None):
     directory = Path(
         tempfile.mkdtemp(prefix=datetime.now().strftime("vq2a8-ep2-long-%Y%m%d_%H%M%S-"), dir=args.result_dir)
     )
-    print(f"RESULT_DIR={directory}")
-    print("Target server: EP2, full_graph (decode graph), prefix caching disabled; verify its launch configuration.")
-    records = []
-    # Check every selected length before starting any expensive generation.
-    for name, variant in variants:
-        record = {
-            "case": name,
-            "model": args.model,
-            "base_url": args.base_url,
-            "input_tokens": variant.input_tokens,
-            "output_tokens": OUTPUT_TOKENS,
-            "required_context_tokens": variant.input_tokens + OUTPUT_TOKENS,
-            "concurrency": 1,
-            "warmups": args.warmups,
-            "repeats": args.repeats,
-            "timeout_seconds": args.timeout,
-            "requests": [],
-            "status": "ready",
-        }
-        records.append(record)
-        with case_log(directory / f"{name}.log"):
-            print(f"CASE={name} PREFLIGHT INPUT={variant.input_tokens} OUTPUT={OUTPUT_TOKENS}")
-            try:
-                variant.prompt = bench.prepare_fixed_prompt(variant)
-                print(f"CASE={name} READY")
-            except (HTTPException, OSError, ValueError) as error:
-                record.update(status="preflight_failed", error=str(error))
-                print(f"CASE={name} PREFLIGHT_FAILED: {error}")
-        save_case(directory, record)
-    if not args.check_only:
-        stop = False
-        for (_, variant), record in zip(variants, records):
-            if record["status"] != "ready":
-                continue
-            if stop:
-                record.update(status="not_run", error="Earlier generation failed; no further requests sent")
-                save_case(directory, record)
-                continue
-            measure_case(variant, record, directory)
-            stop = record["status"] != "passed"
-    report = {"check_only": args.check_only, "cases": records}
-    (directory / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    for record in records:
-        print(f"CASE={record['case']} STATUS={record['status']} LOG={directory / (record['case'] + '.log')}")
-    print(f"SUMMARY={directory / 'summary.json'}")
-    expected = "ready" if args.check_only else "passed"
-    return 0 if all(record["status"] == expected for record in records) else 1
+    with case_log(directory / "run.log"):
+        print(f"RESULT_DIR={directory}")
+        print(
+            "Target server: EP2, full_graph (decode graph), prefix caching disabled; verify its launch configuration."
+        )
+        records = []
+        # Check every selected length before starting any expensive generation.
+        for name, variant in variants:
+            record = {
+                "case": name,
+                "model": args.model,
+                "base_url": args.base_url,
+                "input_tokens": variant.input_tokens,
+                "output_tokens": OUTPUT_TOKENS,
+                "required_context_tokens": variant.input_tokens + OUTPUT_TOKENS,
+                "concurrency": 1,
+                "warmups": args.warmups,
+                "repeats": args.repeats,
+                "timeout_seconds": args.timeout,
+                "requests": [],
+                "status": "ready",
+            }
+            records.append(record)
+            with case_log(directory / f"{name}.log"):
+                print(f"CASE={name} PREFLIGHT INPUT={variant.input_tokens} OUTPUT={OUTPUT_TOKENS}")
+                try:
+                    variant.prompt = bench.prepare_fixed_prompt(variant)
+                    print(f"CASE={name} READY")
+                except (HTTPException, OSError, ValueError) as error:
+                    record.update(status="preflight_failed", error=str(error))
+                    print(f"CASE={name} PREFLIGHT_FAILED: {error}")
+            save_case(directory, record)
+        if not args.check_only:
+            stop = False
+            for (_, variant), record in zip(variants, records):
+                if record["status"] != "ready":
+                    continue
+                if stop:
+                    record.update(status="not_run", error="Earlier generation failed; no further requests sent")
+                    save_case(directory, record)
+                    continue
+                measure_case(variant, record, directory)
+                stop = record["status"] != "passed"
+        report = {"check_only": args.check_only, "cases": records}
+        (directory / "summary.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        for record in records:
+            print(f"CASE={record['case']} STATUS={record['status']} LOG={directory / (record['case'] + '.log')}")
+        print(f"SUMMARY={directory / 'summary.json'}")
+        expected = "ready" if args.check_only else "passed"
+        return 0 if all(record["status"] == expected for record in records) else 1
 
 
 if __name__ == "__main__":

@@ -23,7 +23,8 @@ NPU 回归、服务 TTFT/TPOT 和模型答题准确率是三类独立检查。�
 - 整模型测试还需要完整的 `vllm_ascend_C` 扩展及配套 ACLNN 算子，包括 SAS/QLI AICPU metadata 修复。
   仅构建 GS32 bridge 不足以运行整模型；更新相关源码后应重建对应原生产物。
   构建与 checkpoint 说明见[集成文档](vq2a8_gs32.md#build-and-checkpoint-prerequisites)。
-- checkpoint 应覆盖测试需要的 VQ2/MXFP4 混合投影组合；缺少组合导致的 pytest skip 会使一键 CI 失败。
+- checkpoint 用于验证其中实际存在的 VQ2/MXFP4 混合投影组合。若缺少真实的 `mxfp4 -> vq2` 专家，
+  一键 CI 会自动提示、记录覆盖缺口并继续；无需额外参数。其他 skip 和真实测试失败仍会阻断。
 
 先确认当前终端中的既有路径：
 
@@ -41,7 +42,9 @@ test -f "$BUILD/mixed_w2w4_moe_ffn.o"
 
 ## 一键执行
 
-日常 PR 回归推荐使用空闲卡 4、5，默认依次验证 MRV1 和 MRV2：
+日常 PR 回归使用空闲卡 4、5，默认依次验证 MRV1 和 MRV2。
+下面的命令已自动处理 checkpoint 缺少真实 `mxfp4 -> vq2` 专家的情况，不需要在命令中增加允许跳过的参数。
+具体提示与结果含义见[缺失组合处理](#checkpoint-缺少真实专家组合时)。
 
 ```bash
 python tools/tests/run_vq2a8_npu_ci.py \
@@ -80,6 +83,38 @@ python tools/tests/run_vq2a8_npu_ci.py \
   --result-dir benchmark-results/npu-ci-kernels
 ```
 
+## checkpoint 缺少真实专家组合时
+
+例如，`batched` 显示 `18 passed, 4 skipped`，四个 skip 的原因均为缺少真实的 `mxfp4 -> vq2` 专家。
+这表示 GateUp 使用 MXFP4、Down 使用 VQ2 的同一专家未在 checkpoint 中找到；不是四个数值比较失败。
+其中两项检查 `fused/full_graph` 下的激活融合对照，另外两项检查 `none/swiglu_quant` 下的 prefill 对照。
+一键 CI **默认自动接受这类缺失组合**，打印提示并继续后续 EP 和 MRV1/MRV2 阶段，无需修改上面的命令。
+只有对应真实专家测试报告该专家组合不存在时，才采用此处理；如果 checkpoint 含有该组合，测试照常执行，失败仍会阻断。
+
+该阶段其余检查通过时，终端会显示类似提示：
+
+```text
+STAGE=batched STATUS=passed_with_coverage_gaps
+STAGE=batched NOTICE=Checkpoint has no real expert for mxfp4 -> vq2; recorded 4 untested cases and continuing remaining checks. MODEL=/path/to/checkpoint
+```
+
+自动处理只适用于 `batched` 中上述两个真实专家测试的四个确切参数化用例，
+且 pytest skip 原因必须与“checkpoint 中不存在真实 mxfp4 -> vq2 专家”完全一致。
+缺少 NPU、依赖、模型参数等其他 skip，以及 xfail、失败、错误、整阶段无实际通过用例，仍会使 CI 失败。
+其他专家组合的缺失默认仍阻断；旧参数 `--allow-missing-checkpoint-pairs` 保留兼容，供明确接受其他组合缺口时使用。
+已使用该参数指定 `mxfp4_to_vq2` 的旧命令也继续有效，但现在可以直接移除这一参数。
+
+全部其余检查通过后，汇总为 **`passed_with_coverage_gaps`**，`coverage_complete=false`，退出码为 `0`。
+这表示已执行的检查通过，不能报告为全组合覆盖通过。原始 `skipped` 计数保留，
+`coverage_gaps` 逐项记录阶段、checkpoint、测试 nodeid、组合和原因，终端也实时打印 `COVERAGE_GAP`。
+`automatic_missing_checkpoint_pairs` 记录默认自动处理的组合，`allowed_missing_checkpoint_pairs` 记录自动与显式指定的有效并集。
+阶段中的 `skipped_tests` 保留全部 skip/xfail 的类型和原因，方便识别其他缺口。
+后续阶段若失败，总状态仍为 `failed`，之前的缺口记录不会丢失。
+
+补齐含该真实专家组合的 checkpoint 后，使用同一命令重新运行；人工拼接不同专家权重不能替代真实专家覆盖。
+内部 CI 若额外要求完整覆盖，应检查 `status=passed`、`coverage_complete=true`。
+这里的完整覆盖仅指所选套件的必跑用例，不包含未选择的 EP1、长上下文性能或数据集精度评测。
+
 ## 三套件的覆盖范围
 
 | 套件 | 设备要求 | 默认覆盖 |
@@ -110,6 +145,11 @@ python tools/tests/run_vq2a8_npu_ci.py \
 `pr`、`nightly` 的整模型阶段，不会把九个组件阶段变成 V2 测试。
 默认运行两种 runner 时，分别与**同 runner、同 EP2 拓扑的 eager 参考**对比，不是直接比较 V1 与 V2 的数值一致性。
 
+EP eager/decode graph 对照依次使用 `128→4`、`128→4`、`127→4`、`129→4`、`128→4`，
+覆盖不同输入、长度边界和恢复请求。测试上下文长度为 `129 + 4 = 133`，为全部输出预留空间；
+两个执行模式均开启 chunked prefill，每步预算为 128，图模式仅捕获 B1 decode。
+这些参数由测试内部设置，无需修改一键命令，也无需重新编译原生算子。
+
 `nightly` 的恢复序列为 `127→4`、`16384→1024`、`127→4`，这里箭头表示输入 token 数到输出 token 数。
 测试检查每个 worker 的实际 runner 类型、有效性 owner 和 decode 图回放次数；宣称选择 V2 但实际运行 V1 会失败。
 该探针沿用 128-token prefill chunk，**不代表 256K 或 1M 已验收**。
@@ -127,10 +167,12 @@ python tools/tests/run_vq2a8_npu_ci.py \
 
 退出码及汇总规则：
 
-- 返回 `0`：所有选定阶段均实际执行至少一个测试，并且无 failure、error、skip 或 xfail。
+- 返回 `0`：所有选定阶段均至少有一个实际通过用例，并且无 failure、error、xfail 或不支持的 skip。
   驱动同时启用 `xfail_strict=True`，不能用意外通过的预期失败用例掩盖结果。
+  若仅存在自动接受的 `mxfp4 -> vq2` 缺失，或通过旧参数额外声明的组合缺失，汇总为 `passed_with_coverage_gaps`；
+  若实际没有 skip，汇总为 `passed`。两者均不会因为这些已识别的数据缺口报错。
 - 返回 `1`：环境预检失败、测试失败、超时、零测试，或 JUnit 缺失、格式错误、计数不一致。
-  checkpoint 缺少混合投影组合而触发 skip，也属于未完成验收。
+  其他未接受的 skip、xfail 或整阶段全 skip，也属于未完成验收。
 - Ctrl+C 或 SIGTERM：保存已完成部分及中断状态，返回 `130`。
 
 出现失败即停止后续阶段，尚未运行的阶段保留为 `not_run`。
@@ -154,9 +196,24 @@ benchmark-results/npu-ci/vq2a8-npu-ci-<时间戳>-<随机后缀>/
 ```
 
 终端输出 `RESULT_DIR=...` 和每阶段的 `STAGE=... LOG=...`。
-详细 pytest 输出写入阶段日志，可对打印出的路径执行 `tail -f`。
+环境预检和 pytest 子进程的 stdout/stderr 默认实时显示在终端，同时完整保存到相应日志文件，
+包括用例名称、执行进度、通过/失败信息和异常堆栈；原有启动命令无需增加参数。
+没有新输出时，每约 15 秒显示 `PROBE_WAIT=...`、等待时长和日志路径。
+也可以在另一终端对打印出的路径执行 `tail -f`。
 JUnit XML 保留各用例结果和 skip 原因；pytest 临时目录保留模型子进程的日志及报告。
 `summary.json` 记录 checkout commit、实际命令、所选环境覆盖、测试计数、耗时和状态，并在阶段更新时保存。
+
+失败阶段会打印子进程退出码（如果已经取得）和日志末尾，最多读取 16 KiB、显示最后 64 行，
+并将其保存到阶段的 `log_tail`。完整日志仍保留在原文件；日志读取失败单独记录，不覆盖原错误。
+如果 pytest 在参数解析或加载 `conftest.py` 时退出，可能还没有生成 JUnit XML。
+此时汇总会同时记录 `returncode`、`junit_error` 和日志，不能仅根据“缺少 XML”判断是算子精度失败。
+例如，对终端打印出的结果目录查看：
+
+```bash
+RESULT=/path/to/the/printed/result-directory
+sed -n '1,220p' "$RESULT/activation.log"
+tail -n 80 "$RESULT/activation.log"
+```
 
 可以把上面的一键命令作为内部 Linux NPU CI job 的步骤，归档整个结果目录，使用进程退出码判定 job 成败。
 脚本本身不注册 self-hosted runner，也不自动安装 GitHub PR 触发任务。

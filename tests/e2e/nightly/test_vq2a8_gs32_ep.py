@@ -77,6 +77,11 @@ def runner_options(execution, library, binary, ep_size):
         raise ValueError("GS32 EP acceptance supports only EP1/2/4/8.")
     options = decode_runner_options(execution, library, binary)
     options.update(
+        # The recovery sequence includes INPUT_TOKENS + 1; reserve the full
+        # generation budget too, independently of the prefill chunk size.
+        max_model_len=INPUT_TOKENS + 1 + OUTPUT_TOKENS,
+        max_num_batched_tokens=INPUT_TOKENS,
+        enable_chunked_prefill=True,
         tensor_parallel_size=ep_size,
         data_parallel_size=1,
         enable_expert_parallel=ep_size > 1,

@@ -165,8 +165,16 @@ python tools/tests/run_vq2a8_performance_suite.py \
 
 ## 结果与比较口径
 
-每次运行在 `--result-dir` 下创建独立子目录，输出 `summary.json`、`summary.csv`，
-以及每个 case 的 JSON 和实时日志。终端会打印汇总文件路径。
+每次运行在 `--result-dir` 下创建独立子目录，输出 `summary.json`、`summary.csv`、
+整套客户端日志 `run.log`，以及每个 case 的 JSON 和日志。终端会打印汇总文件路径。
+默认实时显示并同步刷新日志文件，无须另外加 `tee`：`PREFLIGHT`、case 结果和汇总走 stdout，
+请求的 `START`、`FIRST_CONTENT`、`DONE` 进度走 stderr，两者均写入日志。
+原有长输入单独入口也采用同样的双输出方式。
+
+`START` 在发送请求前输出，`FIRST_CONTENT` 在首个内容到达时输出，不等待整条请求完成；
+等待首 token 期间没有新的客户端事件时，终端可能保持安静。
+日志不逐 token 打印生成内容，也不转发服务端 worker 日志；服务日志仍在终端 A 单独保存。
+TTFT/TPOT 的计时点不变，日志仅增加少量客户端 I/O；比较版本时应保持相同的日志输出方式。
 
 | 字段或记录 | 含义 |
 | --- | --- |

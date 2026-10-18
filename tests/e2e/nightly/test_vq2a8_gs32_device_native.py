@@ -158,8 +158,18 @@ def test_gs32_device_routes_full_capture_replays_changed_counts_and_recovers(dev
         assert_result(runtime, uploaded.output, owners[1], expected)
 
 
-@pytest.mark.parametrize("fault", ["cpu", "dtype", "rank", "groups0", "groups257", "rows0"])
-def test_gs32_device_routes_metadata_errors_reject_before_native(device_runtime, fault):
+@pytest.mark.parametrize(
+    "fault,expected_error",
+    [
+        pytest.param("cpu", "group_counts: an NPU tensor is required", id="cpu"),
+        pytest.param("dtype", "group_counts: incorrect dtype", id="dtype"),
+        pytest.param("rank", "group_counts: incorrect rank", id="rank"),
+        pytest.param("groups0", r"requires 1\.\.256 resident experts", id="groups0"),
+        pytest.param("groups257", r"requires 1\.\.256 resident experts", id="groups257"),
+        pytest.param("rows0", "device routes require positive routed row capacity", id="rows0"),
+    ],
+)
+def test_gs32_device_routes_metadata_errors_reject_before_native(device_runtime, fault, expected_error):
     torch, ops, device = device_runtime.torch, device_runtime.ops, device_runtime.device
     anchor = torch.empty((3, 64), dtype=torch.uint8, device=device)
     counts = torch.tensor([1, 0, 2], dtype=torch.int64, device=device)
@@ -173,7 +183,7 @@ def test_gs32_device_routes_metadata_errors_reject_before_native(device_runtime,
         counts = torch.empty(int(fault[6:]), dtype=torch.int64, device=device)
     else:
         anchor = torch.empty((int(fault[4:]), 64), dtype=torch.uint8, device=device)
-    with pytest.raises(RuntimeError, match="NPU|dtype|rank|experts|rows"):
+    with pytest.raises(RuntimeError, match=expected_error):
         ops.prepare_device_routes(anchor, counts)
     torch.npu.synchronize()
 
