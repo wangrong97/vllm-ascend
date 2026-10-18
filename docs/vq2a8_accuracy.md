@@ -89,14 +89,15 @@ curl -fsS http://127.0.0.1:8000/v1/models
 | --- | --- | --- | --- |
 | `--max-model-len` | 服务端 | `65536` | 聊天模板处理后的输入与全部生成 token 的总长度上限 |
 | `--max-num-batched-tokens` | 服务端 | `8192` | 每个调度步的 token 预算，不是输出上限，也不会把短题目补到 8192 |
-| `--max-tokens` | 评测客户端 | `32768` | 每题生成上限；thinking 时包括思考和最终回答，遇到正常结束可提前停止 |
+| `--max-tokens` | 评测客户端 | thinking：`32768`；no-thinking：`8192` | 每题生成上限；thinking 时包括思考和最终回答，遇到正常结束可提前停止 |
 | `--temperature` | 评测客户端 | `0` | 用于本项目的贪心解码回归对照；不保证跨硬件、并行配置完全一致 |
 | `--top-p` | 评测客户端 | `1` | 显式固定采样条件；temperature 为 0 时不进行随机核采样 |
 | `--seed` / `--repeats` | 评测客户端 | `0` / `1` | 固定随机种子、每题一次；增加 repeats 会增加请求数 |
 | `--concurrency` | 评测客户端 | `1` | 匹配当前服务的 B1 配置 |
 
 必须满足：`输入 token 数（含聊天模板） + 请求的输出预算 <= max_model_len`。
-示例为 32768 输出预留空间，输入可用空间为 32768；这不是对任意自定义数据集长度的保证。
+thinking 示例为 32768 输出预留空间，输入可用空间为 32768；no-thinking 示例预留 8192 输出，输入可用空间为 57344。
+这不是对任意自定义数据集长度的保证。
 预检会拒绝输出预算已经占满上下文的配置，逐题是否超限由服务校验；脚本不会自动截短题目。
 此前 128/256-token 上下文的短性能服务不能直接用于这里的完整评测。
 
@@ -104,7 +105,9 @@ curl -fsS http://127.0.0.1:8000/v1/models
 一次命令选择多个数据集时，以上生成参数应用于全部数据集；提示词与答案评分由各自的 EvalScope 适配器处理。
 先用统一条件建立回归基线。如果某个数据集出现较多输出截断，再单独运行该数据集并增大输出预算，
 必要时增大服务上下文；比较 VQ2A8 与原始模型时，该数据集的两边必须使用相同预算和采样参数。
-thinking/no-thinking 的对照也使用相同预算，只改变思考模式。不同配置的结果应分别标注，不能直接当作量化差异。
+本文日常回归分别使用 thinking 32768、no-thinking 8192 的输出预算，并分别建立基线。
+如果要单独比较思考开关的影响，需显式设置相同输出预算，只改变思考模式。
+不同预算的结果不能直接归因于思考模式或量化差异；达到输出上限的题目仍计入评分分母，并统计截断数。
 本文参数是项目回归条件，不是三个数据集或模型厂商的官方最优成绩配置。
 
 ## 一键执行（离线数据）
@@ -128,7 +131,7 @@ python tools/tests/run_vq2a8_accuracy_suite.py \
   --label mrv1-ep2-thinking-high-t0-o32768 \
   --result-dir benchmark-results/accuracy
 
-# No thinking：复用同一个服务，保持其他条件一致
+# No thinking：复用同一个服务，每题输出上限改为 8192
 python tools/tests/run_vq2a8_accuracy_suite.py \
   --base-url http://127.0.0.1:8000 \
   --model vq2a8 \
@@ -137,8 +140,8 @@ python tools/tests/run_vq2a8_accuracy_suite.py \
   --no-thinking \
   --temperature 0 --top-p 1 --seed 0 --repeats 1 \
   --concurrency 1 \
-  --max-tokens 32768 \
-  --label mrv1-ep2-no-thinking-t0-o32768 \
+  --max-tokens 8192 \
+  --label mrv1-ep2-no-thinking-t0-o8192 \
   --result-dir benchmark-results/accuracy
 
 # 只运行 AIME25；--limit 2 明确标记为 smoke，不能作为完整成绩
@@ -179,8 +182,10 @@ Python 和 Shell 入口都会自动把 EvalScope 子进程的完整 stdout/stder
 这些记录表示客户端请求的配置；真实响应是否有思考内容和最终答案，还应检查 `predictions/`。
 
 不指定采样参数时保持原有默认值：输出上限 8192、温度 0、seed 0、repeats 1；
-top-p 与思考模式沿用服务设置。本文完整回归示例显式改用 32768 输出预算，
-给思考和最终回答留出更多空间；它是上限，不会强制每题生成这么多 token。
+top-p 与思考模式沿用服务设置。本文 thinking 示例显式使用 32768 输出预算，no-thinking 示例显式使用 8192。
+`--thinking` 本身不会自动提高输出上限；手动传入的 `--max-tokens` 决定本次预算。
+输出预算是上限，不会强制每题生成这么多 token。关闭 thinking 后，正文仍可能包含长篇解题过程，8192 也可能截断答案。
+修改输出预算无需重启服务，只影响新启动的评测；正在运行的评测继续使用启动时的配置。
 
 ## 内网离线数据
 
@@ -273,7 +278,8 @@ python tools/tests/run_evalscope_accuracy.py baseline \
 
 两边使用相同数据包、提示模板、思考配置、采样参数、输出预算和重复次数。
 上例对照同一个 DeepSeek-V4 模型的原始精度服务，服务端也应使用对应 tokenizer/parser 并提供足够上下文。
-对照 no-thinking 时，两边都改用 `--no-thinking`，移除 `--thinking --reasoning-effort high` 并更新 label。
+对照 no-thinking 时，两边都改用 `--no-thinking --max-tokens 8192`，移除 `--thinking --reasoning-effort high`，
+并将 label 更新为相应的 `no-thinking-t0-o8192` 配置。
 先检查截断、空回答和请求错误，再比较各数据集分数。
 AIME 每年只有 30 题，一道题约占 3.33 个百分点；小样本波动不能直接归因于量化。
 
