@@ -23,7 +23,8 @@ NPU 回归、服务 TTFT/TPOT 和模型答题准确率是三类独立检查。�
 - 整模型测试还需要完整的 `vllm_ascend_C` 扩展及配套 ACLNN 算子，包括 SAS/QLI AICPU metadata 修复。
   仅构建 GS32 bridge 不足以运行整模型；更新相关源码后应重建对应原生产物。
   构建与 checkpoint 说明见[集成文档](vq2a8_gs32.md#build-and-checkpoint-prerequisites)。
-- checkpoint 应覆盖测试需要的 VQ2/MXFP4 混合投影组合；缺少组合导致的 pytest skip 会使一键 CI 失败。
+- checkpoint 应覆盖测试需要的 VQ2/MXFP4 混合投影组合；默认情况下，缺少组合导致的 pytest skip 会使一键 CI 失败。
+  需要先验证其余路径时，可以按下文显式声明缺失组合，并保留覆盖缺口记录。
 
 先确认当前终端中的既有路径：
 
@@ -80,6 +81,41 @@ python tools/tests/run_vq2a8_npu_ci.py \
   --result-dir benchmark-results/npu-ci-kernels
 ```
 
+## checkpoint 缺少真实专家组合时
+
+例如，`batched` 显示 `18 passed, 4 skipped`，四个 skip 的原因均为缺少真实的 `mxfp4 -> vq2` 专家。
+这表示 GateUp 使用 MXFP4、Down 使用 VQ2 的同一专家未在 checkpoint 中找到；不是四个数值比较失败。
+其中两项检查 `fused/full_graph` 下的激活融合对照，另外两项检查 `none/swiglu_quant` 下的 prefill 对照。
+严格模式会在此停止，后续 EP 和 MRV1/MRV2 标为 `not_run`。
+
+若接受该 checkpoint 的已知数据覆盖缺口，希望继续验证其余路径，可显式加入：
+
+```bash
+python tools/tests/run_vq2a8_npu_ci.py \
+  --devices 4,5 \
+  --model "$MODEL" \
+  --gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
+  --gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o" \
+  --suite pr \
+  --allow-missing-checkpoint-pairs mxfp4_to_vq2 \
+  --result-dir benchmark-results/npu-ci
+```
+
+该参数不排除测试，仍然执行全部选定阶段。仅允许 `batched` 中上述两个真实专家测试的确切参数化用例，
+且 pytest skip 原因必须与声明组合的“checkpoint 中不存在真实专家”完全一致。
+缺少 NPU、依赖、模型参数等其他 skip，以及 xfail、失败、错误、整阶段无实际通过用例，仍会使 CI 失败。
+参数支持列出多个组合：`vq2_to_vq2`、`vq2_to_mxfp4`、`mxfp4_to_vq2`、`mxfp4_to_mxfp4`；只声明实际确认缺少的组合。
+
+全部其余检查通过后，汇总为 **`passed_with_coverage_gaps`**，`coverage_complete=false`，退出码为 `0`。
+这表示声明范围内的验收通过，不能报告为全组合覆盖通过。原始 `skipped` 计数保留，
+`coverage_gaps` 逐项记录阶段、checkpoint、测试 nodeid、组合和原因，终端也实时打印 `COVERAGE_GAP`。
+阶段中的 `skipped_tests` 保留全部 skip/xfail 的类型和原因，方便识别未声明的缺口。
+后续阶段若失败，总状态仍为 `failed`，之前的缺口记录不会丢失。
+
+补齐含该真实专家组合的 checkpoint 后，移除此参数重新运行严格模式；人工拼接不同专家权重不能替代真实专家覆盖。
+内部 CI 若要求完整覆盖，应保持默认严格命令，并要求 `status=passed`、`coverage_complete=true`。
+这里的完整覆盖仅指所选套件的必跑用例，不包含未选择的 EP1、长上下文性能或数据集精度评测。
+
 ## 三套件的覆盖范围
 
 | 套件 | 设备要求 | 默认覆盖 |
@@ -127,10 +163,12 @@ python tools/tests/run_vq2a8_npu_ci.py \
 
 退出码及汇总规则：
 
-- 返回 `0`：所有选定阶段均实际执行至少一个测试，并且无 failure、error、skip 或 xfail。
+- 默认模式返回 `0`：所有选定阶段均实际执行至少一个测试，并且无 failure、error、skip 或 xfail。
   驱动同时启用 `xfail_strict=True`，不能用意外通过的预期失败用例掩盖结果。
+- 显式声明缺失组合后返回 `0`：其余检查全部通过，可以有符合声明的 checkpoint 数据 skip；
+  此时汇总为 `passed_with_coverage_gaps`，不计作完整覆盖通过。若实际没有 skip，仍为普通 `passed`。
 - 返回 `1`：环境预检失败、测试失败、超时、零测试，或 JUnit 缺失、格式错误、计数不一致。
-  checkpoint 缺少混合投影组合而触发 skip，也属于未完成验收。
+  未显式接受的 checkpoint 组合 skip，也属于未完成验收。
 - Ctrl+C 或 SIGTERM：保存已完成部分及中断状态，返回 `130`。
 
 出现失败即停止后续阶段，尚未运行的阶段保留为 `not_run`。

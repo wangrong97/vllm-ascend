@@ -41,6 +41,8 @@ TERMINATE_GRACE_SECONDS = 10
 PREFLIGHT_SECONDS = 120
 LOG_TAIL_BYTES = 16384
 LOG_TAIL_LINES = 64
+CHECKPOINT_PAIRS = ("vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_vq2", "mxfp4_to_mxfp4")
+ACCEPTED_STAGE_STATUSES = ("passed", "passed_with_coverage_gaps")
 
 
 def parse_args(argv=None):
@@ -52,6 +54,13 @@ def parse_args(argv=None):
     parser.add_argument("--suite", choices=("kernels", "pr", "nightly"), default="pr")
     parser.add_argument("--model-runners", nargs="+", choices=("v1", "v2"), default=["v1", "v2"])
     parser.add_argument("--single-card-reference", action="store_true", help="Also load the entire EP1 reference model")
+    parser.add_argument(
+        "--allow-missing-checkpoint-pairs",
+        nargs="+",
+        choices=CHECKPOINT_PAIRS,
+        default=[],
+        help="Accept only real-expert skips for these absent GateUp-to-Down pairs; record coverage gaps",
+    )
     parser.add_argument("--timeout", type=int, default=7200, help="Wall timeout in seconds per pytest stage")
     parser.add_argument("--result-dir", type=Path, default=REPO_ROOT / "benchmark-results/npu-ci")
     parser.add_argument("--dry-run", action="store_true", help="Print plan only; no NPU initialization or output files")
@@ -66,6 +75,8 @@ def parse_args(argv=None):
         parser.error("kernels requires exactly one visible device; pr/nightly require exactly two")
     if args.timeout <= 0 or len(set(args.model_runners)) != len(args.model_runners):
         parser.error("--timeout must be positive and --model-runners must be distinct")
+    if len(set(args.allow_missing_checkpoint_pairs)) != len(args.allow_missing_checkpoint_pairs):
+        parser.error("--allow-missing-checkpoint-pairs must be distinct")
     args.devices = ",".join(devices)
     for name in ("model", "gs32_library", "gs32_binary", "result_dir"):
         setattr(args, name, getattr(args, name).expanduser().resolve())
@@ -234,7 +245,53 @@ def read_junit(path):
         for key in ("tests", "failures", "errors", "skipped"):
             if key in suite.attrib and int(suite.attrib[key]) != counts[key]:
                 raise ValueError(f"JUnit {key} count does not match recorded test cases")
-    return junit_counts(root)
+    skipped_tests = [
+        {
+            "classname": case.get("classname", ""),
+            "name": case.get("name", ""),
+            "type": skipped.get("type", ""),
+            "reason": skipped.get("message", ""),
+        }
+        for case in root.iter("testcase")
+        for skipped in case.findall("skipped")
+    ]
+    return junit_counts(root), skipped_tests
+
+
+def checkpoint_coverage_gaps(stage, allowed_pairs):
+    """Recognize only declared missing-data skips, never hardware skips or xfails."""
+    if stage["name"] != "batched":
+        return []
+    classname = "tests.e2e.nightly.test_vq2a8_gs32_batched"
+    allowed = {}
+    for pair in allowed_pairs:
+        label = pair.replace("_to_", " -> ")
+        for function, variants, reason in (
+            (
+                "test_gs32_real_experts_fusion_compare",
+                ("fused", "full_graph"),
+                f"No real {label} expert exists in this checkpoint; combination was not tested.",
+            ),
+            (
+                "test_gs32_real_mixed_ffn_device_prefill_compare_and_timing",
+                ("none", "swiglu_quant"),
+                f"No real {label} expert exists; this prefill combination was not tested.",
+            ),
+        ):
+            for variant in variants:
+                allowed[(f"{function}[{pair}-{variant}]", reason)] = pair
+    gaps = []
+    for skipped in stage["skipped_tests"]:
+        pair = allowed.get((skipped["name"], skipped["reason"]))
+        if pair is not None and skipped["classname"] == classname and skipped["type"] == "pytest.skip":
+            gaps.append(
+                {
+                    "nodeid": f"{TEST_ROOT}/test_vq2a8_gs32_batched.py::{skipped['name']}",
+                    "pair": pair,
+                    "reason": skipped["reason"],
+                }
+            )
+    return gaps
 
 
 def capture_failure_log(stage):
@@ -264,7 +321,7 @@ def run_stage(stage, args, result_dir, on_update):
     try:
         stage["returncode"] = execute(stage["command"], stage["environment"], Path(stage["log"]), args.timeout)
         try:
-            stage["counts"] = read_junit(stage["junit"])
+            stage["counts"], stage["skipped_tests"] = read_junit(stage["junit"])
         except (OSError, ValueError, ET.ParseError) as error:
             stage.update(
                 status="failed",
@@ -276,12 +333,20 @@ def run_stage(stage, args, result_dir, on_update):
             )
         else:
             counts = stage["counts"]
-            passed = stage["returncode"] == 0 and counts["tests"] > 0 and counts["passed"] == counts["tests"]
-            stage["status"] = "passed" if passed else "failed"
+            stage["coverage_gaps"] = checkpoint_coverage_gaps(stage, args.allow_missing_checkpoint_pairs)
+            passed = (
+                stage["returncode"] == 0
+                and counts["passed"] > 0
+                and counts["failures"] == counts["errors"] == 0
+                and counts["skipped"] == len(stage["skipped_tests"]) == len(stage["coverage_gaps"])
+            )
+            stage["status"] = (
+                ("passed_with_coverage_gaps" if stage["coverage_gaps"] else "passed") if passed else "failed"
+            )
             if not passed:
                 stage["error"] = (
-                    f"pytest exited with return code {stage['returncode']}; NPU CI requires nonempty, "
-                    f"successful execution with no skipped/xfail tests. See {stage['log']}"
+                    f"pytest exited with return code {stage['returncode']}; NPU CI requires at least one passed test, "
+                    f"no failures/errors, and no undeclared skipped/xfail tests. See {stage['log']}"
                 )
     except KeyboardInterrupt:
         stage.update(status="interrupted", error="Interrupted; owned pytest process group stopped")
@@ -292,10 +357,12 @@ def run_stage(stage, args, result_dir, on_update):
         stage.update(status="failed", error=str(error))
     finally:
         stage["elapsed_seconds"] = time.monotonic() - start
-        if stage["status"] != "passed":
+        if stage["status"] not in ACCEPTED_STAGE_STATUSES:
             capture_failure_log(stage)
         on_update()
         print(f"STAGE={name} STATUS={stage['status']}", flush=True)
+        for gap in stage.get("coverage_gaps", []):
+            print(f"STAGE={name} COVERAGE_GAP=" + json.dumps(gap, ensure_ascii=False), flush=True)
         if "error" in stage:
             if "returncode" in stage:
                 print(f"STAGE={name} RETURN_CODE={stage['returncode']}", flush=True)
@@ -317,6 +384,9 @@ def main(argv=None):
         "devices": args.devices,
         "model_runners": args.model_runners if args.suite != "kernels" else [],
         "single_card_reference": args.single_card_reference and args.suite != "kernels",
+        "allowed_missing_checkpoint_pairs": args.allow_missing_checkpoint_pairs,
+        "coverage_complete": False,
+        "coverage_gaps": [],
         "scope": "NPU correctness and regression; local timings are not a serving performance gate",
         "timeout_per_stage_seconds": args.timeout,
         "stages": stages,
@@ -341,6 +411,13 @@ def main(argv=None):
     summary = result_dir / "summary.json"
 
     def save():
+        report["coverage_gaps"] = [
+            {"stage": stage["name"], "model": str(args.model), **gap}
+            for stage in stages
+            for gap in stage.get("coverage_gaps", [])
+        ]
+        # Complete refers to the selected suite, not unselected EP1/long-context tests.
+        report["coverage_complete"] = report["status"] == "passed"
         write_json(summary, report)
 
     print(f"RESULT_DIR={result_dir}", flush=True)
@@ -355,11 +432,11 @@ def main(argv=None):
         report["status"] = "running"
         for stage in stages:
             run_stage(stage, args, result_dir, save)
-            if stage["status"] != "passed":
+            if stage["status"] not in ACCEPTED_STAGE_STATUSES:
                 report["status"] = "failed"
                 break
         else:
-            report["status"] = "passed"
+            report["status"] = "passed_with_coverage_gaps" if report["coverage_gaps"] else "passed"
             exit_code = 0
     except KeyboardInterrupt:
         report.update(status="interrupted", error="Interrupted by user")
