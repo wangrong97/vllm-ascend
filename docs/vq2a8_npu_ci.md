@@ -145,6 +145,11 @@ STAGE=batched NOTICE=Checkpoint has no real expert for mxfp4 -> vq2; recorded 4 
 `pr`、`nightly` 的整模型阶段，不会把九个组件阶段变成 V2 测试。
 默认运行两种 runner 时，分别与**同 runner、同 EP2 拓扑的 eager 参考**对比，不是直接比较 V1 与 V2 的数值一致性。
 
+EP eager/decode graph 对照依次使用 `128→4`、`128→4`、`127→4`、`129→4`、`128→4`，
+覆盖不同输入、长度边界和恢复请求。测试上下文长度为 `129 + 4 = 133`，为全部输出预留空间；
+两个执行模式均开启 chunked prefill，每步预算为 128，图模式仅捕获 B1 decode。
+这些参数由测试内部设置，无需修改一键命令，也无需重新编译原生算子。
+
 `nightly` 的恢复序列为 `127→4`、`16384→1024`、`127→4`，这里箭头表示输入 token 数到输出 token 数。
 测试检查每个 worker 的实际 runner 类型、有效性 owner 和 decode 图回放次数；宣称选择 V2 但实际运行 V1 会失败。
 该探针沿用 128-token prefill chunk，**不代表 256K 或 1M 已验收**。

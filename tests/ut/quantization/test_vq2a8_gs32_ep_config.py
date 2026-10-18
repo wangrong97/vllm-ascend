@@ -7,9 +7,12 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from tests.e2e.nightly import test_vq2a8_gs32_ep as ep_probe
 from tests.ut.quantization.test_vq2a8_gs32_fixtures import modules  # noqa: F401
 from tests.ut.quantization.test_vq2a8_gs32_graph_config import graph_config, long_graph_config
 from tools import serve_vq2a8 as serve
@@ -115,8 +118,6 @@ def test_gs32_ep_serving_selects_mp_and_complete_experts(tmp_path, size):
 
 @pytest.mark.parametrize("location", ["parallel", "additional"])
 def test_gs32_ep_rejects_redundant_experts_before_allocating(modules, location):
-    from types import SimpleNamespace
-
     config = ep_config(4)
     if location == "parallel":
         config.parallel_config.eplb_config = SimpleNamespace(num_redundant_experts=4)
@@ -147,6 +148,66 @@ def test_gs32_ep_long_context_reuses_b1_decode_graph(modules, size, budget, use_
     config.parallel_config.enable_expert_parallel = True
     config.parallel_config.expert_placement_strategy = "linear"
     assert modules.config.validate_vq2a8_config(config) == config.additional_config["vq2a8"]
+
+
+@pytest.mark.parametrize("seed_lengths", [(3, 5), (140, 131)])
+def test_ep_probe_preserves_boundary_prompts_and_recovery(seed_lengths):
+    tokenizer = Mock()
+    tokenizer.encode.side_effect = [list(range(1, seed_lengths[0] + 1)), list(range(201, 201 + seed_lengths[1]))]
+    prompts = ep_probe.build_prompts(tokenizer)
+    assert [len(prompt) for prompt in prompts] == [128, 128, 127, 129, 128]
+    assert prompts[0] != prompts[1]
+    assert prompts[2] == prompts[0][:-1]
+    assert prompts[3][:-1] == prompts[0]
+    assert prompts[4] == prompts[0]
+    assert tokenizer.encode.call_count == len(ep_probe.PROMPT_TEXTS)
+    for call, text in zip(tokenizer.encode.call_args_list, ep_probe.PROMPT_TEXTS, strict=True):
+        assert call.args == (text,)
+        assert call.kwargs == {"add_special_tokens": False}
+
+
+@pytest.mark.parametrize("size", [1, 2, 4, 8])
+@pytest.mark.parametrize("execution", ["fused", "full_graph"])
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_ep_probe_reserves_output_budget_with_bounded_prefill(modules, tmp_path, size, execution, use_v2):
+    tokenizer = Mock()
+    tokenizer.encode.side_effect = [[1, 2, 3], [4, 5]]
+    prompts = ep_probe.build_prompts(tokenizer)
+    options = ep_probe.runner_options(execution, tmp_path / "stage.so", tmp_path / "kernel.o", size)
+    assert ep_probe.OUTPUT_TOKENS == 4
+    assert options["max_model_len"] == max(map(len, prompts)) + ep_probe.OUTPUT_TOKENS == 133
+    assert all(len(prompt) + ep_probe.OUTPUT_TOKENS <= options["max_model_len"] for prompt in prompts)
+    assert options["enable_chunked_prefill"] is True
+    assert options["max_num_batched_tokens"] == 128
+    assert options["max_num_seqs"] == 1
+    assert options["enable_prefix_caching"] is False
+    assert options["tensor_parallel_size"] == size
+    assert options["enable_expert_parallel"] is (size > 1)
+    assert options["distributed_executor_backend"] == ("mp" if size > 1 else "uni")
+    if execution == "full_graph":
+        assert options["enforce_eager"] is False
+        assert options["compilation_config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
+        assert options["compilation_config"]["cudagraph_capture_sizes"] == [1]
+        assert options["compilation_config"]["max_cudagraph_capture_size"] == 1
+    else:
+        assert options["enforce_eager"] is True
+        assert options["compilation_config"]["cudagraph_mode"] == "NONE"
+
+    # Validate the generated settings, including the context > 128 branch,
+    # without loading a checkpoint or initializing the upstream NPU runtime.
+    config = ep_config(size)
+    config.use_v2_model_runner = use_v2
+    config.additional_config = options["additional_config"]
+    config.compilation_config = SimpleNamespace(**options["compilation_config"])
+    for field in ("max_model_len", "enforce_eager", "quantization"):
+        setattr(config.model_config, field, options[field])
+    for field in ("enable_chunked_prefill", "max_num_batched_tokens", "max_num_seqs", "async_scheduling"):
+        setattr(config.scheduler_config, field, options[field])
+    for field in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size", "enable_expert_parallel"):
+        setattr(config.parallel_config, field, options[field])
+    config.load_config.load_format = options["load_format"]
+    config.cache_config.enable_prefix_caching = options["enable_prefix_caching"]
+    assert modules.config.validate_vq2a8_config(config) == options["additional_config"]["vq2a8"]
 
 
 @pytest.fixture
