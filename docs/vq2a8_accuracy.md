@@ -301,23 +301,52 @@ python -u -m vllm.entrypoints.cli.main serve "$BASELINE_MODEL" \
   --reasoning-parser deepseek_v4 \
   --generation-config vllm \
   --seed 0 \
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-  --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}' \
-  2>&1 | tee benchmark-results/accuracy-baseline/serve-official-0731-mrv1-dp4.log
+  --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1],"max_cudagraph_capture_size":1,"cudagraph_num_of_warmups":1}' \
+  --additional-config '{"ascend_compilation_config":{"enable_npugraph_ex":false},"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}' \
+  2>&1 | tee benchmark-results/accuracy-baseline/serve-official-0731-mrv1-dp4-compile0.log
 ```
 
-该命令采用普通解码，不开启 DSpark/MTP；`FULL_DECODE_ONLY` 为 decode 阶段启用图，prefill 分块执行。
+该命令采用普通解码，不开启 DSpark/MTP。`mode=0` 关闭 torch.compile，显式关闭 `npugraph_ex`；
+`FULL_DECODE_ONLY` 保留 B1 decode ACL 图捕获和回放，prefill 分块执行。
+仅设置 `FULL_DECODE_ONLY` 不会自动关闭编译优化，两项需要分别配置。
 `--max-num-seqs 1` 是每个 DP rank 的活动序列上限，下面客户端仍以全局并发 `1` 评测。
 与 VQ2A8 示例保持相同的 65536 总上下文、8192 prefill chunk、tokenizer 和 reasoning parser。
 baseline 使用自动内存规划，启动日志中的 KV cache 容量检查必须通过；本命令尚未在目标 NPU 上验证。
 temperature、输出预算和思考模式由下方客户端请求指定，切换数据集或思考模式不需要重启服务。
 
-在终端 B 确认服务就绪，`/v1/models` 应返回 `baseline`：
+在终端 B 确认服务就绪，`/v1/models` 应返回 `baseline`，再验证一次真实生成请求：
 
 ```bash
 curl -fsS http://127.0.0.1:8001/health
 curl -fsS http://127.0.0.1:8001/v1/models
+curl -fsS --max-time 180 http://127.0.0.1:8001/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"baseline","messages":[{"role":"user","content":"Reply with OK."}],"temperature":0,"max_tokens":32,"chat_template_kwargs":{"thinking":false,"reasoning_effort":"none"}}'
 ```
+
+生成请求应成功并返回非空回答；只有 `/health` 成功不足以证明推理正常。
+
+### 启动 profiling 的 HC 形状错误
+
+若启动栈包含 `profile_run`、`aot_autograd`、`npugraph_ex`，并报错
+`The residual.shape[1] should be sequence, actual residual.shape[1] is 8192, sequence is 1`，
+说明 `npu_hc_post` 收到的主分支与残差分支 token 维不一致。
+这里的 `sequence` 是算子输入 `x.size(1)`，不是服务参数 `max-num-seqs`。
+该日志本身不能确定哪个上游算子或编译环节产生了错误形状。
+
+上面的启动配置通过 `mode=0` 和 `enable_npugraph_ex=false` 隔离本次报错的编译路径，
+保留上下文、chunk、并行拓扑和原始权重。此配置已完成源码核对，尚待目标 NPU 启动及真实请求验证；
+不能将它视为编译后端根因已修复的证据。仅修改启动参数，无需重新编译 GS32 算子。
+
+如果仍然失败，可将整项 `--compilation-config` 替换为下面两项，其他参数保持不变，进行全 eager 对照：
+
+```bash
+--enforce-eager \
+--compilation-config '{"mode":0,"cudagraph_mode":"NONE"}'
+```
+
+全 eager 对照同时关闭 decode 图，结果应单独记录，不能与 decode 图服务混作同配置性能数据。
+若 `mode=0` 后仍在 `npu_hc_post` 报相同形状错误，需要继续定位实际前向张量，不能仅归因于编译优化。
 
 ### 一键评测官方 baseline（离线数据）
 
@@ -333,7 +362,7 @@ python tools/tests/run_evalscope_accuracy.py baseline \
   --temperature 0 --top-p 1 --seed 0 --repeats 1 \
   --max-tokens 8192 \
   --concurrency 1 \
-  --label official-0731-mrv1-dp4-no-thinking-t0-o8192 \
+  --label official-0731-mrv1-dp4-compile0-no-thinking-t0-o8192 \
   --result-dir benchmark-results/accuracy-baseline
 ```
 
@@ -349,7 +378,7 @@ python tools/tests/run_evalscope_accuracy.py baseline \
   --temperature 0 --top-p 1 --seed 0 --repeats 1 \
   --max-tokens 32768 \
   --concurrency 1 \
-  --label official-0731-mrv1-dp4-thinking-high-t0-o32768 \
+  --label official-0731-mrv1-dp4-compile0-thinking-high-t0-o32768 \
   --result-dir benchmark-results/accuracy-baseline
 ```
 
