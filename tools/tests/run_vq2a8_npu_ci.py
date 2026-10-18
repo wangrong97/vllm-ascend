@@ -81,6 +81,8 @@ def build_plan(args):
         "addopts=",
         "-o",
         "xfail_strict=True",
+    ]
+    checkpoint_options = [
         "--vq2a8-model",
         str(args.model),
         "--vq2a8-gs32-library",
@@ -91,10 +93,12 @@ def build_plan(args):
     stages = []
 
     def add(name, test, devices, runner, extra=()):
+        # pytest 8 discovers conftest.py from initial positional paths before
+        # it knows our custom options. Put the test ahead of checkpoint paths.
         stages.append(
             {
                 "name": name,
-                "command": [*common, f"{TEST_ROOT}/{test}", *extra],
+                "command": [*common, f"{TEST_ROOT}/{test}", *checkpoint_options, *extra],
                 "environment": {
                     "ASCEND_RT_VISIBLE_DEVICES": devices,
                     "VLLM_USE_V2_MODEL_RUNNER": "1" if runner == "v2" else "0",

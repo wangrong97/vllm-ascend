@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Validate NPU CI orchestration using CPU child processes and real JUnit files."""
 
+import ast
 import importlib.util
 import json
 import os
@@ -87,6 +88,57 @@ def read_report(assets):
     paths = list(assets.results.rglob("summary.json"))
     assert len(paths) == 1
     return json.loads(paths[0].read_text(encoding="utf-8")), paths[0].parent
+
+
+@pytest.mark.parametrize("stage_name", ["activation", "ep2-v2", "recovery-v2"])
+def test_real_plan_discovers_e2e_conftest_and_passes_custom_options(assets, driver, tmp_path, monkeypatch, stage_name):
+    repository = tmp_path / "isolated repository"
+    nightly = repository / driver.TEST_ROOT
+    nightly.mkdir(parents=True)
+    (repository / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    # Reuse the real option declarations without importing NPU-dependent fixtures.
+    conftest_source = (REPO_ROOT / "tests/e2e/conftest.py").read_text(encoding="utf-8")
+    option_hook = next(
+        node
+        for node in ast.parse(conftest_source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "pytest_addoption"
+    )
+    (nightly.parent / "conftest.py").write_text(
+        "import os\nimport pytest\n\n" + ast.get_source_segment(conftest_source, option_hook) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(driver, "REPO_ROOT", repository)
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.setenv("PYTHONUTF8", "1")
+    monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
+    args = driver.parse_args([*assets.argv, "--suite", "nightly", "--model-runners", "v2", "--timeout", "20"])
+    stage = next(stage for stage in driver.build_plan(args) if stage["name"] == stage_name)
+    target = next(argument for argument in stage["command"] if argument.startswith(f"{driver.TEST_ROOT}/"))
+    relative_path, _, node_id = target.partition("::")
+    function = node_id.split("[", 1)[0] if node_id else "test_custom_options"
+    parameter = '@pytest.mark.parametrize("parallelism", ["ep2"])\n' if node_id else ""
+    parameters = "request, parallelism" if node_id else "request"
+    (repository / relative_path).write_text(
+        "import os\nimport pytest\n\n"
+        + parameter
+        + f"def {function}({parameters}):\n"
+        + f"    assert request.config.getoption('--vq2a8-model') == {str(assets.model)!r}\n"
+        + f"    assert request.config.getoption('--vq2a8-gs32-library') == {str(assets.library)!r}\n"
+        + f"    assert request.config.getoption('--vq2a8-gs32-binary') == {str(assets.binary)!r}\n"
+        + f"    assert request.config.getoption('--vq2a8-gs32-ep-skip-single-card') is {stage_name == 'ep2-v2'}\n"
+        + f"    assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == {'4' if stage_name == 'activation' else '4,5'!r}\n"
+        + f"    assert os.environ['VLLM_USE_V2_MODEL_RUNNER'] == {'0' if stage_name == 'activation' else '1'!r}\n",
+        encoding="utf-8",
+    )
+    assets.results.mkdir()
+
+    # Keep command ordering and directory-based conftest discovery exactly as planned.
+    driver.run_stage(stage, args, assets.results, lambda: None)
+
+    log = Path(stage["log"]).read_text(encoding="utf-8")
+    assert stage["returncode"] == 0, log
+    assert stage["status"] == "passed", log
+    assert stage["counts"] == {"tests": 1, "passed": 1, "failures": 0, "errors": 0, "skipped": 0}
+    assert Path(stage["junit"]).is_file()
 
 
 @pytest.mark.parametrize("suite, stage_count", [("kernels", 9), ("pr", 11), ("nightly", 13)])
