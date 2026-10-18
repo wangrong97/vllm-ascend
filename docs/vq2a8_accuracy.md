@@ -260,7 +260,84 @@ Linux 上会清理本次 EvalScope 子进程组及其工作进程，保留退出
 
 ## 与原始模型对比
 
-同样的客户端可以评测已启动的 baseline 服务：
+这里的 baseline 是已经下载到本地的 **官方 `DeepSeek-V4-Flash-0731` checkpoint**。
+官方 Ascend 950DT 部署使用 Attention MXFP8、MoE MXFP4/W4A8 路径，不能标记为 BF16 baseline。
+原始权重直接由 vLLM 加载；不使用 VQ2A8 启动器、GS32 构建产物或 `--quantization ascend`。
+部署依据见 [DeepSeek-V4-Flash 官方指南](https://docs.vllm.ai/projects/ascend/en/v0.27.1rc1/tutorials/models/DeepSeek-V4-Flash.html)。
+
+### 启动官方 baseline 服务
+
+下面使用 **物理卡 4、5、6、7，MRV1、DP4、TP1、EP、decode 图**，端口 `8001`，服务名 `baseline`。
+四卡方案沿用仓库中 Ascend 950DT 的部署拓扑，不代表模型的理论最少卡数。
+这与前面的 VQ2A8 双卡拓扑不同：可以用于相同评测条件下的精度对照，不能直接作为相同资源配置的性能对比。
+请先停止占用这些卡的其他服务，再在终端 A 执行；`BASELINE_MODEL` 改成官方权重的实际目录：
+
+```bash
+export BASELINE_MODEL=/mnt/share/g00872988/DeepSeek-V4-Flash-0731
+mkdir -p benchmark-results/accuracy-baseline
+set -o pipefail
+
+ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 VLLM_USE_V2_MODEL_RUNNER=0 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+OMP_PROC_BIND=false HCCL_BUFFSIZE=1024 \
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True \
+python -u -m vllm.entrypoints.cli.main serve "$BASELINE_MODEL" \
+  --served-model-name baseline \
+  --host 127.0.0.1 --port 8001 \
+  --dtype auto \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 4 \
+  --enable-expert-parallel \
+  --api-server-count 1 \
+  --max-model-len 65536 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 1 \
+  --gpu-memory-utilization 0.9 \
+  --enable-chunked-prefill \
+  --no-enable-prefix-caching \
+  --no-async-scheduling \
+  --block-size 32 \
+  --tokenizer-mode deepseek_v4 \
+  --reasoning-parser deepseek_v4 \
+  --generation-config vllm \
+  --seed 0 \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}' \
+  2>&1 | tee benchmark-results/accuracy-baseline/serve-official-0731-mrv1-dp4.log
+```
+
+该命令采用普通解码，不开启 DSpark/MTP；`FULL_DECODE_ONLY` 为 decode 阶段启用图，prefill 分块执行。
+`--max-num-seqs 1` 是每个 DP rank 的活动序列上限，下面客户端仍以全局并发 `1` 评测。
+与 VQ2A8 示例保持相同的 65536 总上下文、8192 prefill chunk、tokenizer 和 reasoning parser。
+baseline 使用自动内存规划，启动日志中的 KV cache 容量检查必须通过；本命令尚未在目标 NPU 上验证。
+temperature、输出预算和思考模式由下方客户端请求指定，切换数据集或思考模式不需要重启服务。
+
+在终端 B 确认服务就绪，`/v1/models` 应返回 `baseline`：
+
+```bash
+curl -fsS http://127.0.0.1:8001/health
+curl -fsS http://127.0.0.1:8001/v1/models
+```
+
+### 一键评测官方 baseline（离线数据）
+
+No-thinking 完整评测，三个数据集统一使用 8192 输出上限：
+
+```bash
+python tools/tests/run_evalscope_accuracy.py baseline \
+  --base-url http://127.0.0.1:8001 \
+  --model baseline \
+  --datasets gpqa aime24 aime25 \
+  --offline-data-dir /mnt/share/g00872988/vq2a8-eval-data \
+  --no-thinking \
+  --temperature 0 --top-p 1 --seed 0 --repeats 1 \
+  --max-tokens 8192 \
+  --concurrency 1 \
+  --label official-0731-mrv1-dp4-no-thinking-t0-o8192 \
+  --result-dir benchmark-results/accuracy-baseline
+```
+
+Thinking 完整评测，复用同一个服务，输出上限为 32768：
 
 ```bash
 python tools/tests/run_evalscope_accuracy.py baseline \
@@ -272,14 +349,16 @@ python tools/tests/run_evalscope_accuracy.py baseline \
   --temperature 0 --top-p 1 --seed 0 --repeats 1 \
   --max-tokens 32768 \
   --concurrency 1 \
-  --label bf16-baseline-thinking-high-t0-o32768 \
+  --label official-0731-mrv1-dp4-thinking-high-t0-o32768 \
   --result-dir benchmark-results/accuracy-baseline
 ```
 
+也可以使用 `bash tools/tests/run_baseline_evalscope_accuracy.sh`，其余参数相同。
+两个入口都会实时打印 EvalScope 输出并保存日志；每次运行单独创建结果目录，不覆盖已有评测。
+首次检查可追加 `--limit 2`；正式评测移除该选项。离线包缺失或校验失败会报错，不会自动联网下载。
+
 两边使用相同数据包、提示模板、思考配置、采样参数、输出预算和重复次数。
-上例对照同一个 DeepSeek-V4 模型的原始精度服务，服务端也应使用对应 tokenizer/parser 并提供足够上下文。
-对照 no-thinking 时，两边都改用 `--no-thinking --max-tokens 8192`，移除 `--thinking --reasoning-effort high`，
-并将 label 更新为相应的 `no-thinking-t0-o8192` 配置。
+no-thinking 比较两边的 8192 预算结果，thinking 比较两边的 high / 32768 预算结果。
 先检查截断、空回答和请求错误，再比较各数据集分数。
 AIME 每年只有 30 题，一道题约占 3.33 个百分点；小样本波动不能直接归因于量化。
 
