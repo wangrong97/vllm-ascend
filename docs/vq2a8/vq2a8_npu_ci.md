@@ -22,7 +22,7 @@ NPU 回归、服务 TTFT/TPOT 和模型答题准确率是三类独立检查。�
   `libvq2a8_gs32_stage.so` 和 `mixed_w2w4_moe_ffn.o`。它不是需要新建的固定目录名。
 - 整模型测试还需要完整的 `vllm_ascend_C` 扩展及配套 ACLNN 算子，包括 SAS/QLI AICPU metadata 修复。
   仅构建 GS32 bridge 不足以运行整模型；更新相关源码后应重建对应原生产物。
-  构建与 checkpoint 说明见[集成文档](vq2a8_gs32.md#build-and-checkpoint-prerequisites)。
+  构建与 checkpoint 说明见[集成文档](vq2a8_gs32.md#构建与-checkpoint-准备)。
 - checkpoint 用于验证其中实际存在的 VQ2/MXFP4 混合投影组合。若缺少真实的 `mxfp4 -> vq2` 专家，
   一键 CI 会自动提示、记录覆盖缺口并继续；无需额外参数。其他 skip 和真实测试失败仍会阻断。
 
