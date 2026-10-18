@@ -107,8 +107,11 @@ curl -fsS http://127.0.0.1:8000/v1/models
 thinking/no-thinking 的对照也使用相同预算，只改变思考模式。不同配置的结果应分别标注，不能直接当作量化差异。
 本文参数是项目回归条件，不是三个数据集或模型厂商的官方最优成绩配置。
 
-## 一键执行
+## 一键执行（离线数据）
 
+以下命令统一读取容器内的 `/mnt/share/g00872988/vq2a8-eval-data` 离线包。
+请先复制完整数据目录，保留其中的 `manifest.json` 和 `datasets/`；其他部署路径需同步修改 `--offline-data-dir`。
+脚本会校验离线数据后再评测；数据缺失或校验失败时直接报错，不会回退到联网下载。
 首次接入可先使用下方的 `--limit 2` 示例检查返回内容、评分和截断情况，再运行完整评测。
 
 ```bash
@@ -117,6 +120,7 @@ python tools/tests/run_vq2a8_accuracy_suite.py \
   --base-url http://127.0.0.1:8000 \
   --model vq2a8 \
   --datasets gpqa aime24 aime25 \
+  --offline-data-dir /mnt/share/g00872988/vq2a8-eval-data \
   --thinking --reasoning-effort high \
   --temperature 0 --top-p 1 --seed 0 --repeats 1 \
   --concurrency 1 \
@@ -129,6 +133,7 @@ python tools/tests/run_vq2a8_accuracy_suite.py \
   --base-url http://127.0.0.1:8000 \
   --model vq2a8 \
   --datasets gpqa aime24 aime25 \
+  --offline-data-dir /mnt/share/g00872988/vq2a8-eval-data \
   --no-thinking \
   --temperature 0 --top-p 1 --seed 0 --repeats 1 \
   --concurrency 1 \
@@ -139,10 +144,12 @@ python tools/tests/run_vq2a8_accuracy_suite.py \
 # 只运行 AIME25；--limit 2 明确标记为 smoke，不能作为完整成绩
 python tools/tests/run_vq2a8_accuracy_suite.py \
   --datasets aime25 --thinking --limit 2 --concurrency 1 \
+  --offline-data-dir /mnt/share/g00872988/vq2a8-eval-data \
   --temperature 0 --top-p 1 --max-tokens 32768
 
-# 只预览完整命令，不联网、不安装依赖、不创建结果目录
+# 只预览完整命令，不校验离线包、不联网、不创建结果目录
 python tools/tests/run_vq2a8_accuracy_suite.py \
+  --offline-data-dir /mnt/share/g00872988/vq2a8-eval-data \
   --datasets gpqa aime24 --no-thinking --dry-run
 ```
 
@@ -177,7 +184,8 @@ top-p 与思考模式沿用服务设置。本文完整回归示例显式改用 3
 
 ## 内网离线数据
 
-有网络的机器先使用相同 EvalScope 版本准备并导出完整数据集：
+已有离线包时，将完整目录复制到评测容器可见的 `/mnt/share/g00872988/vq2a8-eval-data`，无需再次下载。
+需要重新制作离线包时，在有网络的机器上使用相同 EvalScope 版本准备并导出完整数据集：
 
 ```bash
 python tools/tests/prepare_evalscope_datasets.py \
@@ -193,7 +201,7 @@ python tools/tests/run_vq2a8_accuracy_suite.py \
   --base-url http://127.0.0.1:8000 \
   --model vq2a8 \
   --datasets gpqa aime24 aime25 \
-  --offline-data-dir /mnt/share/vq2a8-eval-data \
+  --offline-data-dir /mnt/share/g00872988/vq2a8-eval-data \
   --thinking --reasoning-effort high \
   --temperature 0 --top-p 1 --seed 0 --repeats 1 \
   --max-tokens 32768 \
@@ -254,7 +262,7 @@ python tools/tests/run_evalscope_accuracy.py baseline \
   --base-url http://127.0.0.1:8001 \
   --model baseline \
   --datasets gpqa aime24 aime25 \
-  --offline-data-dir /mnt/share/vq2a8-eval-data \
+  --offline-data-dir /mnt/share/g00872988/vq2a8-eval-data \
   --thinking --reasoning-effort high \
   --temperature 0 --top-p 1 --seed 0 --repeats 1 \
   --max-tokens 32768 \
