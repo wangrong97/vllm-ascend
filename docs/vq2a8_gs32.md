@@ -106,6 +106,12 @@ offline bundles, native grading and baseline score comparisons.
 
 The [NPU CI guide](vq2a8_npu_ci.md) documents the `kernels`, `pr` and `nightly`
 suites, both model runners, artifact requirements, logs and strict pass criteria.
+The default command rejects all skipped tests. If the checkpoint is known to
+lack a real GateUp-to-Down expert pair, use the
+[missing checkpoint pair instructions](vq2a8_npu_ci.md#checkpoint-缺少真实专家组合时).
+For example, `--allow-missing-checkpoint-pairs mxfp4_to_vq2` records those specific
+coverage gaps and continues the remaining stages. A successful run with gaps is
+reported as `passed_with_coverage_gaps`, not a complete coverage pass.
 
 ### Individual test entry points
 

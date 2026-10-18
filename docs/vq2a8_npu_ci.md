@@ -42,7 +42,15 @@ test -f "$BUILD/mixed_w2w4_moe_ffn.o"
 
 ## 一键执行
 
-日常 PR 回归推荐使用空闲卡 4、5，默认依次验证 MRV1 和 MRV2：
+先按 checkpoint 的覆盖情况选择命令：
+
+- **严格模式（默认）**：使用下面的命令，要求全部选定用例通过，任何 skip 都会停止后续阶段。
+- **已确认缺少真实专家组合**：例如 `batched` 为 `18 passed, 4 skipped`，原因是缺少 `mxfp4 -> vq2`，
+  使用下方[缺失组合的完整命令](#checkpoint-缺少真实专家组合时)，其中增加
+  `--allow-missing-checkpoint-pairs mxfp4_to_vq2`。其余检查通过后结果为 `passed_with_coverage_gaps`，
+  保留缺口记录，不能报告为全组合覆盖通过。
+
+严格模式的日常 PR 回归使用空闲卡 4、5，默认依次验证 MRV1 和 MRV2：
 
 ```bash
 python tools/tests/run_vq2a8_npu_ci.py \
