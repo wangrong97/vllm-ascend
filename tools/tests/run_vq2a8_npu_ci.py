@@ -34,6 +34,8 @@ MODEL_TEST = "test_vq2a8_gs32_ep.py::test_gs32_ep_real_model_eager_and_graphs_ma
 RECOVERY_TEST = "test_vq2a8_gs32_ep_long_context.py::test_gs32_ep_long_context_decode_graph_and_recovery[ep2]"
 TERMINATE_GRACE_SECONDS = 10
 PREFLIGHT_SECONDS = 120
+LOG_TAIL_BYTES = 16384
+LOG_TAIL_LINES = 64
 
 
 def parse_args(argv=None):
@@ -226,6 +228,18 @@ def read_junit(path):
     return junit_counts(root)
 
 
+def capture_failure_log(stage):
+    """Keep bounded child output without hiding the original stage failure."""
+    try:
+        with Path(stage["log"]).open("rb") as log:
+            size = log.seek(0, os.SEEK_END)
+            log.seek(max(0, size - LOG_TAIL_BYTES))
+            tail = log.read(LOG_TAIL_BYTES).decode("utf-8", errors="replace")
+        stage["log_tail"] = "\n".join(tail.splitlines()[-LOG_TAIL_LINES:])
+    except OSError as error:
+        stage["log_tail_error"] = str(error)
+
+
 def run_stage(stage, args, result_dir, on_update):
     name = stage["name"]
     stage.update(
@@ -240,12 +254,26 @@ def run_stage(stage, args, result_dir, on_update):
     start = time.monotonic()
     try:
         stage["returncode"] = execute(stage["command"], stage["environment"], Path(stage["log"]), args.timeout)
-        stage["counts"] = read_junit(stage["junit"])
-        counts = stage["counts"]
-        passed = stage["returncode"] == 0 and counts["tests"] > 0 and counts["passed"] == counts["tests"]
-        stage["status"] = "passed" if passed else "failed"
-        if not passed:
-            stage["error"] = "NPU CI requires nonempty, successful execution with no skipped/xfail tests"
+        try:
+            stage["counts"] = read_junit(stage["junit"])
+        except (OSError, ValueError, ET.ParseError) as error:
+            stage.update(
+                status="failed",
+                junit_error=str(error),
+                error=(
+                    f"pytest exited with return code {stage['returncode']}; JUnit report unavailable or invalid: "
+                    f"{error}. See {stage['log']} for child-process diagnostics"
+                ),
+            )
+        else:
+            counts = stage["counts"]
+            passed = stage["returncode"] == 0 and counts["tests"] > 0 and counts["passed"] == counts["tests"]
+            stage["status"] = "passed" if passed else "failed"
+            if not passed:
+                stage["error"] = (
+                    f"pytest exited with return code {stage['returncode']}; NPU CI requires nonempty, "
+                    f"successful execution with no skipped/xfail tests. See {stage['log']}"
+                )
     except KeyboardInterrupt:
         stage.update(status="interrupted", error="Interrupted; owned pytest process group stopped")
         raise
@@ -255,10 +283,20 @@ def run_stage(stage, args, result_dir, on_update):
         stage.update(status="failed", error=str(error))
     finally:
         stage["elapsed_seconds"] = time.monotonic() - start
+        if stage["status"] != "passed":
+            capture_failure_log(stage)
         on_update()
         print(f"STAGE={name} STATUS={stage['status']}", flush=True)
         if "error" in stage:
+            if "returncode" in stage:
+                print(f"STAGE={name} RETURN_CODE={stage['returncode']}", flush=True)
             print(f"STAGE={name} ERROR={stage['error']}", flush=True)
+            if stage.get("log_tail"):
+                print(f"STAGE={name} LOG_TAIL_BEGIN LOG={stage['log']}", flush=True)
+                print(stage["log_tail"], flush=True)
+                print(f"STAGE={name} LOG_TAIL_END", flush=True)
+            elif "log_tail_error" in stage:
+                print(f"STAGE={name} LOG_TAIL_ERROR={stage['log_tail_error']}", flush=True)
 
 
 def main(argv=None):

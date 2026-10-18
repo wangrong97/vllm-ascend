@@ -381,12 +381,131 @@ def test_nonpassing_junit_or_child_exit_never_produces_green_and_stops(assets, d
         assert failed["returncode"] == 2
 
 
-def test_timeout_terminates_child_and_prevents_later_stage(assets, driver, child_plan):
+@pytest.mark.parametrize(
+    "failure, diagnostic",
+    [
+        ("arguments", "unrecognized arguments: --vq2a8-unknown-option"),
+        ("conftest", "ImportError: vq2a8_conftest_import_sentinel"),
+    ],
+)
+def test_real_pytest_startup_failure_preserves_diagnostics_and_stops(
+    assets, driver, tmp_path, monkeypatch, capsys, failure, diagnostic
+):
+    isolated = tmp_path / "isolated pytest"
+    isolated.mkdir()
+    config = isolated / "pytest.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
+    test_file = isolated / "test_smoke.py"
+    test_file.write_text("def test_pass():\n    assert True\n", encoding="utf-8")
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "pytest",
+        "-c",
+        str(config),
+        "--confcutdir",
+        str(isolated),
+        str(test_file),
+    ]
+    if failure == "arguments":
+        command += ["--noconftest", "--vq2a8-unknown-option"]
+    else:
+        (isolated / "conftest.py").write_text("raise ImportError('vq2a8_conftest_import_sentinel')\n", encoding="utf-8")
+    marker = tmp_path / "later-started"
+    plan = [
+        {
+            "name": "startup-failure",
+            "command": command,
+            "environment": {"PYTHONUTF8": "1", "PYTEST_ADDOPTS": "", "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        },
+        {
+            "name": "must-not-start",
+            "command": [
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).write_text('started')",
+            ],
+            "environment": {},
+        },
+    ]
+    monkeypatch.setattr(driver, "preflight", lambda *args: None)
+    monkeypatch.setattr(driver, "build_plan", lambda *args: plan)
+
+    assert driver.main([*assets.argv, "--timeout", "20"]) == 1
+    console = capsys.readouterr().out
+    report, _ = read_report(assets)
+    failed, later = report["stages"]
+    assert report["status"] == "failed" and failed["status"] == "failed"
+    assert failed["returncode"] == 4
+    assert not Path(failed["junit"]).exists()
+    assert Path(failed["junit"]).name in failed["junit_error"]
+    assert "return code 4" in failed["error"]
+    assert failed["log"] in failed["error"]
+    assert diagnostic in failed["log_tail"]
+    assert diagnostic in console
+    assert "STAGE=startup-failure RETURN_CODE=4" in console
+    assert f"STAGE=startup-failure LOG_TAIL_BEGIN LOG={failed['log']}" in console
+    assert "STAGE=startup-failure LOG_TAIL_END" in console
+    assert later["status"] == "not_run" and not marker.exists()
+
+
+@pytest.mark.parametrize("shape", ["many_lines", "long_line"])
+def test_failure_log_tail_is_bounded_and_keeps_the_latest_diagnostic(driver, tmp_path, shape):
+    log = tmp_path / "child.log"
+    prefix = "old diagnostic that must be omitted\n"
+    if shape == "many_lines":
+        content = prefix + "detail\n" * (driver.LOG_TAIL_LINES * 2)
+    else:
+        content = prefix + "x" * (driver.LOG_TAIL_BYTES * 2) + "\n"
+    log.write_text(content + "latest diagnostic\n", encoding="utf-8")
+    stage = {"log": str(log), "status": "failed", "error": "original error"}
+
+    driver.capture_failure_log(stage)
+
+    assert stage["status"] == "failed" and stage["error"] == "original error"
+    assert stage["log_tail"].endswith("latest diagnostic")
+    assert "old diagnostic" not in stage["log_tail"]
+    assert len(stage["log_tail"].splitlines()) <= driver.LOG_TAIL_LINES
+    assert len(stage["log_tail"].encode("utf-8")) <= driver.LOG_TAIL_BYTES
+    assert "log_tail_error" not in stage
+
+
+def test_failure_log_tail_replaces_invalid_utf8_without_hiding_the_cause(driver, tmp_path):
+    log = tmp_path / "child.log"
+    log.write_bytes(b"compiler output: \xff\xfe\nactual failure\n")
+    stage = {"log": str(log), "status": "failed", "error": "original error"}
+
+    driver.capture_failure_log(stage)
+
+    assert stage["status"] == "failed" and stage["error"] == "original error"
+    assert "\ufffd" in stage["log_tail"]
+    assert stage["log_tail"].endswith("actual failure")
+    assert "log_tail_error" not in stage
+
+
+@pytest.mark.parametrize("unreadable", ["missing", "directory"])
+def test_unreadable_failure_log_keeps_original_failure(driver, tmp_path, unreadable):
+    log = tmp_path / "child.log"
+    if unreadable == "directory":
+        log.mkdir()
+    stage = {"log": str(log), "status": "failed", "error": "original error"}
+
+    driver.capture_failure_log(stage)
+
+    assert stage["status"] == "failed" and stage["error"] == "original error"
+    assert stage["log_tail_error"]
+    assert "log_tail" not in stage
+
+
+def test_timeout_terminates_child_and_prevents_later_stage(assets, driver, child_plan, capsys):
     child_plan.configure("sleep", "pass")
     assert driver.main([*assets.argv, "--timeout", "1"]) != 0
     report, _ = read_report(assets)
     first, later = report["stages"]
     assert first["status"] == "timeout" and first["error"]
+    assert "child stage: sleep" in first["log_tail"]
+    assert "child stage: sleep" in capsys.readouterr().out
     assert later["status"] == "not_run"
     children = [json.loads(line) for line in child_plan.trace.read_text(encoding="utf-8").splitlines()]
     assert [child["mode"] for child in children] == ["sleep"]

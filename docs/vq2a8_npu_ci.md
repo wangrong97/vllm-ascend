@@ -158,6 +158,18 @@ benchmark-results/npu-ci/vq2a8-npu-ci-<时间戳>-<随机后缀>/
 JUnit XML 保留各用例结果和 skip 原因；pytest 临时目录保留模型子进程的日志及报告。
 `summary.json` 记录 checkout commit、实际命令、所选环境覆盖、测试计数、耗时和状态，并在阶段更新时保存。
 
+失败阶段会打印子进程退出码（如果已经取得）和日志末尾，最多读取 16 KiB、显示最后 64 行，
+并将其保存到阶段的 `log_tail`。完整日志仍保留在原文件；日志读取失败单独记录，不覆盖原错误。
+如果 pytest 在参数解析或加载 `conftest.py` 时退出，可能还没有生成 JUnit XML。
+此时汇总会同时记录 `returncode`、`junit_error` 和日志，不能仅根据“缺少 XML”判断是算子精度失败。
+例如，对终端打印出的结果目录查看：
+
+```bash
+RESULT=/path/to/the/printed/result-directory
+sed -n '1,220p' "$RESULT/activation.log"
+tail -n 80 "$RESULT/activation.log"
+```
+
 可以把上面的一键命令作为内部 Linux NPU CI job 的步骤，归档整个结果目录，使用进程退出码判定 job 成败。
 脚本本身不注册 self-hosted runner，也不自动安装 GitHub PR 触发任务。
 如果通过 `tee` 保存终端输出，应先执行 `set -o pipefail`，避免管道把失败退出码覆盖掉。
