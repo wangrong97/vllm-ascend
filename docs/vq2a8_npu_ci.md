@@ -23,8 +23,8 @@ NPU 回归、服务 TTFT/TPOT 和模型答题准确率是三类独立检查。�
 - 整模型测试还需要完整的 `vllm_ascend_C` 扩展及配套 ACLNN 算子，包括 SAS/QLI AICPU metadata 修复。
   仅构建 GS32 bridge 不足以运行整模型；更新相关源码后应重建对应原生产物。
   构建与 checkpoint 说明见[集成文档](vq2a8_gs32.md#build-and-checkpoint-prerequisites)。
-- checkpoint 应覆盖测试需要的 VQ2/MXFP4 混合投影组合；默认情况下，缺少组合导致的 pytest skip 会使一键 CI 失败。
-  需要先验证其余路径时，可以按下文显式声明缺失组合，并保留覆盖缺口记录。
+- checkpoint 用于验证其中实际存在的 VQ2/MXFP4 混合投影组合。若缺少真实的 `mxfp4 -> vq2` 专家，
+  一键 CI 会自动提示、记录覆盖缺口并继续；无需额外参数。其他 skip 和真实测试失败仍会阻断。
 
 先确认当前终端中的既有路径：
 
@@ -42,15 +42,9 @@ test -f "$BUILD/mixed_w2w4_moe_ffn.o"
 
 ## 一键执行
 
-先按 checkpoint 的覆盖情况选择命令：
-
-- **严格模式（默认）**：使用下面的命令，要求全部选定用例通过，任何 skip 都会停止后续阶段。
-- **已确认缺少真实专家组合**：例如 `batched` 为 `18 passed, 4 skipped`，原因是缺少 `mxfp4 -> vq2`，
-  使用下方[缺失组合的完整命令](#checkpoint-缺少真实专家组合时)，其中增加
-  `--allow-missing-checkpoint-pairs mxfp4_to_vq2`。其余检查通过后结果为 `passed_with_coverage_gaps`，
-  保留缺口记录，不能报告为全组合覆盖通过。
-
-严格模式的日常 PR 回归使用空闲卡 4、5，默认依次验证 MRV1 和 MRV2：
+日常 PR 回归使用空闲卡 4、5，默认依次验证 MRV1 和 MRV2。
+下面的命令已自动处理 checkpoint 缺少真实 `mxfp4 -> vq2` 专家的情况，不需要在命令中增加允许跳过的参数。
+具体提示与结果含义见[缺失组合处理](#checkpoint-缺少真实专家组合时)。
 
 ```bash
 python tools/tests/run_vq2a8_npu_ci.py \
@@ -94,34 +88,31 @@ python tools/tests/run_vq2a8_npu_ci.py \
 例如，`batched` 显示 `18 passed, 4 skipped`，四个 skip 的原因均为缺少真实的 `mxfp4 -> vq2` 专家。
 这表示 GateUp 使用 MXFP4、Down 使用 VQ2 的同一专家未在 checkpoint 中找到；不是四个数值比较失败。
 其中两项检查 `fused/full_graph` 下的激活融合对照，另外两项检查 `none/swiglu_quant` 下的 prefill 对照。
-严格模式会在此停止，后续 EP 和 MRV1/MRV2 标为 `not_run`。
+一键 CI **默认自动接受这类缺失组合**，打印提示并继续后续 EP 和 MRV1/MRV2 阶段，无需修改上面的命令。
+只有对应真实专家测试报告该专家组合不存在时，才采用此处理；如果 checkpoint 含有该组合，测试照常执行，失败仍会阻断。
 
-若接受该 checkpoint 的已知数据覆盖缺口，希望继续验证其余路径，可显式加入：
+该阶段其余检查通过时，终端会显示类似提示：
 
-```bash
-python tools/tests/run_vq2a8_npu_ci.py \
-  --devices 4,5 \
-  --model "$MODEL" \
-  --gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
-  --gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o" \
-  --suite pr \
-  --allow-missing-checkpoint-pairs mxfp4_to_vq2 \
-  --result-dir benchmark-results/npu-ci
+```text
+STAGE=batched STATUS=passed_with_coverage_gaps
+STAGE=batched NOTICE=Checkpoint has no real expert for mxfp4 -> vq2; recorded 4 untested cases and continuing remaining checks. MODEL=/path/to/checkpoint
 ```
 
-该参数不排除测试，仍然执行全部选定阶段。仅允许 `batched` 中上述两个真实专家测试的确切参数化用例，
-且 pytest skip 原因必须与声明组合的“checkpoint 中不存在真实专家”完全一致。
+自动处理只适用于 `batched` 中上述两个真实专家测试的四个确切参数化用例，
+且 pytest skip 原因必须与“checkpoint 中不存在真实 mxfp4 -> vq2 专家”完全一致。
 缺少 NPU、依赖、模型参数等其他 skip，以及 xfail、失败、错误、整阶段无实际通过用例，仍会使 CI 失败。
-参数支持列出多个组合：`vq2_to_vq2`、`vq2_to_mxfp4`、`mxfp4_to_vq2`、`mxfp4_to_mxfp4`；只声明实际确认缺少的组合。
+其他专家组合的缺失默认仍阻断；旧参数 `--allow-missing-checkpoint-pairs` 保留兼容，供明确接受其他组合缺口时使用。
+已使用该参数指定 `mxfp4_to_vq2` 的旧命令也继续有效，但现在可以直接移除这一参数。
 
 全部其余检查通过后，汇总为 **`passed_with_coverage_gaps`**，`coverage_complete=false`，退出码为 `0`。
-这表示声明范围内的验收通过，不能报告为全组合覆盖通过。原始 `skipped` 计数保留，
+这表示已执行的检查通过，不能报告为全组合覆盖通过。原始 `skipped` 计数保留，
 `coverage_gaps` 逐项记录阶段、checkpoint、测试 nodeid、组合和原因，终端也实时打印 `COVERAGE_GAP`。
-阶段中的 `skipped_tests` 保留全部 skip/xfail 的类型和原因，方便识别未声明的缺口。
+`automatic_missing_checkpoint_pairs` 记录默认自动处理的组合，`allowed_missing_checkpoint_pairs` 记录自动与显式指定的有效并集。
+阶段中的 `skipped_tests` 保留全部 skip/xfail 的类型和原因，方便识别其他缺口。
 后续阶段若失败，总状态仍为 `failed`，之前的缺口记录不会丢失。
 
-补齐含该真实专家组合的 checkpoint 后，移除此参数重新运行严格模式；人工拼接不同专家权重不能替代真实专家覆盖。
-内部 CI 若要求完整覆盖，应保持默认严格命令，并要求 `status=passed`、`coverage_complete=true`。
+补齐含该真实专家组合的 checkpoint 后，使用同一命令重新运行；人工拼接不同专家权重不能替代真实专家覆盖。
+内部 CI 若额外要求完整覆盖，应检查 `status=passed`、`coverage_complete=true`。
 这里的完整覆盖仅指所选套件的必跑用例，不包含未选择的 EP1、长上下文性能或数据集精度评测。
 
 ## 三套件的覆盖范围
@@ -171,12 +162,12 @@ python tools/tests/run_vq2a8_npu_ci.py \
 
 退出码及汇总规则：
 
-- 默认模式返回 `0`：所有选定阶段均实际执行至少一个测试，并且无 failure、error、skip 或 xfail。
+- 返回 `0`：所有选定阶段均至少有一个实际通过用例，并且无 failure、error、xfail 或不支持的 skip。
   驱动同时启用 `xfail_strict=True`，不能用意外通过的预期失败用例掩盖结果。
-- 显式声明缺失组合后返回 `0`：其余检查全部通过，可以有符合声明的 checkpoint 数据 skip；
-  此时汇总为 `passed_with_coverage_gaps`，不计作完整覆盖通过。若实际没有 skip，仍为普通 `passed`。
+  若仅存在自动接受的 `mxfp4 -> vq2` 缺失，或通过旧参数额外声明的组合缺失，汇总为 `passed_with_coverage_gaps`；
+  若实际没有 skip，汇总为 `passed`。两者均不会因为这些已识别的数据缺口报错。
 - 返回 `1`：环境预检失败、测试失败、超时、零测试，或 JUnit 缺失、格式错误、计数不一致。
-  未显式接受的 checkpoint 组合 skip，也属于未完成验收。
+  其他未接受的 skip、xfail 或整阶段全 skip，也属于未完成验收。
 - Ctrl+C 或 SIGTERM：保存已完成部分及中断状态，返回 `130`。
 
 出现失败即停止后续阶段，尚未运行的阶段保留为 `not_run`。

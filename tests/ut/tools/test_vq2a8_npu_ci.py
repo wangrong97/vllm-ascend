@@ -422,19 +422,49 @@ def checkpoint_gap_plan(tmp_path, driver, monkeypatch):
     return configure
 
 
-def test_checkpoint_gap_is_strictly_rejected_by_default(assets, driver, checkpoint_gap_plan):
+def test_known_checkpoint_gap_automatically_continues_with_notice(assets, driver, checkpoint_gap_plan, capsys):
     checkpoint_gap_plan()
-    assert driver.main(assets.argv) == 1
+    assert driver.main(assets.argv) == 0
     report, _ = read_report(assets)
-    assert report["allowed_missing_checkpoint_pairs"] == []
+    assert report["automatic_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
     assert report["coverage_complete"] is False
-    assert report["status"] == "failed"
-    assert [stage["status"] for stage in report["stages"]] == ["failed", "not_run", "not_run"]
+    assert report["status"] == "passed_with_coverage_gaps"
+    assert [stage["status"] for stage in report["stages"]] == ["passed_with_coverage_gaps", "passed", "passed"]
     stage = report["stages"][0]
     assert stage["returncode"] == 0
     assert stage["counts"] == {"tests": 5, "passed": 1, "failures": 0, "errors": 0, "skipped": 4}
     assert len(stage["skipped_tests"]) == 4
     assert {case["type"] for case in stage["skipped_tests"]} == {"pytest.skip"}
+    assert len(stage["coverage_gaps"]) == len(report["coverage_gaps"]) == 4
+    assert all(gap["pair"] == "mxfp4_to_vq2" and gap["model"] == str(assets.model) for gap in report["coverage_gaps"])
+    output = capsys.readouterr().out
+    assert "NOTICE" in output and "mxfp4_to_vq2" in output and str(assets.model) in output
+
+
+@pytest.mark.parametrize("pair", ["vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_mxfp4"])
+def test_other_checkpoint_pairs_remain_rejected_without_explicit_permission(assets, driver, checkpoint_gap_plan, pair):
+    checkpoint_gap_plan(pair=pair)
+    assert driver.main(assets.argv) == 1
+    report, _ = read_report(assets)
+    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["coverage_complete"] is False
+    assert report["status"] == "failed"
+    assert [stage["status"] for stage in report["stages"]] == ["failed", "not_run", "not_run"]
+    assert report["stages"][0]["counts"]["skipped"] == 4
+
+
+def test_explicit_pairs_merge_with_automatic_pair_without_duplicates(assets, driver):
+    args = driver.parse_args(
+        [
+            *assets.argv,
+            "--allow-missing-checkpoint-pairs",
+            "vq2_to_mxfp4",
+            "mxfp4_to_vq2",
+            "vq2_to_vq2",
+        ]
+    )
+    assert args.allow_missing_checkpoint_pairs == ["mxfp4_to_vq2", "vq2_to_mxfp4", "vq2_to_vq2"]
 
 
 @pytest.mark.parametrize("pair", ["vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_vq2", "mxfp4_to_mxfp4"])
@@ -443,7 +473,8 @@ def test_explicit_checkpoint_gap_continues_and_preserves_real_skip_coverage(asse
     assert driver.main([*assets.argv, "--allow-missing-checkpoint-pairs", pair]) == 0
     report, _ = read_report(assets)
     assert report["status"] == "passed_with_coverage_gaps"
-    assert report["allowed_missing_checkpoint_pairs"] == [pair]
+    assert report["automatic_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2", *([pair] if pair != "mxfp4_to_vq2" else [])]
     assert report["coverage_complete"] is False
     assert [stage["status"] for stage in report["stages"]] == ["passed_with_coverage_gaps", "passed", "passed"]
     stage = report["stages"][0]
@@ -467,25 +498,26 @@ def test_explicit_checkpoint_gap_continues_and_preserves_real_skip_coverage(asse
 
 
 @pytest.mark.parametrize(
-    "mode,stage_name,allowed",
+    "mode,stage_name,pair,allowed",
     [
-        ("other_skip", "batched", "mxfp4_to_vq2"),
-        ("xfail", "batched", "mxfp4_to_vq2"),
-        ("wrong_reason", "batched", "mxfp4_to_vq2"),
-        ("wrong_class", "batched", "mxfp4_to_vq2"),
-        ("wrong_function", "batched", "mxfp4_to_vq2"),
-        ("wrong_variant", "batched", "mxfp4_to_vq2"),
-        ("all_skip", "batched", "mxfp4_to_vq2"),
-        ("nonzero", "batched", "mxfp4_to_vq2"),
-        ("missing", "grouped", "mxfp4_to_vq2"),
-        ("missing", "batched", "vq2_to_mxfp4"),
+        ("other_skip", "batched", "mxfp4_to_vq2", None),
+        ("xfail", "batched", "mxfp4_to_vq2", None),
+        ("wrong_reason", "batched", "mxfp4_to_vq2", None),
+        ("wrong_class", "batched", "mxfp4_to_vq2", None),
+        ("wrong_function", "batched", "mxfp4_to_vq2", None),
+        ("wrong_variant", "batched", "mxfp4_to_vq2", None),
+        ("all_skip", "batched", "mxfp4_to_vq2", None),
+        ("nonzero", "batched", "mxfp4_to_vq2", None),
+        ("missing", "grouped", "mxfp4_to_vq2", None),
+        ("missing", "batched", "vq2_to_mxfp4", "vq2_to_vq2"),
     ],
 )
-def test_checkpoint_gap_opt_in_does_not_allow_other_nonpassing_results(
-    assets, driver, checkpoint_gap_plan, mode, stage_name, allowed
+def test_checkpoint_gap_policy_does_not_allow_other_nonpassing_results(
+    assets, driver, checkpoint_gap_plan, mode, stage_name, pair, allowed
 ):
-    checkpoint_gap_plan(mode, stage_name=stage_name)
-    assert driver.main([*assets.argv, "--allow-missing-checkpoint-pairs", allowed]) == 1
+    checkpoint_gap_plan(mode, stage_name=stage_name, pair=pair)
+    extra = ["--allow-missing-checkpoint-pairs", allowed] if allowed else []
+    assert driver.main([*assets.argv, *extra]) == 1
     report, _ = read_report(assets)
     assert report["status"] == "failed" and report["coverage_complete"] is False
     assert [stage["status"] for stage in report["stages"]] == ["failed", "not_run", "not_run"]
@@ -501,7 +533,7 @@ def test_checkpoint_gap_opt_in_does_not_allow_other_nonpassing_results(
 
 def test_downstream_failure_takes_priority_and_preserves_earlier_checkpoint_gaps(assets, driver, checkpoint_gap_plan):
     checkpoint_gap_plan(later_failure=True)
-    assert driver.main([*assets.argv, "--allow-missing-checkpoint-pairs", "mxfp4_to_vq2"]) == 1
+    assert driver.main(assets.argv) == 1
     report, _ = read_report(assets)
     assert report["status"] == "failed" and report["coverage_complete"] is False
     assert [stage["status"] for stage in report["stages"]] == ["passed_with_coverage_gaps", "failed", "not_run"]
@@ -516,6 +548,8 @@ def test_no_checkpoint_gaps_retains_full_pass_semantics(assets, driver, checkpoi
     assert driver.main([*assets.argv, *extra]) == 0
     report, _ = read_report(assets)
     assert report["status"] == "passed" and report["coverage_complete"] is True
+    assert report["automatic_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
     assert report["coverage_gaps"] == []
     assert all(stage["status"] == "passed" for stage in report["stages"])
     assert all(stage["skipped_tests"] == [] and stage["coverage_gaps"] == [] for stage in report["stages"])

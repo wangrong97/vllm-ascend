@@ -42,6 +42,7 @@ PREFLIGHT_SECONDS = 120
 LOG_TAIL_BYTES = 16384
 LOG_TAIL_LINES = 64
 CHECKPOINT_PAIRS = ("vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_vq2", "mxfp4_to_mxfp4")
+AUTOMATIC_MISSING_CHECKPOINT_PAIRS = ("mxfp4_to_vq2",)
 ACCEPTED_STAGE_STATUSES = ("passed", "passed_with_coverage_gaps")
 
 
@@ -59,7 +60,7 @@ def parse_args(argv=None):
         nargs="+",
         choices=CHECKPOINT_PAIRS,
         default=[],
-        help="Accept only real-expert skips for these absent GateUp-to-Down pairs; record coverage gaps",
+        help="Accept additional missing real-expert pairs; mxfp4_to_vq2 is handled automatically",
     )
     parser.add_argument("--timeout", type=int, default=7200, help="Wall timeout in seconds per pytest stage")
     parser.add_argument("--result-dir", type=Path, default=REPO_ROOT / "benchmark-results/npu-ci")
@@ -77,6 +78,9 @@ def parse_args(argv=None):
         parser.error("--timeout must be positive and --model-runners must be distinct")
     if len(set(args.allow_missing_checkpoint_pairs)) != len(args.allow_missing_checkpoint_pairs):
         parser.error("--allow-missing-checkpoint-pairs must be distinct")
+    args.allow_missing_checkpoint_pairs = list(
+        dict.fromkeys((*AUTOMATIC_MISSING_CHECKPOINT_PAIRS, *args.allow_missing_checkpoint_pairs))
+    )
     args.devices = ",".join(devices)
     for name in ("model", "gs32_library", "gs32_binary", "result_dir"):
         setattr(args, name, getattr(args, name).expanduser().resolve())
@@ -259,7 +263,7 @@ def read_junit(path):
 
 
 def checkpoint_coverage_gaps(stage, allowed_pairs):
-    """Recognize only declared missing-data skips, never hardware skips or xfails."""
+    """Recognize only supported missing-data skips, never hardware skips or xfails."""
     if stage["name"] != "batched":
         return []
     classname = "tests.e2e.nightly.test_vq2a8_gs32_batched"
@@ -346,7 +350,7 @@ def run_stage(stage, args, result_dir, on_update):
             if not passed:
                 stage["error"] = (
                     f"pytest exited with return code {stage['returncode']}; NPU CI requires at least one passed test, "
-                    f"no failures/errors, and no undeclared skipped/xfail tests. See {stage['log']}"
+                    f"no failures/errors, and no unsupported skipped/xfail tests. See {stage['log']}"
                 )
     except KeyboardInterrupt:
         stage.update(status="interrupted", error="Interrupted; owned pytest process group stopped")
@@ -361,6 +365,14 @@ def run_stage(stage, args, result_dir, on_update):
             capture_failure_log(stage)
         on_update()
         print(f"STAGE={name} STATUS={stage['status']}", flush=True)
+        if stage["status"] == "passed_with_coverage_gaps":
+            pairs = ", ".join(sorted({gap["pair"].replace("_to_", " -> ") for gap in stage["coverage_gaps"]}))
+            print(
+                f"STAGE={name} NOTICE=Checkpoint has no real expert for {pairs}; "
+                f"recorded {len(stage['coverage_gaps'])} untested cases and continuing remaining checks. "
+                f"MODEL={args.model}",
+                flush=True,
+            )
         for gap in stage.get("coverage_gaps", []):
             print(f"STAGE={name} COVERAGE_GAP=" + json.dumps(gap, ensure_ascii=False), flush=True)
         if "error" in stage:
@@ -384,6 +396,7 @@ def main(argv=None):
         "devices": args.devices,
         "model_runners": args.model_runners if args.suite != "kernels" else [],
         "single_card_reference": args.single_card_reference and args.suite != "kernels",
+        "automatic_missing_checkpoint_pairs": list(AUTOMATIC_MISSING_CHECKPOINT_PAIRS),
         "allowed_missing_checkpoint_pairs": args.allow_missing_checkpoint_pairs,
         "coverage_complete": False,
         "coverage_gaps": [],
