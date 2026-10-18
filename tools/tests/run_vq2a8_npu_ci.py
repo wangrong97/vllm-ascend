@@ -17,6 +17,11 @@ import xml.etree.ElementTree as ET
 from contextlib import suppress
 from pathlib import Path
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tools.vq2a8_live_log import LiveChildLog  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_ROOT = "tests/e2e/nightly"
 COMPONENTS = (
@@ -143,7 +148,7 @@ def stop_process_group(process):
 
 
 def execute(command, environment, log, timeout):
-    with log.open("w", encoding="utf-8") as output:
+    with log.open("w", encoding="utf-8") as output, LiveChildLog(log, f"npu-ci-{log.stem}"):
         process = subprocess.Popen(
             command,
             cwd=REPO_ROOT,

@@ -4,13 +4,16 @@
 
 import ast
 import importlib.util
+import io
 import json
 import os
 import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -88,6 +91,65 @@ def read_report(assets):
     paths = list(assets.results.rglob("summary.json"))
     assert len(paths) == 1
     return json.loads(paths[0].read_text(encoding="utf-8")), paths[0].parent
+
+
+@pytest.mark.parametrize("returncode", [0, 7])
+def test_child_output_is_live_before_exit_and_preserved_in_log(driver, tmp_path, monkeypatch, returncode):
+    release = tmp_path / "release-child"
+    log = tmp_path / "stream.log"
+    observed = threading.Event()
+
+    class Console(io.StringIO):
+        def write(self, text):
+            count = super().write(text)
+            if "STDOUT-READY" in self.getvalue() and "STDERR-READY" in self.getvalue():
+                observed.set()
+            return count
+
+    console = Console()
+    monkeypatch.setattr(sys, "stdout", console)
+    code = textwrap.dedent("""
+        import os, sys, time
+        from pathlib import Path
+        os.write(1, b'STDOUT-READY\\r')
+        os.write(2, b'STDERR-READY\\n')
+        word = '\u4e2d'.encode('utf-8')
+        os.write(1, word[:2])
+        deadline = time.monotonic() + 10
+        while not Path(sys.argv[1]).exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Parent did not relay output before child exit')
+            time.sleep(0.01)
+        os.write(1, word[2:] + b'-FINAL')
+        sys.exit(int(sys.argv[2]))
+    """)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            driver.execute, [sys.executable, "-u", "-c", code, str(release), str(returncode)], {}, log, 15
+        )
+        try:
+            assert observed.wait(5), "Output was buffered until child exit"
+            assert not future.done(), "Child must still be waiting for the parent"
+            assert b"STDOUT-READY\rSTDERR-READY\n" in log.read_bytes()
+            assert "\ufffd" not in console.getvalue()
+        finally:
+            release.touch()
+        assert future.result(timeout=5) == returncode
+    expected = "STDOUT-READY\rSTDERR-READY\n\u4e2d-FINAL"
+    assert log.read_bytes() == expected.encode("utf-8")
+    assert console.getvalue() == expected + "\n"
+
+
+def test_closed_terminal_does_not_lose_child_log_or_returncode(driver, tmp_path, monkeypatch):
+    class ClosedConsole:
+        def write(self, text):
+            raise BrokenPipeError("terminal disconnected")
+
+    monkeypatch.setattr(sys, "stdout", ClosedConsole())
+    log = tmp_path / "closed-terminal.log"
+    command = [sys.executable, "-u", "-c", "import os, sys; os.write(2, b'child error'); sys.exit(7)"]
+    assert driver.execute(command, {}, log, 10) == 7
+    assert log.read_bytes() == b"child error"
 
 
 @pytest.mark.parametrize("stage_name", ["activation", "ep2-v2", "recovery-v2"])

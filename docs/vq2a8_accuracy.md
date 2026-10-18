@@ -63,6 +63,10 @@ python tools/tests/run_vq2a8_accuracy_suite.py \
 ```
 
 也可以使用 `bash tools/tests/run_vq2a8_evalscope_accuracy.sh`，参数相同。
+Python 和 Shell 入口都会自动把 EvalScope 子进程的完整 stdout/stderr 合并保存到本次结果目录的
+`evalscope.log`，并实时镜像到终端，无需额外使用 `tee`。启动时会打印日志绝对路径，
+`run.json` 的 `log` 字段也记录该路径。子进程使用 Python 无缓冲输出；连续 15 秒没有新输出时，
+终端显示 `PROBE_WAIT=evalscope` 等待提示。该提示表示进程仍未退出，不代表题目已完成。
 默认并发为 4；示例使用 1 便于在此前 B1 decode 服务上验证。
 服务的活动序列数限制可能导致客户端请求排队。
 请求默认超时 3600 秒，可用 `--timeout` 调整。
@@ -111,6 +115,7 @@ python tools/tests/run_vq2a8_accuracy_suite.py \
 ```text
 benchmark-results/accuracy/<timestamp-random>/
   run.json                 # 命令、环境、客户端提交、服务信息、实际参数和运行状态
+  evalscope.log            # 子进程完整 stdout/stderr，与终端实时输出对应
   configs/                 # EvalScope 展开的配置
   logs/                    # EvalScope 日志
   predictions/             # 原始回答、停止原因和 token 用量
@@ -129,7 +134,9 @@ benchmark-results/accuracy/<timestamp-random>/
 子进程失败、缺失报告、题数不符、请求错误、上下文超限和过滤等返回非零退出码。
 输出达到 `max_tokens` 和最终回答为空会明确统计，仍保留在评分分母中；
 它们不会被静默丢弃，也不单独被当成基础设施故障。
-Ctrl+C 返回 130，`run.json` 标记 `interrupted`，部分结果不能作为完整成绩。
+Ctrl+C 返回 130，`run.json` 标记 `interrupted`，部分结果不能作为完整成绩；Linux 上的 SIGTERM 同样处理。
+Linux 上会清理本次 EvalScope 子进程组及其工作进程，保留退出前已写入的日志；不会停止推理服务。
+子进程失败时终端同时显示退出码和 `evalscope.log` 路径，可直接检查原始报错。
 
 **退出码 0 表示评测完成且产物审计通过，不表示精度达到合入门槛。**
 该入口没有默认精度阈值；成绩为 0 的完整有效运行也可能退出 0。

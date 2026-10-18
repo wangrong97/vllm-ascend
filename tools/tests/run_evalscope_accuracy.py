@@ -7,10 +7,13 @@ import argparse
 import csv
 import json
 import math
+import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
 from datetime import datetime
 from importlib import metadata
 from pathlib import Path
@@ -18,11 +21,17 @@ from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from summarize_evalscope_accuracy import DATASET_SIZES, summarize_run
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from summarize_evalscope_accuracy import DATASET_SIZES, summarize_run  # noqa: E402
+
+from tools.vq2a8_live_log import LiveChildLog  # noqa: E402
 
 EVALSCOPE_VERSION = "1.12.0"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SERVICE_CHECK_TIMEOUT = 10
+TERMINATE_GRACE_SECONDS = 10
 DEFAULT_DATASETS = ("gpqa_diamond", "aime24", "aime25")
 
 
@@ -139,6 +148,7 @@ def generation_config(args: argparse.Namespace) -> dict:
 def build_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
     command = [
         sys.executable,
+        "-u",
         "-m",
         "evalscope.cli.cli",
         "eval",
@@ -225,6 +235,40 @@ def client_revision() -> str | None:
         return None
 
 
+def stop_evaluator(process: subprocess.Popen) -> None:
+    """Stop only this evaluation's child process group, including workers."""
+    if os.name == "posix":
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+    elif process.poll() is None:
+        process.terminate()
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=TERMINATE_GRACE_SECONDS)
+    if os.name == "posix":
+        # The evaluator may have exited before its dataset worker processes.
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    elif process.poll() is None:
+        process.kill()
+    process.wait()
+
+
+def execute_evaluator(command: list[str], log: Path) -> int:
+    """Keep complete child output on disk while mirroring it to the terminal."""
+    with log.open("wb") as output, LiveChildLog(log, "evalscope"):
+        process = subprocess.Popen(
+            command,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=os.name == "posix",
+        )
+        try:
+            return process.wait()
+        finally:
+            # Close all child writers before LiveChildLog drains its final bytes.
+            stop_evaluator(process)
+
+
 def write_scores(run_dir: Path, manifest: dict, audit: dict) -> None:
     """Publish the audited native scores, keeping smoke/full and sampling conditions visible."""
     summary = {
@@ -255,6 +299,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     run_dir = None
     manifest = {}
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    previous_sigterm = signal.signal(signal.SIGTERM, interrupt) if os.name == "posix" else None
     try:
         version = check_evalscope_version()
         offline_manifest = None
@@ -292,19 +341,20 @@ def main(argv: list[str] | None = None) -> int:
             "concurrency": args.concurrency,
             "generation_config": generation_config(args),
             "command": command,
+            "log": str(run_dir / "evalscope.log"),
             "status": "running",
         }
         write_json(run_dir / "run.json", manifest)
         print(f"EvalScope run: {run_dir}", flush=True)
         print(f"Datasets: {expected_counts}; concurrent requests: {args.concurrency}", flush=True)
-        print(f"Live progress below; native logs: {run_dir / 'logs'}", flush=True)
-        # Inherit the terminal so EvalScope can display its own live progress.
-        child = subprocess.run(command, check=False)
-        manifest.update(returncode=child.returncode, status="failed" if child.returncode else "auditing")
+        print(f"Live progress below; complete child stdout/stderr: {manifest['log']}", flush=True)
+        print(f"Native EvalScope logs: {run_dir / 'logs'}", flush=True)
+        returncode = execute_evaluator(command, Path(manifest["log"]))
+        manifest.update(returncode=returncode, status="failed" if returncode else "auditing")
         write_json(run_dir / "run.json", manifest)
-        if child.returncode:
-            print(f"EvalScope failed; inspect {run_dir / 'logs'}", file=sys.stderr)
-            return child.returncode if child.returncode > 0 else 1
+        if returncode:
+            print(f"EvalScope failed ({returncode}); inspect {manifest['log']}", file=sys.stderr)
+            return returncode if returncode > 0 else 1
         try:
             summary = summarize_run(run_dir, args.datasets, expected_counts)
         except ValueError as exc:
@@ -339,6 +389,9 @@ def main(argv: list[str] | None = None) -> int:
             write_json(run_dir / "run.json", manifest)
         print(f"EvalScope accuracy failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if os.name == "posix":
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

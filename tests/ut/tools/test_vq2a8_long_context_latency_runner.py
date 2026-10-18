@@ -135,6 +135,9 @@ def long_context_runner(tmp_path):
         summary = json.loads(summaries[0].read_text())
         cases = {record["case"]: record for record in summary["cases"]}
         logs = {case: (directory / f"{case}.log").read_text() for case in cases}
+        run_log = (directory / "run.log").read_text()
+        assert f"RESULT_DIR={directory}" in run_log
+        assert f"SUMMARY={directory / 'summary.json'}" in run_log
         for case, record in cases.items():
             assert json.loads((directory / f"{case}.json").read_text()) == record
         return result, requests, summary, cases, logs, state["peak"]
@@ -194,6 +197,11 @@ def test_defaults_preflight_both_cases_then_measure_exact_lengths_and_save_resul
             f"REQUEST=1/1 START INPUT_TOKENS={input_tokens} MAX_TOKENS=1024",
             "REQUEST=1/1 FIRST_CONTENT TTFT_MS=",
             "REQUEST=1/1 DONE TOKENS=1024",
+        ):
+            assert message in result.stderr
+            assert message not in result.stdout
+            assert message in logs[name]
+        for message in (
             "TPOT_MS=",
             "LONG_CONTEXT_SUMMARY=",
         ):

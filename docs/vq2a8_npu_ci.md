@@ -154,7 +154,10 @@ benchmark-results/npu-ci/vq2a8-npu-ci-<时间戳>-<随机后缀>/
 ```
 
 终端输出 `RESULT_DIR=...` 和每阶段的 `STAGE=... LOG=...`。
-详细 pytest 输出写入阶段日志，可对打印出的路径执行 `tail -f`。
+环境预检和 pytest 子进程的 stdout/stderr 默认实时显示在终端，同时完整保存到相应日志文件，
+包括用例名称、执行进度、通过/失败信息和异常堆栈；原有启动命令无需增加参数。
+没有新输出时，每约 15 秒显示 `PROBE_WAIT=...`、等待时长和日志路径。
+也可以在另一终端对打印出的路径执行 `tail -f`。
 JUnit XML 保留各用例结果和 skip 原因；pytest 临时目录保留模型子进程的日志及报告。
 `summary.json` 记录 checkout commit、实际命令、所选环境覆盖、测试计数、耗时和状态，并在阶段更新时保存。
 

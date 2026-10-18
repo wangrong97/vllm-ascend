@@ -4,10 +4,14 @@
 import importlib.util
 import io
 import json
+import os
+import signal
 import subprocess
 import sys
+import time
+from contextlib import suppress
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 
@@ -28,7 +32,7 @@ def runner(monkeypatch):
 def test_defaults_preserve_existing_accuracy_conditions(runner, tmp_path, profile, model, port):
     args = runner.parse_args([profile])
     command = runner.build_command(args, tmp_path / "run with spaces")
-    assert command[:4] == [sys.executable, "-m", "evalscope.cli.cli", "eval"]
+    assert command[:5] == [sys.executable, "-u", "-m", "evalscope.cli.cli", "eval"]
     assert command[command.index("--model") + 1] == model
     assert command[command.index("--api-url") + 1] == f"http://127.0.0.1:{port}/v1"
     assert command[command.index("--datasets") + 1 : command.index("--eval-batch-size")] == [
@@ -155,7 +159,7 @@ def test_dry_run_needs_no_evalscope_service_or_output_directory(runner, tmp_path
 
     monkeypatch.setattr(runner, "check_evalscope_version", unexpected)
     monkeypatch.setattr(runner, "check_service", unexpected)
-    monkeypatch.setattr(runner.subprocess, "run", unexpected)
+    monkeypatch.setattr(runner, "execute_evaluator", unexpected)
     destination = tmp_path / "uncreated"
     assert runner.main(["baseline", "--work-dir", str(destination), "--dry-run"]) == 0
     assert not destination.exists()
@@ -169,26 +173,28 @@ def fake_evaluation(runner, monkeypatch):
     monkeypatch.setattr(runner, "check_service", lambda args: {"id": args.model, "max_model_len": 65536})
     monkeypatch.setattr(runner, "client_revision", lambda: "client-commit")
 
-    def run(command, **kwargs):
-        calls.append((command, kwargs))
-        return SimpleNamespace(returncode=0)
+    def run(command, log):
+        calls.append((command, log))
+        log.write_text("Evaluator fixture stdout/stderr\n", encoding="utf-8")
+        return 0
 
-    monkeypatch.setattr(runner.subprocess, "run", run)
+    monkeypatch.setattr(runner, "execute_evaluator", run)
     monkeypatch.setattr(runner, "summarize_run", lambda *args: {"invalid": False, "datasets": {}})
     return calls
 
 
-def test_success_records_audit_and_preserves_live_stdio(runner, fake_evaluation, tmp_path):
+def test_success_records_audit_and_complete_child_log(runner, fake_evaluation, tmp_path):
     destination = tmp_path / "runs"
     assert runner.main(["baseline", "--work-dir", str(destination)]) == 0
-    command, kwargs = fake_evaluation[0]
-    for key in ("stdout", "stderr", "stdin"):
-        assert kwargs.get(key) is None
+    command, log = fake_evaluation[0]
     run_dir = Path(command[command.index("--work-dir") + 1])
     assert run_dir.parent == destination
     assert (run_dir / "run.json").is_file()
     assert json.loads((run_dir / "accuracy_audit.json").read_text())["invalid"] is False
-    assert json.loads((run_dir / "run.json").read_text())["status"] == "finished"
+    manifest = json.loads((run_dir / "run.json").read_text())
+    assert manifest["status"] == "finished"
+    assert manifest["log"] == str(log) == str(run_dir / "evalscope.log")
+    assert log.read_text() == "Evaluator fixture stdout/stderr\n"
 
 
 def test_repeated_invocations_do_not_reuse_or_overwrite_results(runner, fake_evaluation, tmp_path):
@@ -225,13 +231,140 @@ def test_limit_repeats_and_datasets_reach_audit(runner, fake_evaluation, tmp_pat
 
 
 def test_child_failure_is_not_reported_as_valid_accuracy(runner, fake_evaluation, tmp_path, monkeypatch):
-    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=7))
+    monkeypatch.setattr(runner, "execute_evaluator", lambda *args: 7)
 
     def unexpected(*args):
         pytest.fail("a failed evaluator must not be summarized as a successful run")
 
     monkeypatch.setattr(runner, "summarize_run", unexpected)
     assert runner.main(["baseline", "--work-dir", str(tmp_path)]) == 7
+
+
+@pytest.mark.parametrize("returncode", [0, 7])
+def test_real_evaluator_streams_before_exit_and_keeps_complete_output(runner, tmp_path, monkeypatch, returncode):
+    log = tmp_path / "evalscope.log"
+    acknowledgement = tmp_path / "terminal-observed-output"
+    observed_disk = []
+
+    class Console(io.StringIO):
+        def write(self, text):
+            if "PROGRESS" in text:
+                observed_disk.append(log.read_bytes())
+                acknowledgement.touch()
+            return super().write(text)
+
+    console = Console()
+    monkeypatch.setattr(runner.sys, "stdout", console)
+    program = (
+        "import pathlib, sys, time\n"
+        f"ack = pathlib.Path({str(acknowledgement)!r})\n"
+        "sys.stdout.buffer.write(b'PROGRESS\\r')\n"
+        "sys.stderr.buffer.write(b'stderr before exit\\n')\n"
+        "deadline = time.monotonic() + 5\n"
+        "while not ack.exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+        "if not ack.exists(): raise SystemExit(99)\n"
+        "sys.stdout.buffer.write(b'final without newline')\n"
+        f"raise SystemExit({returncode})\n"
+    )
+    assert runner.execute_evaluator([sys.executable, "-u", "-c", program], log) == returncode
+    assert observed_disk and b"PROGRESS\r" in observed_disk[0]
+    assert log.read_bytes() == b"PROGRESS\rstderr before exit\nfinal without newline"
+    assert "PROGRESS\r" in console.getvalue()
+    assert "stderr before exit\n" in console.getvalue()
+    assert "final without newline" in console.getvalue()
+
+
+def test_closed_terminal_does_not_discard_evaluator_log(runner, tmp_path, monkeypatch):
+    class ClosedConsole:
+        def write(self, text):
+            raise BrokenPipeError("terminal closed")
+
+    monkeypatch.setattr(runner.sys, "stdout", ClosedConsole())
+    log = tmp_path / "evalscope.log"
+    program = "import sys; sys.stdout.buffer.write(b'stdout\\n'); sys.stderr.buffer.write(b'stderr\\n')"
+    assert runner.execute_evaluator([sys.executable, "-u", "-c", program], log) == 0
+    assert log.read_bytes() == b"stdout\nstderr\n"
+
+
+def test_interruption_stops_real_evaluator_and_drains_last_output(runner, tmp_path, monkeypatch, capsys):
+    log = tmp_path / "evalscope.log"
+    ready = tmp_path / "child-ready"
+    original_popen = subprocess.Popen
+    started = []
+
+    def interrupted_popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        started.append(process)
+        original_wait = process.wait
+        interrupted = False
+
+        def wait(timeout=None):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert ready.exists(), "child did not initialize"
+                raise KeyboardInterrupt
+            return original_wait(timeout=timeout)
+
+        process.wait = wait
+        return process
+
+    monkeypatch.setattr(runner.subprocess, "Popen", interrupted_popen)
+    program = (
+        "import pathlib, sys, time\n"
+        "sys.stdout.write('before interruption\\n')\n"
+        f"pathlib.Path({str(ready)!r}).touch()\n"
+        "time.sleep(30)\n"
+    )
+    with pytest.raises(KeyboardInterrupt):
+        runner.execute_evaluator([sys.executable, "-u", "-c", program], log)
+    assert started[0].poll() is not None
+    assert b"before interruption" in log.read_bytes()
+    assert "before interruption" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name != "posix", reason="OS SIGTERM handling requires POSIX")
+def test_sigterm_marks_interrupted_and_restores_handler(runner, fake_evaluation, tmp_path, monkeypatch):
+    original_handler = signal.getsignal(signal.SIGTERM)
+
+    def interrupted(*args):
+        signal.raise_signal(signal.SIGTERM)
+        pytest.fail("SIGTERM must interrupt the active evaluation")
+
+    monkeypatch.setattr(runner, "execute_evaluator", interrupted)
+    assert runner.main(["vq2a8", "--result-dir", str(tmp_path)]) == 130
+    assert signal.getsignal(signal.SIGTERM) == original_handler
+    manifest = json.loads(next(tmp_path.glob("*/run.json")).read_text())
+    assert manifest["status"] == "interrupted" and manifest["returncode"] == 130
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="process-group worker cleanup requires Linux")
+def test_finished_evaluator_does_not_leave_background_worker(runner, tmp_path):
+    worker_pid = tmp_path / "worker.pid"
+    ready = tmp_path / "worker-ready"
+    worker = f"import pathlib,time; pathlib.Path({str(ready)!r}).touch(); time.sleep(30)"
+    program = (
+        "import pathlib, subprocess, sys, time\n"
+        f"worker = subprocess.Popen([sys.executable, '-u', '-c', {worker!r}])\n"
+        f"pathlib.Path({str(worker_pid)!r}).write_text(str(worker.pid))\n"
+        "deadline = time.monotonic() + 5\n"
+        f"while not pathlib.Path({str(ready)!r}).exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+    )
+    try:
+        assert runner.execute_evaluator([sys.executable, "-u", "-c", program], tmp_path / "evalscope.log") == 0
+        pid = int(worker_pid.read_text())
+        status = Path(f"/proc/{pid}/stat")
+        deadline = time.monotonic() + 5
+        while status.exists() and status.read_text().split(")", 1)[1].split()[0] != "Z":
+            assert time.monotonic() < deadline, "evaluation worker survived process-group cleanup"
+            time.sleep(0.01)
+    finally:
+        if worker_pid.exists():
+            with suppress(ProcessLookupError):
+                os.kill(int(worker_pid.read_text()), signal.SIGKILL)
 
 
 def test_invalid_audit_fails_even_when_evaluator_exits_zero(runner, fake_evaluation, tmp_path, monkeypatch):
@@ -403,7 +536,7 @@ def test_interrupted_or_failed_child_leaves_terminal_manifest(
     def fail(*args, **kwargs):
         raise exception("test failure")
 
-    monkeypatch.setattr(runner.subprocess, "run", fail)
+    monkeypatch.setattr(runner, "execute_evaluator", fail)
     assert runner.main(["vq2a8", "--result-dir", str(tmp_path)]) == code
     run_dir = next(tmp_path.iterdir())
     assert json.loads((run_dir / "run.json").read_text())["status"] == status
@@ -420,7 +553,7 @@ def test_real_audit_requires_official_score_artifact_before_publishing_success(
     monkeypatch.setattr(runner, "check_service", lambda args: {"id": args.model, "max_model_len": 65536})
     monkeypatch.setattr(runner, "client_revision", lambda: "client-commit")
 
-    def evaluate(command, **kwargs):
+    def evaluate(command, log):
         run_dir = Path(command[command.index("--work-dir") + 1])
         prediction_dir = run_dir / "predictions" / "vq2a8"
         prediction_dir.mkdir(parents=True)
@@ -475,9 +608,9 @@ def test_real_audit_requires_official_score_artifact_before_publishing_success(
             report_dir = run_dir / "reports" / "vq2a8"
             report_dir.mkdir(parents=True)
             (report_dir / "aime25.json").write_text(json.dumps(report), encoding="utf-8")
-        return SimpleNamespace(returncode=0)
+        return 0
 
-    monkeypatch.setattr(runner.subprocess, "run", evaluate)
+    monkeypatch.setattr(runner, "execute_evaluator", evaluate)
     result = runner.main(["vq2a8", "--datasets", "aime25", "--limit", "1", "--result-dir", str(tmp_path)])
     run_dir = next(tmp_path.iterdir())
     manifest = json.loads((run_dir / "run.json").read_text())
