@@ -2,6 +2,17 @@
 
 Live doc: <https://docs.vllm.ai/projects/ascend>
 
+## VQ2A8 文档
+
+VQ2A8 相关说明统一放在 [vq2a8/](vq2a8/) 目录：
+
+- [GS32 VQ2/MXFP4 混合量化推理](vq2a8/vq2a8_gs32.md)
+- [GS32 底层运行时](vq2a8/vq2a8_gs32_runtime.md)
+- [NPU CI 回归](vq2a8/vq2a8_npu_ci.md)
+- [性能测试](vq2a8/vq2a8_performance.md)
+- [精度评测](vq2a8/vq2a8_accuracy.md)
+- [混合专家权重交付规范建议](vq2a8/vq2_mixed_gs32_export_spec_20261016.md)
+
 ## Build the docs
 
 The documentation uses [MkDocs](https://www.mkdocs.org/) with the
