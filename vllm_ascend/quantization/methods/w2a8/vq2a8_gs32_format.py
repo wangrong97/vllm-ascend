@@ -248,14 +248,16 @@ def read_gs32_header(path):
 
 def validate_gs32_options(config, options):
     required = {"gs32_library", "gs32_binary"}
+    optional = {"gs32_execution", "gs32_fusion", "eplb", "eplb_options"}
 
     if (
         not required.issubset(options)
-        or set(options) - required - {"gs32_execution", "gs32_fusion"}
+        or set(options) - required - optional
         or any(not isinstance(options[key], str) or not Path(options[key]).is_absolute() for key in required)
     ):
         raise ValueError(
-            "GS32 requires absolute gs32_library/gs32_binary paths and optional gs32_execution/gs32_fusion only."
+            "GS32 requires absolute gs32_library/gs32_binary paths and optional "
+            "gs32_execution/gs32_fusion/eplb/eplb_options only."
         )
     execution = options.get("gs32_execution", "serial")
     if execution not in ("serial", "batched", "fused", "full_graph"):

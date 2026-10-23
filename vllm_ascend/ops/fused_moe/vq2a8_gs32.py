@@ -177,13 +177,20 @@ class GS32ExpertWeights:
 
     decode_mode = "grouped"
 
-    def __init__(self, layer, layer_spec, options, *, _test_ops=None, _test_activation=None, _test_mxfp4=None):
+    def __init__(
+        self, layer, layer_spec, options, *, mp_eplb=None, _test_ops=None, _test_activation=None, _test_mxfp4=None
+    ):
         self.execution = options.get("gs32_execution", "serial")
         if self.execution not in ("serial", "batched", "fused", "full_graph"):
             raise ValueError("GS32 execution must be serial, batched, fused, or full_graph.")
         self.fusion = options.get("gs32_fusion", "none")
         if self.fusion not in ("none", "swiglu_quant"):
             raise ValueError("GS32 fusion must be none or swiglu_quant.")
+        # Mixed-precision EPLB switch: "off" (default) adds zero behavior.
+        from vllm_ascend.eplb.mp.config import OFF_OPTIONS, get_mp_eplb_options
+
+        self.mp_eplb = mp_eplb if mp_eplb is not None else get_mp_eplb_options(options)
+        self.eplb_enabled = self.mp_eplb.enabled
         self.activation = _test_activation
         if (self.execution in ("fused", "full_graph") or self.fusion == "swiglu_quant") and self.activation is None:
             from vllm_ascend.ops.fused_moe import vq2a8_gs32_activation
@@ -244,7 +251,14 @@ class GS32ExpertWeights:
         self.defer_validity = False
         self.validity_buffer = torch.zeros((), dtype=torch.bool, device=self.device)
         self.capture_owners = []
-        if self.execution in ("full_graph",):
+        # MP-EPLB: slot-level load accounting lives on the device (raw token
+        # rows per logical expert); consumed by the slow ring only (C.5).
+        self.moe_load = (
+            torch.zeros(self.num_experts, dtype=torch.int64, device=self.device)
+            if self.eplb_enabled
+            else None
+        )
+        if self.execution in ("full_graph",) or self.eplb_enabled:
             from vllm_ascend.ops.fused_moe import vq2a8_gs32_routes
 
             # A typed subset can have padding even on EP1.
@@ -258,17 +272,33 @@ class GS32ExpertWeights:
                 self.resident_mask[list(self.expert_slots)] = True
             for kind, banks in self.banks.items():
                 for quant_type, bank in banks.items():
-                    bank["expert_ids_tensor"] = torch.tensor(bank["expert_ids"], dtype=torch.int64, device=self.device)
+                    active = torch.tensor(bank["expert_ids"], dtype=torch.int64, device=self.device)
+                    # MP-EPLB capacity: spare tail slots carry the EMPTY(-1)
+                    # sentinel; plans (when built) cover the full capacity so
+                    # fill/evict never changes the group count (doc D/I3).
+                    spare = (
+                        self.mp_eplb.replica_slots[quant_type]
+                        // max(1, getattr(layer, "vq2a8_ep_size", 1))
+                        if self.eplb_enabled
+                        else 0
+                    )
+                    bank["spare_slots"] = spare
+                    if spare:
+                        active = torch.cat(
+                            [active, torch.full((spare,), -1, dtype=torch.int64, device=self.device)]
+                        )
+                    bank["expert_ids_tensor"] = active
                     bank["logical_slots"] = torch.full((self.num_experts,), -1, dtype=torch.int64, device=self.device)
-                    bank["logical_slots"][bank["expert_ids_tensor"]] = torch.arange(
+                    active_ids = torch.tensor(bank["expert_ids"], dtype=torch.int64, device=self.device)
+                    bank["logical_slots"][active_ids] = torch.arange(
                         len(bank["expert_ids"]), device=self.device
                     )
-                    if quant_type == "vq2":
+                    if quant_type == "vq2" and self.execution in ("full_graph",):
                         spec = self.specs[kind]
                         bank["plan"] = self.ops.prepare_grouped_plan(
                             torch.empty((1, spec.columns), dtype=torch.uint8, device=self.device),
                             spec.rows,
-                            len(bank["expert_ids"]),
+                            len(bank["expert_ids"]) + spare,
                         )
 
     def _accept_validity(self, status):
@@ -667,6 +697,13 @@ class GS32ExpertWeights:
             raise ValueError("GS32 group_list must have an integer count/prefix for every logical expert.")
         if self.execution in ("full_graph",) and group_list.device != self.device:
             raise ValueError("GS32 graph group_list must be on the same device as hidden states.")
+        if self.eplb_enabled:
+            # MP-EPLB accounting (doc C.5 raw quantities): accumulate this
+            # step's logical-expert row counts; consumed by the slow ring.
+            counts = group_list.to(device=self.device, dtype=torch.int64).clamp_min(0)
+            if group_list_type == 0:
+                counts = counts - torch.cat((counts.new_zeros(1), counts[:-1]))
+            self.moe_load[: counts.numel()].add_(counts)
         if self.execution in ("full_graph",) and 0 < hidden_states.shape[0] <= graph_rows:
             return self._apply_device(
                 hidden_states, group_list, group_list_type, 0.0 if swiglu_limit is None else swiglu_limit, capturing
@@ -726,3 +763,47 @@ class GS32ExpertWeights:
                 output[first:last].copy_(result)
             start += count
         return finish(output)
+
+    # -- MP-EPLB P2 commit hooks (value-only index refresh; doc 2.5) ---------
+
+    def _bank_of(self, kind, quant_type):
+        bank = self.banks.get(kind, {}).get(quant_type)
+        if bank is None or "expert_ids_tensor" not in bank:
+            raise ValueError(f"MP-EPLB commit requires device indexes for {kind}/{quant_type}.")
+        return bank
+
+    def commit_fill(self, quant_type, slot, expert):
+        """P2 for a fill move on this rank (both projections, same slot)."""
+        for kind in ("gate_up", "down"):
+            bank = self._bank_of(kind, quant_type)
+            if int(bank["expert_ids_tensor"][slot]) != -1:
+                raise ValueError("commit_fill targets an occupied slot.")
+            bank["expert_ids_tensor"][slot] = expert
+        bank = self._bank_of("gate_up", quant_type)
+        bank["logical_slots"][expert] = slot
+        self.resident_mask[expert] = True
+
+    def commit_evict(self, quant_type, slot, expert):
+        """P2 for an evict move (index only; weight bytes stay resident)."""
+        for kind in ("gate_up", "down"):
+            bank = self._bank_of(kind, quant_type)
+            if int(bank["expert_ids_tensor"][slot]) != expert:
+                raise ValueError("commit_evict slot mismatch.")
+            bank["expert_ids_tensor"][slot] = -1
+        bank = self._bank_of("gate_up", quant_type)
+        bank["logical_slots"][expert] = -1
+        self.resident_mask[expert] = False
+
+    def commit_swap(self, quant_type, slot, incoming_expert):
+        """P2 for the local end of a swap: outgoing expert leaves this rank."""
+        bank = self._bank_of("gate_up", quant_type)
+        outgoing = int(bank["expert_ids_tensor"][slot])
+        if outgoing < 0:
+            raise ValueError("commit_swap targets an empty slot.")
+        for kind in ("gate_up", "down"):
+            self._bank_of(kind, quant_type)["expert_ids_tensor"][slot] = incoming_expert
+        bank["logical_slots"][outgoing] = -1
+        bank["logical_slots"][incoming_expert] = slot
+        self.resident_mask[outgoing] = False
+        self.resident_mask[incoming_expert] = True
+        return outgoing

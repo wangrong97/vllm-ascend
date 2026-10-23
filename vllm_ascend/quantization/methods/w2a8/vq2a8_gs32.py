@@ -33,6 +33,12 @@ class AscendGS32FusedMoEScheme(AscendMoEScheme):
     def __init__(self, layer_spec, *, native_options=None, moe_config=None):
         self.layer_spec = layer_spec
         self.native_options = dict(native_options or {})
+        # Mixed-precision EPLB switch (vq2a8.eplb); "off" keeps the runtime
+        # byte-identical to the baseline (no capacity reservation, no
+        # accounting, no split tables).
+        from vllm_ascend.eplb.mp.config import get_mp_eplb_options
+
+        self.mp_eplb = get_mp_eplb_options(self.native_options)
         self.moe_config = moe_config
         self.placement = None
 
@@ -70,7 +76,11 @@ class AscendGS32FusedMoEScheme(AscendMoEScheme):
                     native_field = SOURCE_TO_NATIVE[source_field]
                     name = f"{prefix}_{native_field}"
                     dtype, shape = native_fields[native_field]
-                    result[name] = torch.empty((len(ids), *shape), dtype=dtype)
+                    # MP-EPLB capacity reservation (doc 2.5-D): tail spare
+                    # slots keep the bank's dim-0 constant for the whole run
+                    # so plans/captured graphs never need rebuilding.
+                    spare = self.mp_eplb.replica_slots[quant_type] // placement.ep_size
+                    result[name] = torch.empty((len(ids) + spare, *shape), dtype=dtype)
                     self.parameter_experts[name] = {expert: slot for slot, expert in enumerate(ids)}
                     self.loaded_experts[name] = set()
                     self.parameter_metadata[name] = (kind, quant_type, source_field, spec)
@@ -141,7 +151,9 @@ class AscendGS32FusedMoEScheme(AscendMoEScheme):
             for kind in self.layer_spec.specs
         }
         local_spec = replace(self.layer_spec, expert_ids=placement.local_ids, quant_types=local_types)
-        layer.vq2a8_weights = GS32ExpertWeights(layer, local_spec, self.native_options)
+        layer.vq2a8_weights = GS32ExpertWeights(
+            layer, local_spec, self.native_options, mp_eplb=self.mp_eplb
+        )
 
     def get_dynamic_quant_param(self, num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype):
         return {}
