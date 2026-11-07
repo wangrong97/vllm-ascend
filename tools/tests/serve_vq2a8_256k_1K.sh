@@ -21,7 +21,6 @@ if [[ -n "${GS32_EP_BINARY:-}" ]]; then assets+=(--gs32-binary "$GS32_EP_BINARY"
 # The engine validates that this manual KV budget can accommodate the requested context.
 exec python3 -u tools/serve_vq2a8.py "${assets[@]}" \
   --ep-size 2 \
-  --gs32-execution full_graph \
   --max-model-len 263168 \
   --max-num-batched-tokens 4096 \
   --kv-cache-mib 16384 \

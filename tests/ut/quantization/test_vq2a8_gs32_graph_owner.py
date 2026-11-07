@@ -361,7 +361,7 @@ def test_runner_quantization_validity_rejects_incomplete_or_aliased_inventory(qu
     assert not any(owner.defer_validity for owner in harness.owners)
 
 
-@pytest.mark.parametrize("execution,fusion", [("full_graph", "none"), ("fused", "full_ffn")])
+@pytest.mark.parametrize("execution,fusion", [("full_graph", "full_ffn"), ("fused", "full_ffn")])
 def test_runner_eager_checks_all_layers_once_and_cannot_reuse_stale_success(quantization_runner, execution, fusion):
     harness = quantization_runner
     runner = harness.runner
@@ -545,7 +545,7 @@ def test_runner_execute_does_not_add_private_kwargs_to_other_runners(quantizatio
 
 @pytest.mark.parametrize(
     "quantization, options",
-    [("w4a8", {}), ("vq2a8", {"gs32_fusion": "none"}), ("vq2a8", {"gs32_execution": "fused", "gs32_fusion": "none"})],
+    [("w4a8", {})],
 )
 def test_runner_non_full_graph_and_wrapper_default_keep_existing_behavior(quantization_runner, quantization, options):
     harness = quantization_runner

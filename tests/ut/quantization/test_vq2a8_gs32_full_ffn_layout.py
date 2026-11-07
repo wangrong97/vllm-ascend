@@ -147,7 +147,8 @@ def test_postload_mixed_bank_preserves_weights_and_releases_old_storage(modules,
 
 
 def test_default_full_ffn_rejects_w4_w2_before_allocating(modules):
-    spec = source_layer_spec(modules)  # Expert 2 deliberately has W4 Gate/W2 Down.
+    spec = source_layer_spec(modules)
+    spec.quant_types["down"][2] = "vq2"  # Explicit unsupported W4 Gate/W2 Down.
     scheme = modules.method.AscendGS32FusedMoEScheme(spec)
     assert scheme.native_options["gs32_fusion"] == "full_ffn"
     with pytest.raises(ValueError, match="expert 2 precision pair"):

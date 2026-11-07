@@ -54,7 +54,7 @@ def runner_options(execution, library, binary):
     additional = {
         "vq2a8": {
             "gs32_execution": execution,
-            "gs32_fusion": "none",
+            "gs32_fusion": "full_ffn",
             "gs32_library": str(library),
             "gs32_binary": str(binary),
         },
@@ -142,7 +142,7 @@ def run_variant(model, library, binary, execution, output):
 
     from tests.e2e.conftest import VllmRunner
 
-    config = json.loads((model / "config.json").read_text())
+    config = json.loads((model / "config.json").read_text(encoding="utf-8"))
     expected_version = 2 if envs.VLLM_USE_V2_MODEL_RUNNER else 1
     report = {
         "execution": execution,
@@ -215,7 +215,7 @@ def test_gs32_real_model_b1_i32_o4_full_graph_matches_eager(request, tmp_path):
     assert all(options.values()), "Both GS32 native artifact paths are required."
     paths = {name: Path(value).resolve(strict=True) for name, value in options.items()}
     assert paths["library"].is_file() and paths["binary"].is_file()
-    config = json.loads((paths["model"] / "config.json").read_text())
+    config = json.loads((paths["model"] / "config.json").read_text(encoding="utf-8"))
     assert config["quantization_config"]["format"] == "vq2_mixed_gs32_source"
     assert (paths["model"] / "model.safetensors.index.json").is_file()
     reports = {}
@@ -233,8 +233,8 @@ def test_gs32_real_model_b1_i32_o4_full_graph_matches_eager(request, tmp_path):
                 check=False,
                 timeout=CHILD_TIMEOUT_SECONDS,
             )
-        assert child.returncode == 0, f"{execution} failed; see {log}\n{log.read_text()[-16000:]}"
-        reports[execution] = json.loads(output.read_text())
+        assert child.returncode == 0, f"{execution} failed; see {log}\n{log.read_text(encoding='utf-8')[-16000:]}"
+        reports[execution] = json.loads(output.read_text(encoding="utf-8"))
     assert len(reports["fused"]["requests"]) == len(reports["full_graph"]["requests"]) == REQUEST_REPEATS
     for actual, expected in zip(reports["full_graph"]["requests"], reports["fused"]["requests"], strict=True):
         compare_requests(actual, expected)

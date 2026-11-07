@@ -5,6 +5,7 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -46,12 +47,10 @@ def dspark_assets(tmp_path):
 
 
 @pytest.mark.parametrize("execution", ["fused", "full_graph"])
-def test_reference_launch_needs_no_gs32_artifacts_and_preserves_tp4_b64(server_assets, execution):
+def test_full_ffn_launch_preserves_tp4_b64(server_assets, execution):
     args = serve.parse_args(
-        server_assets[:2]
+        server_assets
         + [
-            "--gs32-backend",
-            "reference_mxfp8",
             "--gs32-execution",
             execution,
             "--ep-size",
@@ -67,7 +66,9 @@ def test_reference_launch_needs_no_gs32_artifacts_and_preserves_tp4_b64(server_a
     )
     command = serve.build_command(args)
     options = json.loads(command[command.index("--additional-config") + 1])["vq2a8"]
-    assert options == {"gs32_backend": "reference_mxfp8", "gs32_execution": execution, "gs32_fusion": "none"}
+    assert options["gs32_backend"] == "native"
+    assert options["gs32_execution"] == execution
+    assert options["gs32_fusion"] == "full_ffn"
     assert command[command.index("--tensor-parallel-size") + 1] == "4"
     assert command[command.index("--max-num-seqs") + 1] == "64"
     assert command[command.index("--max-num-batched-tokens") + 1] == "8192"
@@ -75,19 +76,70 @@ def test_reference_launch_needs_no_gs32_artifacts_and_preserves_tp4_b64(server_a
     assert "--speculative-config" not in command
 
 
-@pytest.mark.parametrize("execution,fusion", [("serial", "none"), ("batched", "none"), ("full_graph", "swiglu_quant")])
-def test_reference_launch_rejects_unsupported_mode_before_loading(server_assets, execution, fusion):
-    args = serve.parse_args(
-        server_assets[:2]
-        + ["--gs32-backend", "reference_mxfp8", "--gs32-execution", execution, "--gs32-fusion", fusion]
-    )
-    with pytest.raises(ValueError, match="reference_mxfp8 requires"):
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("--gs32-backend", "reference_mxfp8"),
+        ("--gs32-fusion", "none"),
+        ("--gs32-fusion", "swiglu_quant"),
+        ("--gs32-execution", "serial"),
+        ("--gs32-execution", "batched"),
+    ],
+)
+def test_removed_launch_modes_fail_before_artifact_loading(server_assets, flag, value):
+    args = serve.parse_args(server_assets[:2] + [flag, value])
+    with pytest.raises(ValueError, match="GS32"):
         serve.build_command(args)
 
 
 def test_native_launch_still_requires_native_artifacts(server_assets):
-    with pytest.raises(ValueError, match="requires --gs32-library and --gs32-binary"):
+    with pytest.raises(ValueError, match="requires --gs32-runtime-dir"):
         serve.build_command(serve.parse_args(server_assets[:2]))
+
+
+@pytest.mark.parametrize("eager", [False, True])
+def test_runtime_directory_resolves_local_artifacts_and_graph_default(server_assets, tmp_path, eager):
+    directory = tmp_path / "runtime"
+    directory.mkdir()
+    # A copied manifest can contain paths from the build server.
+    (directory / "build-manifest.json").write_text(json.dumps({"library": "/old/server/library.so"}))
+    for filename in ("libvq2a8_gs32_stage.so", "mixed_w2w4_moe_ffn.o"):
+        (directory / filename).touch()
+    args = serve.parse_args(
+        server_assets[:2]
+        + ["--gs32-runtime-dir", str(directory), "--max-num-seqs", "64"]
+        + (["--enforce-eager"] if eager else [])
+    )
+    command = serve.build_command(args)
+    options = json.loads(command[command.index("--additional-config") + 1])["vq2a8"]
+    assert options["gs32_backend"] == "native" and options["gs32_fusion"] == "full_ffn"
+    assert options["gs32_execution"] == ("fused" if eager else "full_graph")
+    assert options["gs32_library"] == str(directory / "libvq2a8_gs32_stage.so")
+    assert options["gs32_binary"] == str(directory / "mixed_w2w4_moe_ffn.o")
+    assert ("--enforce-eager" in command) == eager
+    if not eager:
+        compilation = json.loads(command[command.index("--compilation-config") + 1])
+        assert compilation["cudagraph_mode"] == "FULL_DECODE_ONLY"
+        assert compilation["cudagraph_capture_sizes"] == [1, 2, 4, 8, 16, 32, 64]
+
+
+def test_runtime_directory_requires_manifest_and_rejects_ambiguous_sources(server_assets, tmp_path):
+    with pytest.raises(ValueError, match="requires build-manifest.json"):
+        serve.build_command(serve.parse_args(server_assets[:2] + ["--gs32-runtime-dir", str(tmp_path)]))
+    with pytest.raises(ValueError, match="not both"):
+        serve.build_command(serve.parse_args(server_assets + ["--gs32-runtime-dir", str(tmp_path)]))
+    with pytest.raises(ValueError, match="conflicts"):
+        serve.build_command(serve.parse_args(server_assets + ["--enforce-eager", "--gs32-execution", "full_graph"]))
+
+
+def test_help_exposes_execution_choice_without_old_implementation_selectors(capsys):
+    with pytest.raises(SystemExit) as error:
+        serve.parse_args(["--help"])
+    assert error.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--gs32-runtime-dir" in help_text and "--enforce-eager" in help_text
+    for option in ("--gs32-backend", "--gs32-fusion", "--gs32-execution", "--gs32-library", "--gs32-binary"):
+        assert option not in help_text
 
 
 @pytest.mark.parametrize("valid", [False, True])
@@ -110,7 +162,7 @@ def test_runtime_record_is_written_only_after_preflight_with_resolved_defaults(
     assert record_path.exists() == valid
     if valid:
         record = json.loads(record_path.read_text(encoding="utf-8"))
-        assert record["gs32_fusion"] == "full_ffn" and record["gs32_execution"] == "fused"
+        assert record["gs32_fusion"] == "full_ffn" and record["gs32_execution"] == "full_graph"
         assert record["gs32_backend"] == "native" and record["model_path"] == str(tmp_path.resolve())
         assert record["native_artifacts"] == artifacts
         assert record["device_execution_verified"] is False
@@ -166,7 +218,7 @@ def test_launcher_defaults_to_v2_and_preserves_explicit_selection(server_assets,
     assert shlex.split(capsys.readouterr().out)[:2] == ["env", f"VLLM_USE_V2_MODEL_RUNNER={expected}"]
 
 
-@pytest.mark.parametrize("execution", ["serial", "batched", "fused", "full_graph"])
+@pytest.mark.parametrize("execution", ["fused", "full_graph"])
 @pytest.mark.parametrize("check_only", [False, True])
 def test_launcher_checks_selected_bridge_before_serving(server_assets, monkeypatch, capsys, execution, check_only):
     calls = []
@@ -175,7 +227,7 @@ def test_launcher_checks_selected_bridge_before_serving(server_assets, monkeypat
     monkeypatch.setattr(build, "verify_loaded_library", lambda path, mode, **kwargs: calls.append((path, mode)))
     monkeypatch.setattr(build, "verify_runtime_artifacts", lambda path, binary, **kwargs: {"library_path": str(path)})
     monkeypatch.setattr(serve.os, "execv", lambda *args: calls.append("serve"))
-    flags = ["--gs32-execution", execution, "--gs32-fusion", "none"]
+    flags = ["--gs32-execution", execution]
     if check_only:
         flags.append("--check-native-only")
     assert serve.main(server_assets + flags) == 0
@@ -208,18 +260,20 @@ def test_launcher_rejects_stale_bridge_before_loading_weights(server_assets, mon
     assert "GS32 schema mismatch" in captured.err and "PASS" not in captured.out
 
 
-def test_reference_preflight_checks_model_extension_without_loading_bridge(server_assets, monkeypatch, capsys):
+def test_reference_preflight_rejected_before_loading_extensions(server_assets, monkeypatch, capsys):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    monkeypatch.setattr(serve, "check_native_dependencies", lambda: "model.so")
+    monkeypatch.setattr(
+        serve, "check_native_dependencies", lambda: pytest.fail("Invalid config must not load extensions")
+    )
     monkeypatch.setattr(build, "verify_loaded_library", lambda *args: pytest.fail("Reference must not load GS32"))
     assert (
         serve.main(
             server_assets[:2]
             + ["--gs32-backend", "reference_mxfp8", "--gs32-execution", "fused", "--check-native-only"]
         )
-        == 0
+        == 1
     )
-    assert "gs32_bridge=not_required" in capsys.readouterr().out
+    assert "reference backends are test-only" in capsys.readouterr().err
 
 
 def test_dry_run_does_not_import_torch_or_npu(server_assets):
@@ -259,11 +313,23 @@ def test_launcher_rejects_invalid_runner_before_native_loading(server_assets, mo
 
 
 @pytest.mark.parametrize("batch", [2, 64])
-def test_launcher_rejects_multisequence_mrv1_graph_before_native_loading(server_assets, monkeypatch, capsys, batch):
+@pytest.mark.parametrize("mode", [[], ["--gs32-execution", "full_graph"]])
+def test_launcher_rejects_multisequence_mrv1_graph_before_native_loading(
+    server_assets, monkeypatch, capsys, batch, mode
+):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     monkeypatch.setattr(serve, "check_native_dependencies", lambda: pytest.fail("Native loading must not start"))
-    assert serve.main(server_assets + ["--gs32-execution", "full_graph", "--max-num-seqs", str(batch)]) == 1
+    assert serve.main(server_assets + mode + ["--max-num-seqs", str(batch)]) == 1
     assert "requires MRV2" in capsys.readouterr().err
+
+
+def test_mrv1_eager_override_is_resolved_before_graph_guard(server_assets, monkeypatch, capsys):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    assert serve.main(server_assets + ["--max-num-seqs", "64", "--enforce-eager", "--dry-run"]) == 0
+    command = shlex.split(capsys.readouterr().out)
+    assert "--enforce-eager" in command
+    compilation = json.loads(command[command.index("--compilation-config") + 1])
+    assert compilation["cudagraph_mode"] == "NONE"
 
 
 def test_launcher_defaults_multisequence_graphs_to_mrv2(server_assets, monkeypatch, capsys):
@@ -275,7 +341,7 @@ def test_launcher_defaults_multisequence_graphs_to_mrv2(server_assets, monkeypat
 
 
 @pytest.mark.parametrize("width", [2, 4, 8])
-@pytest.mark.parametrize("execution", ["serial", "fused", "full_graph"])
+@pytest.mark.parametrize("execution", ["fused", "full_graph"])
 def test_dp_ep_launches_distinct_engines_with_whole_experts(server_assets, width, execution):
     args = serve.parse_args(
         server_assets
@@ -290,8 +356,6 @@ def test_dp_ep_launches_distinct_engines_with_whole_experts(server_assets, width
             "16",
             "--max-num-batched-tokens",
             "2048",
-            "--gs32-fusion",
-            "none",
         ]
     )
     command = serve.build_command(args)
@@ -334,7 +398,7 @@ def test_dp_ep_rejects_single_rank_before_native_loading(server_assets, monkeypa
     assert "dp-ep requires --ep-size 2, 4 or 8" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("execution", ["serial", "batched", "fused", "full_graph"])
+@pytest.mark.parametrize("execution", ["fused", "full_graph"])
 @pytest.mark.parametrize("width", [4, 8])
 def test_dp_ep_rejects_mrv1_even_for_batch_one(server_assets, monkeypatch, capsys, execution, width):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -471,6 +535,7 @@ def test_no_dspark_rejects_explicit_draft_instead_of_silently_enabling_it(server
         serve.build_command(serve.parse_args(server_assets + ["--no-dspark", "--dspark-model", str(dspark_assets)]))
 
 
+@pytest.mark.skipif(os.name == "nt" or shutil.which("bash") is None, reason="Shell launchers require POSIX with bash")
 @pytest.mark.parametrize("baseline", [False, True])
 def test_dspark_performance_shell_uses_packaged_draft_and_matching_baseline(
     server_assets, dspark_assets, tmp_path, baseline

@@ -30,9 +30,13 @@ DSPARK_SPECULATIVE_TOKENS = 5
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--gs32-library", type=Path, help="GS32 Torch bridge .so; required for native")
-    parser.add_argument("--gs32-binary", type=Path, help="mixed_w2w4_moe_ffn.o kernel ELF; required for native")
-    parser.add_argument("--gs32-backend", choices=("native", "reference_mxfp8"), default="native")
+    parser.add_argument(
+        "--gs32-runtime-dir", type=Path, help="Full-FFN build directory containing the manifest, .so and .o"
+    )
+    parser.add_argument("--gs32-library", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--gs32-binary", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--gs32-backend", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--enforce-eager", action="store_true", help="Run the same full FFN without decode graphs")
     parser.add_argument(
         "--dspark",
         action=argparse.BooleanOptionalAction,
@@ -64,15 +68,13 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--gs32-execution",
-        choices=("serial", "batched", "fused", "full_graph"),
         default=None,
-        help="default fused for full_ffn/reference; full_graph captures decode with eager chunked prefill",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--gs32-fusion",
-        choices=("none", "swiglu_quant", "full_ffn"),
         default=None,
-        help="default full_ffn for native, none for reference; explicit none selects staged projections",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--max-model-len",
@@ -189,6 +191,10 @@ def dspark_config(args):
 def build_command(args):
     """Validate model assets and execution limits, then build the vLLM serve command."""
     contract = source_contract()
+    if args.enforce_eager:
+        if args.gs32_execution not in (None, "fused"):
+            raise ValueError("--enforce-eager conflicts with --gs32-execution; omit the legacy execution option")
+        args.gs32_execution = "fused"
     resolved = contract["resolve_gs32_options"](
         {
             key: getattr(args, key)
@@ -198,6 +204,15 @@ def build_command(args):
     )
     for key, value in resolved.items():
         setattr(args, key, value)
+    if args.gs32_runtime_dir is not None:
+        if args.gs32_library is not None or args.gs32_binary is not None:
+            raise ValueError("Use --gs32-runtime-dir or explicit --gs32-library/--gs32-binary, not both")
+        directory = args.gs32_runtime_dir.resolve(strict=True)
+        if not (directory / "build-manifest.json").is_file():
+            raise ValueError("Full FFN runtime directory requires build-manifest.json")
+        # Resolve locally: manifests may have been produced on another server.
+        args.gs32_library = directory / "libvq2a8_gs32_stage.so"
+        args.gs32_binary = directory / "mixed_w2w4_moe_ffn.o"
     if args.parallel_mode == "dp-ep" and args.ep_size not in DP_EP_SIZES:
         raise ValueError("GS32 dp-ep requires --ep-size 2, 4 or 8.")
     tp_size = args.ep_size if args.parallel_mode == "tp-ep" else 1
@@ -244,16 +259,15 @@ def build_command(args):
     if not (model / "model.safetensors.index.json").is_file():
         raise ValueError("Select a GS32 source-v3 checkpoint with independently named expert tensors.")
     additional["vq2a8"] = dict(resolved)
-    if args.gs32_backend == "native":
-        if args.gs32_library is None or args.gs32_binary is None:
-            raise ValueError("GS32 native requires --gs32-library and --gs32-binary.")
-        native = {
-            "gs32_library": args.gs32_library.resolve(strict=True),
-            "gs32_binary": args.gs32_binary.resolve(strict=True),
-        }
-        if any(not path.is_file() for path in native.values()):
-            raise ValueError("GS32 native library and kernel binary must be regular files.")
-        additional["vq2a8"].update({name: str(path) for name, path in native.items()})
+    if args.gs32_library is None or args.gs32_binary is None:
+        raise ValueError("GS32 full FFN requires --gs32-runtime-dir (or --gs32-library and --gs32-binary).")
+    native = {
+        "gs32_library": args.gs32_library.resolve(strict=True),
+        "gs32_binary": args.gs32_binary.resolve(strict=True),
+    }
+    if any(not path.is_file() for path in native.values()):
+        raise ValueError("GS32 native library and kernel binary must be regular files.")
+    additional["vq2a8"].update({name: str(path) for name, path in native.items()})
     command = [
         sys.executable,
         "-m",
@@ -363,15 +377,13 @@ def check_native_dependencies():
 
 
 def check_gs32_dependencies(args):
-    """Load the selected bridge and check its ABI without initializing a device."""
-    if args.gs32_backend != "native":
-        return None
+    """Check the full-FFN bridge ABI without initializing a device."""
     # Reuse the build-time ABI checks, keeping Torch imports out of --dry-run.
     from tools.build_vq2a8_gs32_stage import verify_loaded_library, verify_runtime_artifacts
 
     library = args.gs32_library.resolve(strict=True)
     verify_loaded_library(library, args.gs32_execution, fusion=args.gs32_fusion, binary=args.gs32_binary)
-    return verify_runtime_artifacts(library, args.gs32_binary, require_full_ffn=args.gs32_fusion == "full_ffn")
+    return verify_runtime_artifacts(library, args.gs32_binary, require_full_ffn=True)
 
 
 def runtime_record(args, bridge):
@@ -413,9 +425,9 @@ def main(argv=None):
             raise ValueError("GS32 dp-ep requires MRV2 (VLLM_USE_V2_MODEL_RUNNER=1).")
         if (args.dspark or args.dspark_model is not None) and runner != "1":
             raise ValueError("GS32 DSpark requires MRV2 (VLLM_USE_V2_MODEL_RUNNER=1).")
+        command = build_command(args)
         if args.gs32_execution == "full_graph" and args.max_num_seqs > 1 and runner != "1":
             raise ValueError("GS32 full_graph with max_num_seqs >1 requires MRV2 (VLLM_USE_V2_MODEL_RUNNER=1).")
-        command = build_command(args)
         if args.dry_run:
             print(shlex.join(["env", f"VLLM_USE_V2_MODEL_RUNNER={runner}", *command]))
         else:
@@ -425,7 +437,7 @@ def main(argv=None):
             if args.check_native_only:
                 print(
                     f"VQ2A8_NATIVE_CHECK=PASS extension={extension} gs32_backend={args.gs32_backend} "
-                    f"gs32_bridge={bridge or 'not_required'} gs32_execution={args.gs32_execution} "
+                    f"gs32_bridge={bridge} gs32_execution={args.gs32_execution} "
                     "(registration only; no device execution)"
                 )
             else:

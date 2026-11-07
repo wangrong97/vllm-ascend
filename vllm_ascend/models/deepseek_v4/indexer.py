@@ -665,6 +665,12 @@ class DeepseekV4Indexer(nn.Module):
         assert compressor is not None
 
         if (
+            qr_pertoken_scale is not None
+            and qr.dtype == torch.float8_e4m3fn
+            and self.cv_wq_b.can_share_mxfp8_input(self.cv_wq_b)
+        ):
+            q = self.cv_wq_b.matmul(qr, qr_pertoken_scale, bias=None if self.wq_b.skip_bias_add else self.wq_b.bias)
+        elif (
             _is_w8a8_dynamic(self.wq_b)
             and qr_pertoken_scale is not None
             and not get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)

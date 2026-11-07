@@ -181,16 +181,16 @@ class GS32DPWorkerExtension:
                     "moe_ep_size": moe_config.ep_size,
                     "moe_local_experts": moe_config.num_local_experts,
                     "graph_row_capacity": bank.graph_row_capacity,
-                    "banks": {
-                        kind: {
-                            quant_type: {
-                                "expert_ids": [expert + layer.vq2a8_expert_start for expert in group["expert_ids"]],
-                                "field_names": list(group["fields"]),
-                                "field_counts": [value.shape[0] for value in group["fields"].values()],
-                            }
-                            for quant_type, group in groups.items()
-                        }
-                        for kind, groups in bank.banks.items()
+                    "fusion": bank.fusion,
+                    "full_ffn": {
+                        "expert_ids": [
+                            expert + layer.vq2a8_expert_start for expert in bank.full_ffn_bank["expert_ids"]
+                        ],
+                        "gate_w4": bank.full_ffn_bank["gate_w4"].tolist(),
+                        "down_w4": bank.full_ffn_bank["down_w4"].tolist(),
+                        "field_shapes": {
+                            name: list(value.shape) for name, value in bank.full_ffn_bank["fields"].items()
+                        },
                     },
                 }
             )
@@ -231,7 +231,7 @@ def check_state_inventory(states, config, dp_size, entries, execution):
         assert state["dp_rank"] == state["rank"] == rank
         assert state["dp_size"] == state["ep_size"] == dp_size
         assert state["tp_rank"] == 0 and state["tp_size"] == 1
-        assert state["validity_owners"] == (len(entries) if execution == "full_graph" else 0)
+        assert state["validity_owners"] == len(entries)
         for layer in state["layers"]:
             assert layer["moe_ep_rank"] == rank and layer["moe_ep_size"] == dp_size
             assert layer["moe_local_experts"] == config["n_routed_experts"] // dp_size

@@ -1859,6 +1859,9 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         # Consumed in derive_and_validate as the SP MoE switch. Not an
         # AscendConfig field, so strip it before extra="forbid" validation.
         "enable_flashcomm1",
+        # Quantization-owned options: preserve on VllmConfig for
+        # validate_vq2a8_config rather than passing to this platform schema.
+        "vq2a8",
         # injected fields (factory passes explicitly; a copy in additional_config would conflict)
         "scheduler_config",
         "sparse_kv_offload_config",

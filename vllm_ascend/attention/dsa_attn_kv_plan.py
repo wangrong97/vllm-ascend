@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import torch_npu
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
 from vllm_ascend.attention.mixed_quant_sparse_flash_mla import (
     mixed_quant_sparse_flash_mla_fp8,
@@ -55,6 +56,19 @@ def is_a5_bf16_kv_enabled(vllm_config) -> bool:
     if cache_config is None:
         return False
     return str(cache_config.cache_dtype).lower() in _BF16_KV_CACHE_DTYPES
+
+
+def get_dsv4_attn_kv_dtype(vllm_config) -> torch.dtype:
+    """Keep attention KV storage consistent with the selected DSA operator.
+
+    On A5, ``auto`` selects the FP8 attention plan even for a BF16 model.
+    Resolving it through the generic model dtype would allocate BF16 rows
+    for an operator that consumes packed FP8 rows. Preserve the launch dtype
+    in the config so an explicit BF16 request still selects the BF16 plan.
+    """
+    if _supports_dsv4_compressed_cache():
+        return torch.bfloat16 if is_a5_bf16_kv_enabled(vllm_config) else torch.float8_e4m3fn
+    return kv_cache_dtype_str_to_dtype(vllm_config.cache_config.cache_dtype, vllm_config.model_config)
 
 
 DSA_COMPRESSOR_SLOT_MAPPING_FLAT = 1

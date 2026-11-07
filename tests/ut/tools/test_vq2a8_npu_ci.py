@@ -152,7 +152,7 @@ def test_closed_terminal_does_not_lose_child_log_or_returncode(driver, tmp_path,
     assert log.read_bytes() == b"child error"
 
 
-@pytest.mark.parametrize("stage_name", ["activation", "ep2-v2", "recovery-v2"])
+@pytest.mark.parametrize("stage_name", ["full_ffn", "ep2-v2", "recovery-v2"])
 def test_real_plan_discovers_e2e_conftest_and_passes_custom_options(assets, driver, tmp_path, monkeypatch, stage_name):
     repository = tmp_path / "isolated repository"
     nightly = repository / driver.TEST_ROOT
@@ -187,7 +187,7 @@ def test_real_plan_discovers_e2e_conftest_and_passes_custom_options(assets, driv
         + f"    assert request.config.getoption('--vq2a8-gs32-library') == {str(assets.library)!r}\n"
         + f"    assert request.config.getoption('--vq2a8-gs32-binary') == {str(assets.binary)!r}\n"
         + f"    assert request.config.getoption('--vq2a8-gs32-ep-skip-single-card') is {stage_name == 'ep2-v2'}\n"
-        + f"    assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == {'4' if stage_name == 'activation' else '4,5'!r}\n"
+        + f"    assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == {'4' if stage_name == 'full_ffn' else '4,5'!r}\n"
         + "    assert os.environ['VLLM_USE_V2_MODEL_RUNNER'] == '1'\n",
         encoding="utf-8",
     )
@@ -203,7 +203,7 @@ def test_real_plan_discovers_e2e_conftest_and_passes_custom_options(assets, driv
     assert Path(stage["junit"]).is_file()
 
 
-@pytest.mark.parametrize("suite, stage_count", [("kernels", 9), ("pr", 10), ("nightly", 11)])
+@pytest.mark.parametrize("suite, stage_count", [("kernels", 5), ("pr", 6), ("nightly", 7)])
 def test_dry_run_is_offline_and_plans_isolated_stages_with_explicit_devices(assets, suite, stage_count):
     result = run_cli(assets, "--suite", suite, "--devices", "4" if suite == "kernels" else "4,5", "--dry-run")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -223,10 +223,10 @@ def test_dry_run_is_offline_and_plans_isolated_stages_with_explicit_devices(asse
             ("--vq2a8-gs32-binary", assets.binary),
         ):
             assert command[command.index(flag) + 1] == str(value)
-        assert environment["ASCEND_RT_VISIBLE_DEVICES"] == ("4" if index < 9 else "4,5")
+        assert environment["ASCEND_RT_VISIBLE_DEVICES"] == ("4" if index < 5 else "4,5")
         assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "1"
-    files = [next(item for item in stage["command"] if "tests/e2e/nightly/" in item) for stage in stages[:9]]
-    assert len(set(files)) == 9
+    files = [next(item for item in stage["command"] if "tests/e2e/nightly/" in item) for stage in stages[:5]]
+    assert len(set(files)) == 5
     if suite != "kernels":
         ep_stages = [stage for stage in stages if any("test_vq2a8_gs32_ep.py::" in item for item in stage["command"])]
         assert [stage["name"] for stage in ep_stages] == ["ep2-v2"]
@@ -251,11 +251,11 @@ def test_v1_selection_does_not_restore_removed_ep2_acceptance(assets, suite):
     assert not plan["single_card_reference"]
     assert all(stage["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "0" for stage in stages)
     if suite == "nightly":
-        assert len(stages) == 10
+        assert len(stages) == 6
         assert stages[-1]["name"] == "recovery-v1"
         assert plan["model_runners"] == ["v1"]
     else:
-        assert len(stages) == 9
+        assert len(stages) == 5
         assert plan["model_runners"] == []
     assert not assets.results.exists()
 
@@ -266,13 +266,13 @@ def test_nightly_explicit_runner_matrix_keeps_both_recovery_variants(assets, run
     assert result.returncode == 0, result.stdout + result.stderr
     plan = json.loads(result.stdout)
     stages = plan["stages"]
-    assert len(stages) == 12
+    assert len(stages) == 8
     assert plan["model_runners"] == list(runners)
     assert all(
-        stage["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == ("1" if runners[0] == "v2" else "0") for stage in stages[:9]
+        stage["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == ("1" if runners[0] == "v2" else "0") for stage in stages[:5]
     )
-    assert {stage["name"] for stage in stages[9:]} == {"ep2-v2", "recovery-v1", "recovery-v2"}
-    for stage in stages[9:]:
+    assert {stage["name"] for stage in stages[5:]} == {"ep2-v2", "recovery-v1", "recovery-v2"}
+    for stage in stages[5:]:
         assert stage["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == ("0" if stage["name"] == "recovery-v1" else "1")
     assert not assets.results.exists()
 
@@ -281,7 +281,7 @@ def test_default_pr_can_select_only_v2_and_enable_ep1_reference(assets):
     result = run_cli(assets, "--model-runners", "v2", "--single-card-reference", "--dry-run")
     assert result.returncode == 0, result.stdout + result.stderr
     stages = json.loads(result.stdout)["stages"]
-    assert len(stages) == 10
+    assert len(stages) == 6
     assert stages[-1]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
     assert "--vq2a8-gs32-ep-skip-single-card" not in stages[-1]["command"]
     assert not assets.results.exists()
@@ -305,7 +305,8 @@ def test_kernels_suite_accepts_one_device_but_pr_requires_two(assets):
         ("--timeout", "nan"),
         ("--model-runners", "v2", "v2"),
         ("--allow-missing-checkpoint-pairs", "unknown_pair"),
-        ("--allow-missing-checkpoint-pairs", "mxfp4_to_vq2", "mxfp4_to_vq2"),
+        ("--allow-missing-checkpoint-pairs", "vq2_to_vq2", "vq2_to_vq2"),
+        ("--allow-missing-checkpoint-pairs", "mxfp4_to_vq2"),
     ],
 )
 def test_invalid_configuration_is_rejected_before_output_creation(assets, arguments):
@@ -395,36 +396,22 @@ def checkpoint_gap_plan(tmp_path, driver, monkeypatch):
     monkeypatch.setenv("PYTHONUTF8", "1")
     monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
 
-    def configure(mode="missing", *, pair="mxfp4_to_vq2", stage_name="batched", later_failure=False):
-        filename = "test_other.py" if mode == "wrong_class" else "test_vq2a8_gs32_batched.py"
-        function = "test_unrelated" if mode == "wrong_function" else "test_gs32_real_experts_fusion_compare"
-        executions = ("fused", "unexpected") if mode == "wrong_variant" else ("fused", "full_graph")
-        fusion_reason = (
-            f"No real {pair.replace('_to_', ' -> ')} expert exists in this checkpoint; combination was not tested."
-        )
-        prefill_reason = (
-            f"No real {pair.replace('_to_', ' -> ')} expert exists; this prefill combination was not tested."
-        )
+    def configure(mode="missing", *, pair="vq2_to_mxfp4", stage_name="full_ffn", later_failure=False):
+        filename = "test_other.py" if mode == "wrong_class" else "test_vq2a8_gs32_full_ffn.py"
+        function = "test_unrelated" if mode == "wrong_function" else "test_gs32_real_experts_full_ffn_compare"
+        test_pair = "unexpected" if mode == "wrong_variant" else pair
+        reason = f"No real {tuple(pair.split('_to_'))} expert in this checkpoint; this precision pair was not tested."
         source = (
-            "import pytest\n\n"
-            + f"@pytest.mark.parametrize('execution', {executions!r})\n"
-            + f"@pytest.mark.parametrize('pair', [{pair!r}])\n"
-            + f"def {function}(pair, execution):\n"
+            "import pytest\n\n" + f"@pytest.mark.parametrize('pair', [{test_pair!r}])\n" + f"def {function}(pair):\n"
         )
         if mode == "plain":
             source += "    assert True\n"
         elif mode == "xfail":
-            source += f"    pytest.xfail({fusion_reason!r})\n"
+            source += f"    pytest.xfail({reason!r})\n"
         elif mode == "wrong_reason":
             source += "    pytest.skip('no NPU available')\n"
         else:
-            source += f"    pytest.skip({fusion_reason!r})\n"
-        source += (
-            "\n@pytest.mark.parametrize('fusion', ('none', 'swiglu_quant'))\n"
-            + f"@pytest.mark.parametrize('pair', [{pair!r}])\n"
-            + "def test_gs32_real_mixed_ffn_device_prefill_compare_and_timing(pair, fusion):\n"
-            + ("    assert True\n" if mode == "plain" else f"    pytest.skip({prefill_reason!r})\n")
-        )
+            source += f"    pytest.skip({reason!r})\n"
         if mode != "all_skip":
             source += "\ndef test_executed_witness():\n    assert True\n"
         if mode == "other_skip":
@@ -465,109 +452,76 @@ def checkpoint_gap_plan(tmp_path, driver, monkeypatch):
     return configure
 
 
-def test_known_checkpoint_gap_automatically_continues_with_notice(assets, driver, checkpoint_gap_plan, capsys):
-    checkpoint_gap_plan()
-    assert driver.main(assets.argv) == 0
-    report, _ = read_report(assets)
-    assert report["automatic_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
-    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
-    assert report["coverage_complete"] is False
-    assert report["status"] == "passed_with_coverage_gaps"
-    assert [stage["status"] for stage in report["stages"]] == ["passed_with_coverage_gaps", "passed", "passed"]
-    stage = report["stages"][0]
-    assert stage["returncode"] == 0
-    assert stage["counts"] == {"tests": 5, "passed": 1, "failures": 0, "errors": 0, "skipped": 4}
-    assert len(stage["skipped_tests"]) == 4
-    assert {case["type"] for case in stage["skipped_tests"]} == {"pytest.skip"}
-    assert len(stage["coverage_gaps"]) == len(report["coverage_gaps"]) == 4
-    assert all(gap["pair"] == "mxfp4_to_vq2" and gap["model"] == str(assets.model) for gap in report["coverage_gaps"])
-    output = capsys.readouterr().out
-    assert "NOTICE" in output and "mxfp4_to_vq2" in output and str(assets.model) in output
-
-
 @pytest.mark.parametrize("pair", ["vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_mxfp4"])
-def test_other_checkpoint_pairs_remain_rejected_without_explicit_permission(assets, driver, checkpoint_gap_plan, pair):
+def test_checkpoint_pairs_rejected_without_explicit_permission(assets, driver, checkpoint_gap_plan, pair):
     checkpoint_gap_plan(pair=pair)
     assert driver.main(assets.argv) == 1
     report, _ = read_report(assets)
-    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["automatic_missing_checkpoint_pairs"] == []
+    assert report["allowed_missing_checkpoint_pairs"] == []
     assert report["coverage_complete"] is False
     assert report["status"] == "failed"
     assert [stage["status"] for stage in report["stages"]] == ["failed", "not_run", "not_run"]
-    assert report["stages"][0]["counts"]["skipped"] == 4
+    assert report["stages"][0]["counts"]["skipped"] == 1
 
 
-def test_explicit_pairs_merge_with_automatic_pair_without_duplicates(assets, driver):
-    args = driver.parse_args(
-        [
-            *assets.argv,
-            "--allow-missing-checkpoint-pairs",
-            "vq2_to_mxfp4",
-            "mxfp4_to_vq2",
-            "vq2_to_vq2",
-        ]
-    )
-    assert args.allow_missing_checkpoint_pairs == ["mxfp4_to_vq2", "vq2_to_mxfp4", "vq2_to_vq2"]
-
-
-@pytest.mark.parametrize("pair", ["vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_vq2", "mxfp4_to_mxfp4"])
-def test_explicit_checkpoint_gap_continues_and_preserves_real_skip_coverage(assets, driver, checkpoint_gap_plan, pair):
+@pytest.mark.parametrize("pair", ["vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_mxfp4"])
+def test_explicit_checkpoint_gap_continues_and_preserves_real_skip_coverage(
+    assets, driver, checkpoint_gap_plan, capsys, pair
+):
     checkpoint_gap_plan(pair=pair)
     assert driver.main([*assets.argv, "--allow-missing-checkpoint-pairs", pair]) == 0
     report, _ = read_report(assets)
     assert report["status"] == "passed_with_coverage_gaps"
-    assert report["automatic_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
-    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2", *([pair] if pair != "mxfp4_to_vq2" else [])]
+    assert report["automatic_missing_checkpoint_pairs"] == []
+    assert report["allowed_missing_checkpoint_pairs"] == [pair]
     assert report["coverage_complete"] is False
     assert [stage["status"] for stage in report["stages"]] == ["passed_with_coverage_gaps", "passed", "passed"]
     stage = report["stages"][0]
-    assert stage["counts"] == {"tests": 5, "passed": 1, "failures": 0, "errors": 0, "skipped": 4}
-    assert len(stage["coverage_gaps"]) == len(stage["skipped_tests"]) == len(report["coverage_gaps"]) == 4
-    expected_names = {
-        f"test_gs32_real_experts_fusion_compare[{pair}-{execution}]" for execution in ("fused", "full_graph")
-    } | {
-        f"test_gs32_real_mixed_ffn_device_prefill_compare_and_timing[{pair}-{fusion}]"
-        for fusion in ("none", "swiglu_quant")
-    }
-    assert {case["name"] for case in stage["skipped_tests"]} == expected_names
-    assert {case["classname"] for case in stage["skipped_tests"]} == {"tests.e2e.nightly.test_vq2a8_gs32_batched"}
+    assert stage["counts"] == {"tests": 2, "passed": 1, "failures": 0, "errors": 0, "skipped": 1}
+    assert len(stage["coverage_gaps"]) == len(stage["skipped_tests"]) == len(report["coverage_gaps"]) == 1
+    name = f"test_gs32_real_experts_full_ffn_compare[{pair}]"
+    assert {case["name"] for case in stage["skipped_tests"]} == {name}
+    assert {case["type"] for case in stage["skipped_tests"]} == {"pytest.skip"}
+    assert {case["classname"] for case in stage["skipped_tests"]} == {"tests.e2e.nightly.test_vq2a8_gs32_full_ffn"}
     assert {gap["nodeid"] for gap in stage["coverage_gaps"]} == {
-        f"tests/e2e/nightly/test_vq2a8_gs32_batched.py::{name}" for name in expected_names
+        f"tests/e2e/nightly/test_vq2a8_gs32_full_ffn.py::{name}"
     }
     assert all(gap["pair"] == pair and "was not tested" in gap["reason"] for gap in stage["coverage_gaps"])
     assert report["coverage_gaps"] == [
-        {"stage": "batched", "model": str(assets.model), **gap} for gap in stage["coverage_gaps"]
+        {"stage": "full_ffn", "model": str(assets.model), **gap} for gap in stage["coverage_gaps"]
     ]
+    output = capsys.readouterr().out
+    assert "NOTICE" in output and pair in output and str(assets.model) in output
 
 
 @pytest.mark.parametrize(
     "mode,stage_name,pair,allowed",
     [
-        ("other_skip", "batched", "mxfp4_to_vq2", None),
-        ("xfail", "batched", "mxfp4_to_vq2", None),
-        ("wrong_reason", "batched", "mxfp4_to_vq2", None),
-        ("wrong_class", "batched", "mxfp4_to_vq2", None),
-        ("wrong_function", "batched", "mxfp4_to_vq2", None),
-        ("wrong_variant", "batched", "mxfp4_to_vq2", None),
-        ("all_skip", "batched", "mxfp4_to_vq2", None),
-        ("nonzero", "batched", "mxfp4_to_vq2", None),
-        ("missing", "grouped", "mxfp4_to_vq2", None),
-        ("missing", "batched", "vq2_to_mxfp4", "vq2_to_vq2"),
+        ("other_skip", "full_ffn", "vq2_to_mxfp4", "vq2_to_mxfp4"),
+        ("xfail", "full_ffn", "vq2_to_mxfp4", "vq2_to_mxfp4"),
+        ("wrong_reason", "full_ffn", "vq2_to_mxfp4", "vq2_to_mxfp4"),
+        ("wrong_class", "full_ffn", "vq2_to_mxfp4", "vq2_to_mxfp4"),
+        ("wrong_function", "full_ffn", "vq2_to_mxfp4", "vq2_to_mxfp4"),
+        ("wrong_variant", "full_ffn", "vq2_to_mxfp4", "vq2_to_mxfp4"),
+        ("all_skip", "full_ffn", "vq2_to_mxfp4", "vq2_to_mxfp4"),
+        ("nonzero", "full_ffn", "vq2_to_mxfp4", "vq2_to_mxfp4"),
+        ("missing", "ep_routes", "vq2_to_mxfp4", "vq2_to_mxfp4"),
+        ("missing", "full_ffn", "vq2_to_mxfp4", "vq2_to_vq2"),
     ],
 )
 def test_checkpoint_gap_policy_does_not_allow_other_nonpassing_results(
     assets, driver, checkpoint_gap_plan, mode, stage_name, pair, allowed
 ):
     checkpoint_gap_plan(mode, stage_name=stage_name, pair=pair)
-    extra = ["--allow-missing-checkpoint-pairs", allowed] if allowed else []
-    assert driver.main([*assets.argv, *extra]) == 1
+    assert driver.main([*assets.argv, "--allow-missing-checkpoint-pairs", allowed]) == 1
     report, _ = read_report(assets)
     assert report["status"] == "failed" and report["coverage_complete"] is False
     assert [stage["status"] for stage in report["stages"]] == ["failed", "not_run", "not_run"]
     stage = report["stages"][0]
     assert stage["error"]
     if mode == "all_skip":
-        assert stage["counts"]["passed"] == 0 and stage["counts"]["skipped"] == 4
+        assert stage["counts"]["passed"] == 0 and stage["counts"]["skipped"] == 1
     if mode == "nonzero":
         assert stage["returncode"] == 7
     if mode == "xfail":
@@ -576,23 +530,23 @@ def test_checkpoint_gap_policy_does_not_allow_other_nonpassing_results(
 
 def test_downstream_failure_takes_priority_and_preserves_earlier_checkpoint_gaps(assets, driver, checkpoint_gap_plan):
     checkpoint_gap_plan(later_failure=True)
-    assert driver.main(assets.argv) == 1
+    assert driver.main([*assets.argv, "--allow-missing-checkpoint-pairs", "vq2_to_mxfp4"]) == 1
     report, _ = read_report(assets)
     assert report["status"] == "failed" and report["coverage_complete"] is False
     assert [stage["status"] for stage in report["stages"]] == ["passed_with_coverage_gaps", "failed", "not_run"]
-    assert len(report["coverage_gaps"]) == 4
+    assert len(report["coverage_gaps"]) == 1
     assert report["stages"][1]["counts"]["failures"] == 1
 
 
 @pytest.mark.parametrize("allow_missing", [False, True])
 def test_no_checkpoint_gaps_retains_full_pass_semantics(assets, driver, checkpoint_gap_plan, allow_missing):
     checkpoint_gap_plan("plain")
-    extra = ["--allow-missing-checkpoint-pairs", "mxfp4_to_vq2"] if allow_missing else []
+    extra = ["--allow-missing-checkpoint-pairs", "vq2_to_mxfp4"] if allow_missing else []
     assert driver.main([*assets.argv, *extra]) == 0
     report, _ = read_report(assets)
     assert report["status"] == "passed" and report["coverage_complete"] is True
-    assert report["automatic_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
-    assert report["allowed_missing_checkpoint_pairs"] == ["mxfp4_to_vq2"]
+    assert report["automatic_missing_checkpoint_pairs"] == []
+    assert report["allowed_missing_checkpoint_pairs"] == (["vq2_to_mxfp4"] if allow_missing else [])
     assert report["coverage_gaps"] == []
     assert all(stage["status"] == "passed" for stage in report["stages"])
     assert all(stage["skipped_tests"] == [] and stage["coverage_gaps"] == [] for stage in report["stages"])

@@ -64,7 +64,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
 )
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.flashmla import prepare_flashmla_batch_req_state
 from vllm_ascend.attention.mla_v1 import AscendMLABackend, all_mla_use_flashmla
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
@@ -309,6 +309,30 @@ class NPUModelRunner(GPUModelRunner):
         # the dumper at the end of load_model).
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
+
+        # Bind stable layer status views before profiling or graph capture.
+        from vllm_ascend.ops.fused_moe.vq2a8_gs32 import initialize_quantization_validity
+
+        initialize_quantization_validity(
+            self,
+            breakable=(
+                self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                and breakable_cudagraph.is_breakable_cudagraph_enabled()
+            ),
+        )
+        self._quantization_validity_pending = False
+
+    def _check_quantization_validity(self) -> None:
+        from vllm_ascend.ops.fused_moe.vq2a8_gs32 import check_quantization_validity
+
+        try:
+            check_quantization_validity(self)
+        except RuntimeError:
+            # A failed forward must never remain available to sample_tokens().
+            self.execute_model_state = None
+            raise
+        finally:
+            self._quantization_validity_pending = False
 
     def _restore_replicated_draft_target_states(self) -> None:
         """Restore target states consumed by a replicated PCP draft."""
@@ -596,6 +620,81 @@ class NPUModelRunner(GPUModelRunner):
             layer = self.compilation_config.static_forward_context[layer_name]
             layer.impl.bind_copy_sfa_kv_cache(manager, layer_name)
 
+    @contextmanager
+    def _gs32_prefill_warmup(self, num_tokens: int):
+        """Borrow non-null KV pages for the shared worker's startup prefill."""
+        if self.req_states.req_id_to_index or self.execute_model_state is not None:
+            raise RuntimeError("GS32 startup prefill warmup requires an idle runner.")
+        if not 0 < num_tokens <= min(self.max_num_tokens, self.max_model_len):
+            raise ValueError("GS32 startup prefill warmup exceeds the configured token capacity.")
+        groups = self.kv_cache_config.kv_cache_groups
+        block_sizes = [group.kv_cache_spec.block_size for group in groups]
+        tables = self.block_tables.input_block_tables
+        factors = self.block_tables.blocks_per_kv_block
+        for size, table, factor in zip(block_sizes, tables, factors):
+            num_tokens = min(num_tokens, table.shape[1] // factor * size)
+        available_blocks = max(self.kv_cache_config.num_blocks - 1, 0)
+        lower, upper = 0, num_tokens
+        while lower < upper:
+            candidate = (lower + upper + 1) // 2
+            if sum((candidate + size - 1) // size for size in block_sizes) <= available_blocks:
+                lower = candidate
+            else:
+                upper = candidate - 1
+        num_tokens = lower
+        if not block_sizes or num_tokens < 1:
+            raise ValueError("GS32 startup prefill warmup requires available KV pages in every group.")
+
+        borrowed, cache_views = [], []
+        first = 1
+        for group, table, factor, size in zip(groups, tables, factors, block_sizes):
+            count = (num_tokens + size - 1) // size
+            end = first + count
+            borrowed.append((table[0], factor, first, end, size))
+            for name in group.layer_names:
+                caches = self.compilation_config.static_forward_context[name].kv_cache[0]
+                for cache in caches if isinstance(caches, (list, tuple)) else (caches,):
+                    if cache.shape[0] < end:
+                        raise ValueError("GS32 startup prefill warmup exceeds an allocated cache tensor.")
+                    cache_views.append(cache[first:end])
+            first = end
+
+        buffers = [
+            self.input_buffers.input_ids[:num_tokens],
+            self.input_buffers.positions[:num_tokens],
+            self.input_buffers.seq_lens,
+            self.input_buffers.seq_lens_cpu,
+            self.input_buffers.query_start_loc,
+            self.input_buffers.is_padding[:num_tokens],
+            self.block_tables.slot_mappings[:, :num_tokens],
+            *(table for table, *_ in borrowed),
+            *cache_views,
+        ]
+        torch.npu.synchronize()
+        snapshots = [(buffer, buffer.clone()) for buffer in buffers]
+        old_metadata = getattr(self.model_state, "attn_metadata", None)
+        try:
+            for gid, (table, factor, first, end, size) in enumerate(borrowed):
+                table.zero_()
+                table[: (end - first) * factor].copy_(
+                    torch.arange(first * factor, end * factor, dtype=table.dtype, device=self.device)
+                )
+                slots = self.block_tables.slot_mappings[gid, :num_tokens]
+                slots.copy_(torch.arange(num_tokens, dtype=slots.dtype, device=self.device) + first * size)
+            self._gs32_prefill_warmup_active = True
+            yield num_tokens
+        finally:
+            try:
+                torch.npu.synchronize()
+            finally:
+                for buffer, snapshot in snapshots:
+                    buffer.copy_(snapshot)
+                self.model_state.attn_metadata = old_metadata
+                self.execute_model_state = None
+                self._quantization_validity_pending = False
+                self._gs32_prefill_warmup_active = False
+                torch.npu.synchronize()
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -613,6 +712,16 @@ class NPUModelRunner(GPUModelRunner):
             profiling_config,
             scheduler_output,
         )
+
+        validity = getattr(self, "_quantization_validity", None)
+        if validity is not None:
+            # Consume the previous step before its stable views can be reused,
+            # even if this is an empty scheduler step with no model forward.
+            if getattr(self, "_quantization_validity_pending", False):
+                self._check_quantization_validity()
+            validity.zero_()
+        startup_prefill = getattr(self, "_gs32_prefill_warmup_active", False)
+        is_profile = is_profile or startup_prefill  # Force eager startup prefill.
 
         # Preemption stores must complete before the parent updates states and
         # reuses or zeroes the preempted requests' physical KV cache blocks.
@@ -633,22 +742,30 @@ class NPUModelRunner(GPUModelRunner):
             skip_dp_coordination() if should_skip_allreduce_across_dp_group(self.vllm_config) else nullcontext()
         )
         forward_failed = True
-        with dp_coordination_context:
-            try:
-                output = super().execute_model(
-                    scheduler_output,
-                    intermediate_tensors=intermediate_tensors,
-                    dummy_run=dummy_run,
-                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                    is_profile=is_profile,
-                    context_len=context_len,
-                    valid_dummy_state_slots=valid_dummy_state_slots,
-                )
-                forward_failed = False
-            finally:
-                finish_execution = getattr(self.model_state, "finish_execution", None)
-                if finish_execution is not None:
-                    finish_execution(failed=forward_failed)
+        try:
+            with dp_coordination_context:
+                try:
+                    output = super().execute_model(
+                        scheduler_output,
+                        intermediate_tensors=intermediate_tensors,
+                        dummy_run=dummy_run,
+                        skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                        is_profile=is_profile,
+                        context_len=context_len,
+                        valid_dummy_state_slots=valid_dummy_state_slots,
+                    )
+                    forward_failed = False
+                finally:
+                    finish_execution = getattr(self.model_state, "finish_execution", None)
+                    if finish_execution is not None:
+                        finish_execution(failed=forward_failed)
+        except Exception:
+            if validity is not None:
+                # Failed submission or metadata retirement cannot expose a
+                # prior or partial forward to sample_tokens().
+                self.execute_model_state = None
+                self._quantization_validity_pending = False
+            raise
         if not dummy_run and not is_profile:
             self._maybe_send_draft_kv(scheduler_output)
         self.model_state.kvpp_is_dummy_run = False
@@ -674,6 +791,13 @@ class NPUModelRunner(GPUModelRunner):
                 # Non-last pooling ranks do not reach pool(). Decoding ranks
                 # finalize after sample_tokens(), including non-last PP ranks.
                 self._finalize_dump_data()
+
+        if validity is not None and scheduler_output.total_num_scheduled_tokens:
+            self._quantization_validity_pending = True
+            # Generation submits LM Head before checking, just as MRV1 does.
+            # Dummy/profile and intermediate PP outputs have no sampler owner.
+            if dummy_run or is_profile or not self.is_last_pp_rank:
+                self._check_quantization_validity()
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,
@@ -1055,6 +1179,29 @@ class NPUModelRunner(GPUModelRunner):
     def prepare_dummy_attn(
         self, input_batch: AscendInputBatch, valid_state_slots: bool = False
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        if getattr(self, "_gs32_prefill_warmup_active", False):
+            # MRV2 dummy batches normally use DecodeOnly and null pages. Mark this
+            # one startup batch as a fresh prefill while retaining the same buffers.
+            if input_batch.num_reqs != 1 or input_batch.num_tokens != input_batch.num_tokens_after_padding:
+                raise RuntimeError("GS32 startup prefill requires one unpadded request.")
+            input_batch.attn_state = AscendAttentionState.PrefillNoCache
+            input_batch.is_prefilling_np[:] = True
+            input_batch.has_prefill = True
+            input_batch.prefill_len_np[:] = input_batch.num_tokens
+            input_batch.num_computed_tokens_np[:] = 0
+            input_batch.num_computed_prefill_tokens_np[:] = 0
+            input_batch.positions.copy_(
+                torch.arange(input_batch.num_tokens, dtype=input_batch.positions.dtype, device=self.device)
+            )
+            input_batch.is_padding.zero_()
+            update_cos_sin(input_batch.positions)
+            input_batch.input_ids.copy_(
+                torch.arange(input_batch.num_tokens, device=self.device) % self.model_config.get_vocab_size()
+            )
+            return (
+                tuple(table[:1] for table in self.block_tables.input_block_tables),
+                self.block_tables.slot_mappings[:, : input_batch.num_tokens],
+            )
         block_tables, slot_mappings = super().prepare_dummy_attn(
             input_batch,
             valid_state_slots=valid_state_slots,
@@ -1075,23 +1222,24 @@ class NPUModelRunner(GPUModelRunner):
         return lmhead_tp_max_num_logits(self.max_num_reqs, self.decode_query_len)
 
     def sample(self, hidden_states, input_batch, grammar_output):
-        """Override GPUModelRunner.sample for lmhead TP: every rank must feed
-        compute_logits the same row count — pad up to ``_lmhead_tp_max_num_logits()``
-        and trim back; prompt_logprobs stays unsupported (same as V1)."""
-        if not lmhead_tp_enable():
+        """Preserve LM-head TP index padding and check GS32 status before sampling."""
+        lmhead_tp = lmhead_tp_enable()
+        check_validity = getattr(self, "_quantization_validity_pending", False)
+        if not lmhead_tp and not check_validity:
             return super().sample(hidden_states, input_batch, grammar_output)
 
         num_logits = input_batch.logits_indices.shape[0]
-        capacity = self._lmhead_tp_max_num_logits()
-        # V1-style index pad: pad a private copy of the indices (input_batch keeps
-        # the real ones; the V2 sampler gathers penalties by them) so one gather
-        # feeds compute_logits the capacity rows; zero entries gather row 0.
+        capacity = self._lmhead_tp_max_num_logits() if lmhead_tp else num_logits
+        # Keep the upstream index padding so LM-head collectives receive
+        # the same row capacity on every rank without changing sampler indices.
         sample_indices = lmhead_tp_pad_rows(
             input_batch.logits_indices,
             capacity,
             "max_num_reqs * decode_query_len",
         )
         logits = self.model.compute_logits(hidden_states[sample_indices])
+        if check_validity:
+            self._check_quantization_validity()
         logits = logits[:num_logits]
 
         # Dispatch tail mirrors GPUModelRunner.sample; refresh it on main bumps.

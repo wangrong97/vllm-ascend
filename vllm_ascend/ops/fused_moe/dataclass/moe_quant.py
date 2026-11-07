@@ -70,6 +70,8 @@ class MoEQuantParams:
 
     @property
     def dispatch_with_quant(self) -> bool:
+        # VQ2A8 requires expert-specific permutations/scales after dispatch, so its
+        # activations remain BF16 through communication and token reordering.
         return self.quant_type in (
             QuantType.W8A8,
             QuantType.W4A8,

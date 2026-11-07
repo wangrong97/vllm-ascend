@@ -27,338 +27,151 @@ PREFILL_BENCHMARK_REPEATS = 5
 def route_runtime(request):
     runtime = request.getfixturevalue("activation_runtime")
 
-    from vllm_ascend.ops.fused_moe.vq2a8_gs32_activation import finish_flags
-    from vllm_ascend.ops.fused_moe.vq2a8_gs32_routes import prepare, prepare_metadata, restore
+    from vllm_ascend.ops.fused_moe.vq2a8_gs32_routes import prepare_identity_metadata, prepare_metadata, restore
 
     return SimpleNamespace(
-        **vars(runtime), route=prepare, metadata=prepare_metadata, restore=restore, finish=finish_flags
+        **vars(runtime), metadata=prepare_metadata, identity_metadata=prepare_identity_metadata, restore=restore
     )
-
-
-def host_fields(runtime, counts, experts, width=64, group_type=1, dtype=None):
-    torch = runtime.torch
-    rows, logical = sum(counts), len(counts)
-    hidden = torch.arange(rows * width).reshape(rows, width).bfloat16()
-    group = torch.tensor(counts, dtype=torch.int64 if dtype is None else dtype)
-    if group_type == 0:
-        group = group.cumsum(0).to(group.dtype)
-    slots = [-1] * logical
-    for slot, expert in enumerate(experts):
-        slots[expert] = slot
-    return hidden, group, torch.tensor(experts, dtype=torch.int64), torch.tensor(slots, dtype=torch.int64)
-
-
-def enqueue(runtime, tensors, group_type):
-    hidden, group, experts, slots = tensors
-    return runtime.route(hidden, group, group_type, experts, slots)
-
-
-def assert_route(runtime, host, group_type, results, *, allow_padding=False, subset=False):
-    torch = runtime.torch
-    hidden, group, experts, slots = host
-    expected = route_reference(
-        group.tolist(),
-        group_type,
-        experts.tolist(),
-        slots.tolist(),
-        hidden.shape[0],
-        allow_padding=allow_padding,
-        subset=subset,
-    )
-    physical, source, inverse, valid = expected
-    assert results[3].cpu().tolist() == [valid]
-    assert results[1].cpu().tolist() == physical
-    assert results[2].cpu().tolist() == inverse
-    actual = results[0].cpu()
-    expected_hidden = torch.zeros_like(hidden)
-    if valid:
-        for row, source_row in enumerate(source):
-            if source_row >= 0:
-                expected_hidden[row] = hidden[source_row]
-    assert torch.equal(actual, expected_hidden)
-    if valid and not allow_padding and not subset:
-        assert torch.equal(actual[inverse], hidden)
 
 
 @pytest.mark.parametrize("group_type", [0, 1])
 @pytest.mark.parametrize("dtype_name", ["int32", "int64"])
-@pytest.mark.parametrize(
-    "counts,experts",
-    [
-        ([1], [0]),
-        ([1, 0, 2, 0], [2, 0, 3]),
-        ([0, 0, 0, 8], [3, 2, 0]),
-        # Exercise masked tails on both lookup tables, including unequal
-        # power-of-two blocks (logical 5 -> 8, physical 3 -> 4).
-        ([1, 0, 2, 0, 1], [4, 0, 2]),
-        ([0, 1, 0, 2, 0, 1, 2], [6, 0, 3, 1, 5]),
-        # Isolate row tails from expert tails: the original abort had both
-        # ROWS=3 and EXPERTS=3, so either could have supplied its 3 -> 4 slice.
-        ([1, 0, 2, 0], [2, 0, 3, 1]),  # ROWS=3, EXPERTS=4.
-        ([1, 0, 3, 0], [2, 0, 3]),  # ROWS=4, EXPERTS=3.
-        ([1, 0, 4, 0], [2, 0, 3, 1]),  # ROWS=5, EXPERTS=4.
-        ([2, 0, 5, 0], [2, 0, 3, 1]),  # ROWS=7, EXPERTS=4.
-    ],
-)
-def test_gs32_device_routes_match_cpu_order(route_runtime, group_type, dtype_name, counts, experts):
-    runtime = route_runtime
-    host = host_fields(runtime, counts, experts, group_type=group_type, dtype=getattr(runtime.torch, dtype_name))
-    device = tuple(value.to(runtime.device) for value in host)
-    assert_route(runtime, host, group_type, enqueue(runtime, device, group_type))
-
-
-def test_gs32_device_routes_maximum_bank_and_width(route_runtime):
-    runtime = route_runtime
-    counts = [0] * 256
-    for expert in (0, 3, 31, 95, 127, 200, 254, 255):
-        counts[expert] = 1
-    host = host_fields(runtime, counts, list(reversed(range(256))), width=4096)
-    device = tuple(value.to(runtime.device) for value in host)
-    assert_route(runtime, host, 1, enqueue(runtime, device, 1))
-
-
-@pytest.mark.parametrize("group_type", [0, 1], ids=("prefix", "counts"))
-@pytest.mark.parametrize("capacity", [6, 256])
-def test_gs32_routes_runtime_expert_bounds_subset_graph_recovery(route_runtime, capacity, group_type):
+def test_identity_metadata_graph_matches_general_route_oracle_with_holes(route_runtime, group_type, dtype_name):
     runtime, torch = route_runtime, route_runtime.torch
-    logical = 128
-    for expert_count in (1, 2, 3, 63, 64, 65, 127, 128):
-        experts = list(reversed(range(expert_count)))
-        slots = torch.full((logical,), -1, dtype=torch.int64)
-        for slot, expert in enumerate(experts):
-            slots[expert] = slot
-        counts = torch.zeros(logical, dtype=torch.int64)
-        counts[0] += 1
-        counts[expert_count - 1] += 2
-        if expert_count < logical:
-            counts[-1] = 1  # Active route owned by another quantization bank.
-        hidden = torch.arange(capacity * 64).reshape(capacity, 64).bfloat16()
-        group = counts.cumsum(0) if group_type == 0 else counts
-        host = (hidden, group, torch.tensor(experts, dtype=torch.int64), slots)
-        tensors = tuple(value.to(runtime.device) for value in host)
+    capacity, ids, slots = 129, [0, 2, 4], [0, -1, 1, -1, 2]
+    hidden = torch.zeros(capacity, 64, dtype=torch.bfloat16, device=runtime.device)
+    expert_ids = torch.tensor(ids, dtype=torch.int64, device=runtime.device)
+    logical_slots = torch.tensor(slots, dtype=torch.int64, device=runtime.device)
+    groups = torch.zeros(5, dtype=getattr(torch, dtype_name), device=runtime.device)
 
-        def forward(tensors=tensors):
-            return runtime.route(*tensors[:2], group_type, *tensors[2:], allow_padding=True, subset=True)
+    def forward():
+        return runtime.identity_metadata(hidden, groups, group_type, expert_ids, logical_slots, allow_padding=True)
 
-        stream = torch.npu.Stream(device=runtime.device)
-        stream.wait_stream(torch.npu.current_stream(runtime.device))
-        with torch.npu.stream(stream):
-            for _ in range(2):
-                forward()
-        stream.synchronize()
-        graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph, stream=stream):
-            result = forward()
-        stream.synchronize()
-        for index, state in enumerate(("valid", "bad_slot", "empty", "recovered")):
-            refreshed = [value.clone() for value in host]
-            refreshed[0].add_(index)
-            if state == "bad_slot":
-                refreshed[3][0] = expert_count
-            elif state == "empty":
-                refreshed[1].zero_()
-            with torch.npu.stream(stream):
-                for target, value in zip(tensors, refreshed, strict=True):
-                    target.copy_(value)
-                graph.replay()
-            stream.synchronize()
-            assert_route(runtime, refreshed, group_type, result, allow_padding=True, subset=True)
-            assert result[3].cpu().tolist() == [int(state != "bad_slot")]
-
-
-@pytest.mark.parametrize("group_type", [0, 1], ids=("prefix", "counts"))
-def test_gs32_routes_three_expert_decode_warmup(route_runtime, group_type):
-    """Cover the reported R=6 / logical=256 JIT failure without projection.
-
-    The real bank selected experts [0, 50, 1], with two rows each. Exercise
-    that physical order and representative one/two-expert typed subsets.
-    This validates eager compilation before any graph can be captured.
-    """
-    runtime = route_runtime
-    counts = [0] * 256
-    for expert in (0, 50, 1):
-        counts[expert] = 2
-    for experts in ([0, 50, 1], [0, 1], [50]):
-        host = host_fields(runtime, counts, experts, group_type=group_type)
-        tensors = tuple(value.to(runtime.device) for value in host)
-        result = runtime.route(*tensors[:2], group_type, *tensors[2:], allow_padding=True, subset=True)
-        runtime.torch.npu.synchronize()
-        assert_route(runtime, host, group_type, result, allow_padding=True, subset=True)
-
-
-@pytest.mark.parametrize("group_type", [0, 1], ids=("prefix", "counts"))
-@pytest.mark.parametrize("capacity", [12, 512])
-def test_gs32_routes_three_expert_metadata_warmup(route_runtime, capacity, group_type):
-    """Compile the bank's large-row routing path without loading projections."""
-    runtime = route_runtime
-    counts = [0] * 256
-    counts[0], counts[50], counts[1] = capacity // 3, capacity // 3, capacity - 2 * (capacity // 3)
-    for experts in ([0, 50, 1], [0, 1], [50]):
-        host = host_fields(runtime, counts, experts, group_type=group_type)
-        tensors = tuple(value.to(runtime.device) for value in host)
-        result = runtime.metadata(*tensors[:2], group_type, *tensors[2:], allow_padding=True, subset=True)
-        expected = route_reference(
-            host[1].tolist(),
-            group_type,
-            experts,
-            host[3].tolist(),
-            capacity,
-            allow_padding=True,
-            subset=True,
-            max_count=None,
-        )
-        for actual, reference in zip(result[:3], expected[:3], strict=True):
-            assert actual.cpu().tolist() == reference
-        assert result[3].cpu().tolist() == [expected[3]]
-        assert result[4].cpu().tolist() == [sum(expected[0]), expected[3]]
-
-
-@pytest.mark.parametrize("group_type", [0, 1])
-@pytest.mark.parametrize("dtype_name", ["int32", "int64"])
-@pytest.mark.parametrize(
-    "counts,experts",
-    [
-        ([32] * 6, [5, 3, 1, 4, 2, 0]),
-        ([32] * 8, list(reversed(range(8)))),
-        ([128, 0, 64], [2, 1, 0]),
-        ([0, 7, 0, 31, 0, 25, 128], [6, 3, 1, 5, 0]),
-        ([1] * 256, list(reversed(range(256)))),
-    ],
-)
-def test_gs32_device_routes_prefill_matches_cpu_order(route_runtime, group_type, dtype_name, counts, experts):
-    runtime = route_runtime
-    host = host_fields(runtime, counts, experts, group_type=group_type, dtype=getattr(runtime.torch, dtype_name))
-    device = tuple(value.to(runtime.device) for value in host)
-    assert_route(runtime, host, group_type, enqueue(runtime, device, group_type))
-
-
-@pytest.mark.parametrize("group_type", [0, 1])
-def test_gs32_device_routes_prefill_graph_dynamic_routes_and_recovery(route_runtime, group_type):
-    runtime, torch = route_runtime, route_runtime.torch
-    experts = [7, 5, 3, 1, 6, 4, 2, 0]
-    host = host_fields(runtime, [32] * 6 + [0, 0], experts, group_type=group_type)
-    tensors = tuple(value.to(runtime.device) for value in host)
-    stream = torch.npu.Stream(device=runtime.device)
-    stream.wait_stream(torch.npu.current_stream(runtime.device))
-    with torch.npu.stream(stream):
-        for _ in range(2):
-            enqueue(runtime, tensors, group_type)
+    for _ in range(2):
+        forward()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        counts, flags, summary = forward()
+    addresses = tuple(value.data_ptr() for value in (counts, flags, summary))
+    cases = (
+        [0, 0, 0, 0, 0],
+        [2, 0, 3, 0, 1],
+        [0, 0, 129, 0, 0],
+        [2, 1, 3, 0, 0],
+        [-1, 0, 2, 0, 0],
+        [130, 0, 0, 0, 0],
+        [64, 0, 66, 0, 0],
+        [0, 0, 0, 0, 128],
+    )
+    for raw in cases:
+        host = torch.tensor(raw, dtype=getattr(torch, dtype_name))
+        if group_type == 0:
+            host = host.cumsum(0).to(host.dtype)
+        groups.copy_(host)
+        graph.replay()
         torch.npu.synchronize()
-        graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph, stream=stream):
-            result = enqueue(runtime, tensors, group_type)
-        for index, counts in enumerate(
-            ([32] * 6 + [0, 0], [0, 0, 0, 0, 0, 0, 64, 128], [0, 0, 0, 0, 0, 0, 63, 129], [24] * 8)
-        ):
-            # The third replay is invalid although its total row count remains
-            # correct. The fourth must recover with the same captured buffers.
-            refreshed = list(host_fields(runtime, counts, experts, group_type=group_type))
-            refreshed[0].add_(index)
-            for target, source in zip(tensors, refreshed, strict=True):
-                target.copy_(source)
-            graph.replay()
-            assert_route(runtime, refreshed, group_type, result)
-        for corrupt in (True, False):
-            refreshed = list(host_fields(runtime, [24] * 8, experts, group_type=group_type))
-            if corrupt:
-                refreshed[2][0] = 2**63 - 1
-            for target, source in zip(tensors, refreshed, strict=True):
-                target.copy_(source)
-            graph.replay()
-            assert_route(runtime, refreshed, group_type, result)
-    torch.npu.current_stream(runtime.device).wait_stream(stream)
+        physical, gather, inverse, valid = route_reference(
+            host.tolist(), group_type, ids, slots, capacity, allow_padding=True, max_count=None
+        )
+        assert counts.cpu().tolist() == physical
+        assert flags.cpu().tolist() == [valid]
+        assert summary.cpu().tolist() == [sum(physical), valid]
+        generic = runtime.metadata(hidden, groups, group_type, expert_ids, logical_slots, allow_padding=True)
+        assert torch.equal(counts.cpu(), generic[0].cpu())
+        assert torch.equal(flags.cpu(), generic[3].cpu())
+        if valid:
+            active = sum(physical)
+            assert gather == inverse == [*range(active), *([-1] * (capacity - active))]
+            assert generic[1].cpu().tolist() == gather
+            assert generic[2].cpu().tolist() == inverse
+        assert addresses == tuple(value.data_ptr() for value in (counts, flags, summary))
 
 
-@pytest.mark.parametrize("group_type", [0, 1])
-@pytest.mark.parametrize(
-    "fault",
-    [
-        "max",
-        "min",
-        "negative",
-        "too_many",
-        "missing",
-        "zero",
-        "bad_id_min",
-        "bad_id_max",
-        "bad_id_negative",
-        "bad_id_oob",
-        "bad_slot_min",
-        "bad_slot_max",
-        "bad_slot_negative",
-        "bad_slot_oob",
-        "duplicate",
-    ],
-)
-def test_gs32_device_routes_invalid_data_is_safe_and_recovers(route_runtime, group_type, fault):
-    runtime = route_runtime
-    host = list(host_fields(runtime, [1, 0, 2, 0], [2, 0, 3], group_type=group_type))
-    if fault in ("max", "min", "negative", "too_many"):
-        host[1][0] = {"max": 2**63 - 1, "min": -(2**63), "negative": -1, "too_many": 4}[fault]
-    elif fault == "missing":
-        host[1].copy_(runtime.torch.tensor([0, 1, 3, 3] if group_type == 0 else [0, 1, 2, 0]))
-    elif fault == "zero":
-        host[1].zero_()
-    elif fault.startswith("bad_id_"):
-        host[2][0] = {
-            "bad_id_min": -(2**63),
-            "bad_id_max": 2**63 - 1,
-            "bad_id_negative": -1,
-            "bad_id_oob": host[1].numel(),
-        }[fault]
-    elif fault.startswith("bad_slot_"):
-        host[3][0] = {
-            "bad_slot_min": -(2**63),
-            "bad_slot_max": 2**63 - 1,
-            "bad_slot_negative": -2,
-            "bad_slot_oob": host[2].numel(),
-        }[fault]
-    else:
-        host[2][1] = host[2][0]
-    device = tuple(value.to(runtime.device) for value in host)
-    results = enqueue(runtime, device, group_type)
-    assert_route(runtime, host, group_type, results)
-    assert results[3].cpu().tolist() == [0]
-    fresh = host_fields(runtime, [1, 0, 2, 0], [2, 0, 3], group_type=group_type)
-    assert_route(
-        runtime, fresh, group_type, enqueue(runtime, tuple(value.to(runtime.device) for value in fresh), group_type)
-    )
-
-
-@pytest.mark.parametrize("group_type", [0, 1])
-def test_gs32_device_routes_graph_dynamic_counts_and_status_recovery(route_runtime, group_type):
+def test_identity_rejects_reordered_or_subset_inventory_and_recovers_on_device(route_runtime):
     runtime, torch = route_runtime, route_runtime.torch
-    host = host_fields(runtime, [1, 0, 2, 0], [2, 0, 3], group_type=group_type)
-    tensors = tuple(value.to(runtime.device) for value in host)
-    stream = torch.npu.Stream(device=runtime.device)
-    stream.wait_stream(torch.npu.current_stream(runtime.device))
-    with torch.npu.stream(stream):
-        flags = torch.ones(3, dtype=torch.int32, device=runtime.device)
-        native = torch.ones(1, dtype=torch.int32, device=runtime.device)
-        for _ in range(2):
-            result = enqueue(runtime, tensors, group_type)
-            runtime.finish(result[0], flags, flags, route_flags=result[3], native_flags=native).cpu()
-        graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph, stream=stream):
-            result = enqueue(runtime, tensors, group_type)
-            combined = runtime.finish(result[0], flags, flags, route_flags=result[3], native_flags=native)
-        for index, counts in enumerate(([1, 0, 2, 0], [0, 0, 0, 3], [0, 1, 2, 0], [3, 0, 0, 0])):
-            refreshed = list(host_fields(runtime, counts, [2, 0, 3], group_type=group_type))
-            refreshed[0].add_(index)
-            for target, source in zip(tensors, refreshed, strict=True):
-                target.copy_(source)
-            native.fill_(1)
-            graph.replay()
-            expected_valid = int(counts[1] == 0)
-            assert combined.cpu().tolist() == [expected_valid]
-            assert_route(runtime, refreshed, group_type, result)
-        # A native validator rejection must survive otherwise valid routes,
-        # and the same captured status must recover on its next replay.
-        for value in (0, 2, 1):
-            native.fill_(value)
-            graph.replay()
-            assert combined.cpu().tolist() == [int(value == 1)]
-    torch.npu.current_stream(runtime.device).wait_stream(stream)
+    hidden = torch.zeros(8, 64, dtype=torch.bfloat16, device=runtime.device)
+    groups = torch.tensor([2, 0, 3], dtype=torch.int64, device=runtime.device)
+    experts = torch.tensor([0, 2], dtype=torch.int64, device=runtime.device)
+    slots = torch.tensor([0, -1, 1], dtype=torch.int64, device=runtime.device)
+    for ids, mapping, values, expected in (
+        ([2, 0], [1, -1, 0], [2, 0, 3], 0),
+        ([0, 2], [0, -1, 1], [2, 1, 2], 0),
+        ([0, 0], [0, -1, -1], [2, 0, 0], 0),
+        ([0, 2], [0, -1, 1], [2, 0, 3], 1),
+    ):
+        experts.copy_(torch.tensor(ids))
+        slots.copy_(torch.tensor(mapping))
+        groups.copy_(torch.tensor(values))
+        counts, flags, metadata = runtime.identity_metadata(hidden, groups, 1, experts, slots, allow_padding=True)
+        assert flags.cpu().tolist() == [expected]
+        if expected:
+            assert counts.cpu().tolist() == [2, 3] and metadata.cpu().tolist() == [5, 1]
+        else:
+            assert not counts.cpu().count_nonzero() and metadata.cpu().tolist() == [0, 0]
+    # A general subset is still valid, but its row permutation is not identity.
+    experts.copy_(torch.tensor([2, 0]))
+    slots.copy_(torch.tensor([1, -1, 0]))
+    groups.copy_(torch.tensor([2, 3, 1]))
+    generic = runtime.metadata(hidden, groups, 1, experts, slots, allow_padding=True, subset=True)
+    assert generic[3].cpu().tolist() == [1]
+    assert generic[1][:3].cpu().tolist() == [5, 0, 1]
+
+
+@pytest.fixture(scope="module")
+def native_route_runtime(request, route_runtime):
+    from tests.e2e.nightly.test_vq2a8_gs32_full_ffn import selected_paths
+
+    paths = selected_paths(request)
+    route_runtime.torch.ops.load_library(paths["gs32_library"])
+    from vllm_ascend.ops.fused_moe import vq2a8_gs32_counts  # noqa: F401
+
+    return route_runtime
+
+
+@pytest.mark.parametrize("allow_padding", [False, True])
+def test_native_counts_owned_copy_exact_status_and_graph_replay(native_route_runtime, allow_padding):
+    runtime, torch = native_route_runtime, native_route_runtime.torch
+    ops = torch.ops.vq2a8_gs32_stage
+    hidden = torch.zeros(8, 64, dtype=torch.uint8, device=runtime.device)
+    counts = torch.tensor([3, 0, 5], dtype=torch.int64, device=runtime.device)
+    safe, flags = ops._sanitize_device_counts(counts, 8, allow_padding)
+    counts.zero_()
+    assert safe.cpu().tolist() == [3, 0, 5], "The sanitizer must own counts independently of caller mutations."
+    assert flags.cpu().tolist() == [1]
+    counts.copy_(torch.tensor([3, 0, 5]))
+    handle = ops.prepare_device_routes(hidden, counts, allow_padding)
+    external_status = ops.device_routes_status(handle)
+    external_status.zero_()
+    assert ops.device_routes_status(handle).cpu().tolist() == [1], (
+        "Status reads must not expose mutable internal storage."
+    )
+    for _ in range(2):
+        ops.prepare_device_routes(hidden, counts, allow_padding)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        graph_safe, graph_flag = ops._sanitize_device_counts(counts, 8, allow_padding)
+        graph_handle = ops.prepare_device_routes(hidden, counts, allow_padding)
+        graph_status = ops.device_routes_status(graph_handle)
+    for values in ([3, 0, 5], [-1, 4, 5], [9, 0, 0], [4, 0, 5], [0, 0, 0], [1, 0, 2], [0, 0, 8]):
+        counts.copy_(torch.tensor(values, dtype=torch.int64))
+        graph.replay()
+        torch.npu.synchronize()
+        valid = all(0 <= value <= 8 for value in values) and (sum(values) <= 8 if allow_padding else sum(values) == 8)
+        assert graph_safe.cpu().tolist() == (values if valid else [0] * len(values))
+        assert graph_flag.cpu().tolist() == graph_status.cpu().tolist() == [int(valid)]
+    for values, valid in (([2**63 - 1, 0], True), ([2**63 - 1, 1], False), ([2**63 - 1] * 256, False)):
+        extreme = torch.tensor(values, dtype=torch.int64, device=runtime.device)
+        safe, flags = ops._sanitize_device_counts(extreme, 2**63 - 1, True)
+        assert flags.cpu().tolist() == [int(valid)]
+        assert safe.cpu().tolist() == (values if valid else [0] * len(values))
+
+    bad_dtype = counts.to(torch.int32)
+    with pytest.raises((ValueError, RuntimeError)):
+        ops._sanitize_device_counts(bad_dtype, 8, allow_padding)
+    with pytest.raises((ValueError, RuntimeError)):
+        ops.prepare_device_routes(hidden, bad_dtype, allow_padding)
 
 
 @pytest.mark.parametrize(

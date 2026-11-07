@@ -274,14 +274,10 @@ def runtime_context(args):
     if not isinstance(record, dict) or record.get("schema_version") != 1 or record.get("status") != "preflight_passed":
         raise ValueError("runtime-record must be a schema 1 preflight_passed server startup record")
     backend, fusion, execution = (record.get(key) for key in ("gs32_backend", "gs32_fusion", "gs32_execution"))
-    if backend not in ("native", "reference_mxfp8") or fusion not in ("none", "swiglu_quant", "full_ffn"):
-        raise ValueError("runtime-record has an invalid GS32 backend/fusion")
-    if execution not in ("serial", "batched", "fused", "full_graph"):
-        raise ValueError("runtime-record has an invalid GS32 execution mode")
-    if backend == "reference_mxfp8" and (fusion != "none" or execution not in ("fused", "full_graph")):
-        raise ValueError("reference_mxfp8 runtime-record requires fusion=none and fused/full_graph execution")
-    if fusion == "full_ffn" and execution not in ("fused", "full_graph"):
-        raise ValueError("full_ffn runtime-record requires fused/full_graph execution")
+    if backend != "native" or fusion != "full_ffn":
+        raise ValueError("runtime-record requires native/full_ffn")
+    if execution not in ("fused", "full_graph"):
+        raise ValueError("runtime-record requires fused/full_graph execution")
     if not isinstance(record.get("model_path"), str) or not record["model_path"].strip():
         raise ValueError("runtime-record must include model_path")
     with urlopen(args.base_url + "/v1/models", timeout=30) as response:

@@ -167,7 +167,10 @@ def test_ep_remote_experts_are_skipped_without_native_placeholder(modules):
 def test_all_mxfp4_projection_uses_its_actual_resident_anchor(modules):
     scheme, layer = make_scheme(modules, 8, 7, ids=(14, 15))
     assert not hasattr(layer, "w13_packed_zn")
-    assert scheme.projection_anchor(layer, "w13") is layer.w13_mxfp4_weight
+    load_declared_experts(scheme, layer)
+    modules.stub("vllm_ascend.ops.fused_moe.vq2a8_gs32", GS32ExpertWeights=Mock())
+    scheme.process_weights_after_loading(layer)
+    assert scheme.projection_anchor(layer, "w13") is layer.vq2a8_full_ffn_bank["fields"]["gate_weight"]
 
 
 @pytest.mark.parametrize(
@@ -183,7 +186,7 @@ def test_ep_rejects_inconsistent_placement(modules, field, value):
 
 @pytest.mark.parametrize("ids", [(), (0, 0), (-1,), (GLOBAL_EXPERTS,), (True,), (1.0,)])
 def test_ep_rejects_invalid_global_inventory(modules, ids):
-    with pytest.raises(ValueError, match="inventory"):
+    with pytest.raises(ValueError, match="inventory|unique and sorted"):
         make_scheme(modules, 4, 0, ids)
 
 

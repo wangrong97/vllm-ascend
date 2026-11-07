@@ -166,7 +166,7 @@ def test_gs32_ep_long_context_decode_graph_and_recovery(request, tmp_path, ep_si
         pytest.skip("Pass a unified GS32 model and native artifacts to opt in to the EP long-context graph test.")
     assert all(values.values())
     paths = {name: Path(value).resolve(strict=True) for name, value in values.items()}
-    config = json.loads((paths["model"] / "config.json").read_text())
+    config = json.loads((paths["model"] / "config.json").read_text(encoding="utf-8"))
     assert config["model_type"] == "deepseek_v4"
     assert config["quantization_config"]["format"] == "vq2_mixed_gs32_source"
     assert (paths["model"] / "model.safetensors.index.json").is_file()
@@ -185,8 +185,10 @@ def test_gs32_ep_long_context_decode_graph_and_recovery(request, tmp_path, ep_si
             check=False,
             timeout=CHILD_TIMEOUT_SECONDS,
         )
-    assert child.returncode == 0, f"EP{ep_size} long-context graph failed; see {log}\n{log.read_text()[-16000:]}"
-    report = json.loads(output.read_text())
+    assert child.returncode == 0, (
+        f"EP{ep_size} long-context graph failed; see {log}\n{log.read_text(encoding='utf-8')[-16000:]}"
+    )
+    report = json.loads(output.read_text(encoding="utf-8"))
     assert report["status"] == "PASS"
     assert [(entry["input_tokens"], entry["output_tokens"]) for entry in report["requests"]] == list(REQUEST_SHAPES)
     print(

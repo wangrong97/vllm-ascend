@@ -81,7 +81,7 @@ def test_source_v3_inventory_has_independent_projection_types(modules, source_ch
     quant.bind_checkpoint(source_checkpoint.config)
     layer = quant.layer_spec(0)
     assert [layer.quant_types["gate_up"][e] for e in range(4)] == ["vq2", "vq2", "mxfp4", "mxfp4"]
-    assert [layer.quant_types["down"][e] for e in range(4)] == ["vq2", "mxfp4", "vq2", "mxfp4"]
+    assert [layer.quant_types["down"][e] for e in range(4)] == ["vq2", "mxfp4", "mxfp4", "mxfp4"]
     assert quant.root_linear_kind("model.layers.0.self_attn.wq_a") == "ds_fp8_block128"
     assert quant.root_linear_kind("lm_head") == "unquantized"
     assert quant.normalize_root_name("model.layers.0.attn_hc.scale") == "model.layers.0.hc_attn_scale"
@@ -130,6 +130,7 @@ def test_folded_source_v3_binds_natural_vq_weights_and_rejects_contradictions(mo
 def test_folded_runtime_rejects_speculation_before_entering_original_dspark(modules, tmp_path):
     config = serving_config()
     config.additional_config["vq2a8"] = {
+        "gs32_execution": "fused",
         "gs32_library": str(tmp_path / "stage.so"),
         "gs32_binary": str(tmp_path / "kernel.o"),
     }
@@ -323,7 +324,7 @@ def test_source_v3_audits_index_and_file_extents(modules, source_checkpoint, fau
     if fault == "duplicate_json":
         index_path.write_text('{"weight_map":{},"weight_map":{}}')
     elif fault == "wrong_index":
-        index = json.loads(index_path.read_text())
+        index = json.loads(index_path.read_text(encoding="utf-8"))
         del index["weight_map"][next(iter(index["weight_map"]))]
         index_path.write_text(json.dumps(index))
     elif fault == "traversal":

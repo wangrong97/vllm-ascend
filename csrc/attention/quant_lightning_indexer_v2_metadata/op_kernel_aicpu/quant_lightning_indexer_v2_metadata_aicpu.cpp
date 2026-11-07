@@ -915,7 +915,20 @@ bool QuantLightningIndexerV2MetadataCpuKernel::BalanceSchedule(SplitResult &spli
 bool QuantLightningIndexerV2MetadataCpuKernel::GenMetadata(SplitResult &splitRes)
 {
     optiling::detail::QliV2Metadata *metadataPtr = static_cast<optiling::detail::QliV2Metadata *>(metadata_->GetData());
-    *metadataPtr = {};
+    constexpr uint64_t outputBytes = QLI_V2_METADATA_TOTAL_SIZE * sizeof(QLI_V2_METADATA_T);
+    static_assert(sizeof(QLI_V2_METADATA_T) == sizeof(uint32_t));
+    auto shape = metadata_->GetTensorShape();
+    if (shape == nullptr || shape->GetDims() != 1 || shape->GetDimSize(0) != QLI_V2_METADATA_TOTAL_SIZE ||
+        metadata_->GetDataType() != DT_INT32 || metadata_->GetDataSize() < outputBytes) {
+        KERNEL_LOG_ERROR("QLI metadata output must be 1024 INT32 words with sufficient storage");
+        return false;
+    }
+    // Clear idle-core slots and the reserved tail: the Torch binding allocates
+    // uninitialized storage, while QliV2Metadata covers only 864 of 1024 words.
+    auto outputWords = static_cast<QLI_V2_METADATA_T *>(metadata_->GetData());
+    for (uint32_t i = 0; i < QLI_V2_METADATA_TOTAL_SIZE; ++i) {
+        outputWords[i] = 0;
+    }
     // LI Metadata Generate
     for (size_t i = 0; i < aicCoreNum_; ++i) {
         if (i >= splitRes.usedCoreNum) {

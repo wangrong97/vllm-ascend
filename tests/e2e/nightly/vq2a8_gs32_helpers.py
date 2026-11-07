@@ -104,8 +104,6 @@ def native_paths(options):
 
 def checkpoint_inventory(model):
     from vllm_ascend.quantization.methods.w2a8.vq2a8_gs32_format import (
-        GS32_FORMAT,
-        GS32_VERSION,
         MXFP4_SOURCE_FIELDS,
         VQ2_SOURCE_FIELDS,
         parse_vq2a8_expert_name,
@@ -114,12 +112,9 @@ def checkpoint_inventory(model):
 
     root = Path(model).resolve(strict=True)
     config = read_gs32_json(root / "config.json")
-    if config.get("quantization_config") != {
-        "quant_method": "vq2a8",
-        "format": GS32_FORMAT,
-        "format_version": GS32_VERSION,
-    }:
-        raise ValueError("This probe requires a source-v3 GS32 checkpoint.")
+    from tools.vq2a8_source_contract import source_contract
+
+    source_contract()["validate_source_config"](config.get("quantization_config"))
     index = read_gs32_json(root / "model.safetensors.index.json")["weight_map"]
     fields = defaultdict(set)
     for name in index:

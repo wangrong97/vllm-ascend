@@ -131,7 +131,12 @@ def states(dp_size, execution="full_graph"):
     logical_experts = 8
     topk = 2
     local_experts = logical_experts // dp_size
-    config = {"n_routed_experts": logical_experts, "num_experts_per_tok": topk}
+    config = {
+        "n_routed_experts": logical_experts,
+        "num_experts_per_tok": topk,
+        "hidden_size": 128,
+        "moe_intermediate_size": 64,
+    }
     entries = {
         0: {
             kind: dict.fromkeys(range(logical_experts), quant)
@@ -148,20 +153,18 @@ def states(dp_size, execution="full_graph"):
             "moe_ep_size": dp_size,
             "moe_local_experts": local_experts,
             "graph_row_capacity": acceptance.LOCAL_MAX_SEQS * dp_size * topk,
-            "banks": {
-                "gate_up": {
-                    "vq2": {
-                        "expert_ids": ids,
-                        "field_names": ["packed_zn", "pair_lut", "row_scale_bits"],
-                        "field_counts": [local_experts] * 3,
-                    }
-                },
-                "down": {
-                    "mxfp4": {
-                        "expert_ids": ids,
-                        "field_names": ["weight", "scale"],
-                        "field_counts": [local_experts] * 2,
-                    }
+            "fusion": "full_ffn",
+            "full_ffn": {
+                "expert_ids": ids,
+                "gate_w4": [False] * local_experts,
+                "down_w4": [True] * local_experts,
+                "field_shapes": {
+                    "gate_weight": [1024],
+                    "gate_table": [256],
+                    "gate_row_scale": [local_experts, 128],
+                    "down_weight": [1024],
+                    "down_table": [256],
+                    "down_row_scale": [local_experts, 128],
                 },
             },
         }
@@ -176,7 +179,7 @@ def states(dp_size, execution="full_graph"):
                 "tp_size": 1,
                 "layers": [layer],
                 "model_runner_version": 2,
-                "validity_owners": int(graph),
+                "validity_owners": 1,
                 "forwards": {"real": 0, "dummy": 0, "max_real_requests": 0},
                 "prefill": {"captures": 0, "replays": 0},
                 "decode": {"captures": len(acceptance.CAPTURE_SIZES) if graph else 0, "replays": 0},
@@ -289,19 +292,17 @@ def test_dp_inventory_checks_real_ep_config_and_aggregate_row_capacity(dp_size, 
 
 
 @pytest.mark.parametrize("fault", [None, "perm", "unknown_field", "missing_field", "expert_dimension"])
-def test_ep_dp_inventory_accepts_only_named_complete_natural_vq2_banks(fault):
+def test_ep_dp_inventory_accepts_only_complete_full_ffn_banks(fault):
     values, config, entries = states(4)
-    bank = values[0]["layers"][0]["banks"]["gate_up"]["vq2"]
+    shapes = values[0]["layers"][0]["full_ffn"]["field_shapes"]
     if fault == "perm":
-        bank["field_names"].append("perm")
-        bank["field_counts"].append(len(bank["expert_ids"]))
+        shapes["perm"] = [128]
     elif fault == "unknown_field":
-        bank["field_names"][0] = "wrong_three_field_bank"
+        shapes["wrong_weight"] = shapes.pop("gate_weight")
     elif fault == "missing_field":
-        bank["field_names"].pop()
-        bank["field_counts"].pop()
+        del shapes["gate_weight"]
     elif fault == "expert_dimension":
-        bank["field_counts"][0] += 1
+        shapes["gate_row_scale"][0] += 1
     if fault is None:
         acceptance.check_state_inventory(values, config, 4, entries, "full_graph")
     else:

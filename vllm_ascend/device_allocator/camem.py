@@ -18,6 +18,7 @@
 #
 import dataclasses
 import gc
+import importlib
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -53,23 +54,15 @@ def find_loaded_library(lib_name) -> str | None:
     return path
 
 
-camem_available = False
-try:
-    from vllm_ascend.vllm_ascend_C import (  # type: ignore # noqa: F401
-        init_module,
-        python_create_and_map,
-        python_unmap_and_release,
-    )
+def _get_camem_extension():
+    # Workers import this module even without sleep mode. A module-level
+    # extension import would register unrelated operators before the model's
+    # native provider is selected. Let Python cache the lazy import.
+    try:
+        return importlib.import_module("vllm_ascend.vllm_ascend_C")
+    except ImportError as error:
+        raise RuntimeError("The CaMem sleep allocator requires the vllm_ascend_C extension.") from error
 
-    lib_name = find_loaded_library("vllm_ascend_C")
-    camem_available = True
-except ImportError as e:
-    logger.warning("Failed to import vllm_ascend_C:%s. Sleep mode will be disabled. ", e)
-    init_module = None
-    python_create_and_map = None
-    python_unmap_and_release = None
-    lib_name = None
-    libcudart = None
 
 # py_device, py_alignedSize, py_d_mem, py_p_memHandle
 HandleType = tuple[int, int, int, int]
@@ -83,18 +76,22 @@ class AllocationData:
 
 
 def create_and_map(allocation_handle: HandleType) -> None:
-    python_create_and_map(*allocation_handle)
+    _get_camem_extension().python_create_and_map(*allocation_handle)
 
 
 def unmap_and_release(allocation_handle: HandleType) -> None:
-    python_unmap_and_release(*allocation_handle)
+    _get_camem_extension().python_unmap_and_release(*allocation_handle)
 
 
 def get_pluggable_allocator(
     python_malloc_fn: Callable[[tuple[int, int, int, int]], None],
     python_free_func: Callable[[int], tuple[int, int, int, int]],
 ) -> torch.npu.memory.NPUPluggableAllocator:
-    init_module(python_malloc_fn, python_free_func)
+    extension = _get_camem_extension()
+    lib_name = find_loaded_library("vllm_ascend_C")
+    if lib_name is None:
+        raise RuntimeError("The loaded vllm_ascend_C library could not be located for the CaMem sleep allocator.")
+    extension.init_module(python_malloc_fn, python_free_func)
     new_alloc = torch.npu.memory.NPUPluggableAllocator(lib_name, "my_malloc", "my_free")
     return new_alloc
 

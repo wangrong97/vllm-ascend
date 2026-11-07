@@ -200,7 +200,7 @@ def test_dspark_preflight_rejects_index_without_mtp(dspark, dspark_config):
 )
 def test_dspark_preflight_rejects_incompatible_official_config(dspark, dspark_config, field, value, error):
     path = Path(dspark_config.speculative_config.model) / "config.json"
-    hf = json.loads(path.read_text())
+    hf = json.loads(path.read_text(encoding="utf-8"))
     hf[field] = value
     path.write_text(json.dumps(hf))
     with pytest.raises(ValueError, match=error):

@@ -56,9 +56,11 @@ def cross_inputs(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     directory = tmp_path / "output"
+    binary = write_target_elf(tmp_path / "mixed.o", "aarch64")
+    binary.write_bytes(binary.read_bytes() + build.KERNEL_ENTRY.encode("ascii") + b"\x00")
     arguments = [
         "--kernel-binary",
-        str(write_target_elf(tmp_path / "mixed.o", "aarch64")),
+        str(binary),
         "--build-dir",
         str(directory),
         "--cann",

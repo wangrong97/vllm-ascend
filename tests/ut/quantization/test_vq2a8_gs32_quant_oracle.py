@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_ascend.quantization.methods.w2a8.vq2a8_gs32_staged import quantize_mxfp8_k32
+from tests.support.vq2a8_oracle import quantize_mxfp8_k32
 
 
 @pytest.fixture(scope="module")

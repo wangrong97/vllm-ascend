@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU/source contracts for the GS32 projection and complete FFN adapter."""
+"""CPU/source contracts for the GS32 complete FFN adapter."""
 
 import json
 import shutil
@@ -44,26 +44,41 @@ def write_elf(path, architecture="aarch64"):
     return path
 
 
-def test_binding_preserves_the_existing_downw2_stage_contract():
+def test_binding_exposes_only_complete_ffn_and_device_routes():
     source = source_text()
     assert '#include "../mixed_w2w4_moe_ffn/tiling_builders.h"' in source
     assert '#include "../mixed_w2w4_moe_ffn/mixed_tiling.h"' in source
-    assert "constexpr uint64_t kGroupCount = 1;" in source
     assert "constexpr uint32_t kKernelCoreCount = 32;" in source
-    assert "static_assert(kMixedStageDownW2 == 4" in source
-    assert "static_cast<uint64_t>(2 * k)" in function(source, "Project")
-    assert "static_cast<uint64_t>(n)" in function(source, "Project")
-    assert "rtKernelLaunch(registered->stub, kKernelCoreCount" in function(source, "Project")
+    assert "static_assert(kMixedTilingVersion == 3 && kMixedTilingBytes == 1632" in source
+    registrations = source[source.index("TORCH_LIBRARY(vq2a8_gs32_stage,") :]
+    expected = {
+        "initialize",
+        "_sanitize_device_counts",
+        "prepare_device_routes",
+        "device_routes_status",
+        "full_ffn_abi_version",
+        "prepare_full_ffn",
+        "full_ffn_device",
+    }
+    assert set(re.findall(r'm\.def\("(\w+)\(', registrations)) == expected
+    assert dict(build.REQUIRED_FULL_FFN_SCHEMAS).keys() == expected
+    assert re.findall(r'm\.class_<.*?>\("(\w+)"\)', registrations) == ["DeviceRoutes", "FullFFNPlan"]
+    assert set(re.findall(r'm\.impl\("(\w+)"', registrations)) == {
+        "prepare_full_ffn",
+        "full_ffn_device",
+        "prepare_device_routes",
+    }
+    for removed in ("ProjectionPlan", "GroupedRoutes", "GroupedProjectionPlan", "ProjectGrouped", "ProjectPrepared"):
+        assert removed not in source
 
 
-def test_make_tiling_preserves_component_offsets_with_versioned_post_options():
-    source = source_text()
-    body = function(source, "MakeTiling")
-    assert "BuildDownW2TilingBlob" in body
+def test_full_ffn_tiling_preserves_all_component_offsets_and_post_options():
+    body = function(source_text(), "MakeFullFFNTiling")
     assert "kMixedTilingBytes" in body
-    assert "kMixedStageDownW2" in body
-    assert "kMixedDownW2TilingOffset" in body
-    assert "std::memcpy(bytes + kMixedDownW2TilingOffset" in body
+    for stage in ("GateW2", "GateW4", "DownW2", "DownW4"):
+        assert f"copy(kMixed{stage}TilingOffset, kMixed{stage}TilingBytes, Build{stage}TilingBlob(" in body
+    assert "const MixedPostOptions post{static_cast<float>(limit), {}}" in body
+    assert "std::memcpy(bytes + kMixedPostOptionsOffset, &post, sizeof(post))" in body
     mixed = (MIXED / "mixed_tiling.h").read_text(encoding="utf-8")
     assert "constexpr uint64_t kMixedPostOptionsOffset = 1600;" in mixed
     assert "constexpr uint64_t kMixedPostOptionsBytes = 32;" in mixed
@@ -80,55 +95,47 @@ def test_resident_expert_views_are_aligned_and_storage_bounded():
     assert "tensor.storage().data_ptr()" in function(source_text(), "RecordStream")
 
 
-def test_project_is_fail_closed_on_geometry_dtype_layout_alias_and_metadata():
-    body = function(source_text(), "Project")
-    for dtype in ("at::kByte", "at::kLong", "at::kInt", "at::kBFloat16"):
+def test_full_ffn_is_fail_closed_on_geometry_dtype_layout_alias_and_metadata():
+    source = source_text()
+    body = function(source, "FullFFNDevice")
+    for dtype in ("at::kByte", "at::kLong", "at::kBFloat16"):
         assert dtype in body
     for shape in (
-        "input_scale must have shape [M,K/32]",
-        "packed_weight must have shape [1,N/32,K/16,16,8]",
-        "pair_lut must have shape [1,N/32,K/32,32]",
-        "row_scale must have shape [1,N]",
-        "group_list must have shape [1] and contain M",
-        "route_mask must have shape [1] and contain the all-W2 value zero",
-        "output must have shape [M,N]",
+        "input_scale must be [R,K/32]",
+        "Gate row scales must be [G,N]",
+        "Down row scales must be [G,D]",
+        "hidden workspace must be [R,N/2]",
+        "hidden scale must be [R,N/64]",
+        "output must be [R,D]",
     ):
         assert shape in body
-    assert "1<=M<=128" in body
-    assert "group_list.data_ptr<int64_t>()[0] == m" in body
-    assert "route_mask.data_ptr<int32_t>()[0] == 0" in body
-    assert "std::memcmp(tiling.data_ptr(), expected_tiling.data_ptr(), kMixedTilingBytes)" in body
-    assert "CheckNoAlias(npu_owners)" in body
-    assert "CheckNoAlias(cpu_metadata)" in body
-    checks = function(source_text(), "CheckNpuTensor") + function(source_text(), "CheckCpuMetadata")
+    assert "full FFN mixed weight/table blob sizes do not match resident precision masks" in body
+    assert "CheckNoAlias(" in body
+    checks = function(source, "CheckNpuTensor") + function(source, "CheckCpuMetadata")
     assert "is_contiguous()" in checks
     assert "storage_offset() == 0" in checks
     assert "% kRequiredAlignment == 0" in checks
+    prepare = function(source, "PrepareFullFFN")
+    assert "k % 64 == 0" in prepare and "n % 128 == 0" in prepare and "d % 32 == 0" in prepare
+    assert "std::isfinite(swiglu_limit)" in prepare and "swiglu_limit >= 0" in prepare
+    assert "CheckCpuMetadata(gate_w4, at::kBool" in prepare
+    assert "CheckCpuMetadata(down_w4, at::kBool" in prepare
 
 
-def test_cpu_metadata_is_validated_then_copied_and_owned_for_the_queued_launch():
-    body = function(source_text(), "Project")
-    assert "group_list.to(input_bytes.device(), at::kLong, false, true)" in body
-    assert "route_mask.to(input_bytes.device(), at::kInt, false, true)" in body
-    assert "tiling.to(input_bytes.device(), at::kByte, false, true)" in body
-    assert "device_group_list.data_ptr()" in body
-    assert "device_route_mask.data_ptr()" in body
-    assert "device_tiling.data_ptr()" in body
-    assert "device_group_list, device_route_mask, device_tiling" in body
-    assert "RecordStream(" in body
-
-
-def test_raw_stream_is_resolved_before_queue_callback_and_graph_is_rejected():
-    body = function(source_text(), "Project")
+def test_resident_metadata_is_prepared_before_capture_and_owned_for_the_launch():
+    source = source_text()
+    prepare = function(source, "PrepareFullFFN")
+    assert prepare.index("CheckNotCapturing(") < prepare.index("gate_mask.to(")
+    assert "gate_mask.to(anchor.device(), at::kInt, false, true)" in prepare
+    assert "down_mask.to(anchor.device(), at::kInt, false, true)" in prepare
+    assert "tiling.to(anchor.device(), at::kByte, false, true)" in prepare
+    body = function(source, "FullFFNDevice")
+    assert "plan->GateMask(), plan->DownMask(), plan->Tiling()" in body
+    assert "routes->GroupList(), routes->Status()" in body
     before_queue, callback = body.split("at_npu::native::OpCommand::RunOpApi(", 1)
-    assert "CheckNotCapturing(" in before_queue
-    assert before_queue.index("OptionalNPUGuard") < before_queue.index("CheckNotCapturing(")
-    assert before_queue.index("CheckNotCapturing(") < before_queue.index("CheckNpuTensor(")
-    assert before_queue.index("CheckNotCapturing(") < before_queue.index("group_list.to(")
-    assert "const auto launch_stream = stream.stream();" in before_queue
-    assert "getCurrentNPUStream" not in callback
-    assert ".stream()" not in callback
-    assert "[registered, launch_stream" in callback
+    assert "const auto launch_stream = stream.stream(false);" in before_queue
+    assert "getCurrentNPUStream" not in callback and ".stream(" not in callback
+    assert "[routes, plan, launch_stream" in callback
     assert "false);" in callback
     for forbidden in ("synchronize", ".item(", "rtDeviceReset", "aclrtResetDevice"):
         assert forbidden not in body
@@ -171,11 +178,11 @@ def test_registration_is_startup_only_idempotent_and_retains_elf_bytes():
     assert "#if __has_include(<runtime/rt.h>)" in source
 
 
-def test_torch_schema_is_exact_and_output_is_mutable():
+def test_torch_schema_marks_all_full_ffn_workspaces_mutable():
     source = source_text()
     assert 'm.def("initialize(str binary) -> ()"' in source
-    assert 'm.def("make_tiling(int k, int n) -> Tensor"' in source
-    assert "Tensor(a!) output) -> ()" in source
+    assert "Tensor(a!) hidden" in source
+    assert "Tensor(b!) hidden_scale, Tensor(c!) output) -> ()" in source
     assert "TORCH_LIBRARY_IMPL(vq2a8_gs32_stage, PrivateUse1" in source
 
 
@@ -216,12 +223,12 @@ def test_full_ffn_preflight_rejects_stale_bridge_and_workspace_schema(fault):
         classes["FullFFNPlan"] = object()
     fake_torch = SimpleNamespace(
         classes=SimpleNamespace(vq2a8_gs32_stage=SimpleNamespace(**classes)),
-        _C=SimpleNamespace(_dispatch_find_schema_or_throw=find_schema),
+        _C=SimpleNamespace(
+            _dispatch_find_schema_or_throw=find_schema,
+            _dispatch_has_kernel_for_dispatch_key=lambda *args: True,
+        ),
         ops=SimpleNamespace(
             vq2a8_gs32_stage=SimpleNamespace(
-                supports_dynamic_grouped_rows=lambda: True,
-                supports_dynamic_device_rows=lambda: True,
-                supports_sparse_prefill_output=lambda: True,
                 full_ffn_abi_version=lambda: 2 if fault == "old_version" else build.FULL_FFN_ABI_VERSION,
             )
         ),
@@ -257,20 +264,21 @@ def test_full_ffn_artifacts_must_match_completed_build(tmp_path, fault):
     (tmp_path / "build-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     if fault:
         with pytest.raises(ValueError, match="ABI|manifest"):
-            build.verify_runtime_artifacts(library, binary, require_full_ffn=True)
+            build.verify_runtime_artifacts(library, binary)
     else:
-        result = build.verify_runtime_artifacts(library, binary, require_full_ffn=True)
+        result = build.verify_runtime_artifacts(library, binary)
         assert result["library_sha256"] == manifest["library_sha256"]
         assert result["kernel"]["sha256"] == manifest["deployed_kernel_sha256"]
         assert result["abi_version"] == build.FULL_FFN_ABI_VERSION
 
 
-def test_full_ffn_requires_manifest_without_affecting_explicit_legacy_preflight(tmp_path):
+def test_full_ffn_artifact_verification_requires_manifest_by_default(tmp_path):
     library = write_elf(tmp_path / build.LIBRARY_NAME)
     binary = write_elf(tmp_path / build.KERNEL_NAME)
     with pytest.raises(ValueError, match="build-manifest"):
-        build.verify_runtime_artifacts(library, binary, require_full_ffn=True)
-    assert build.verify_runtime_artifacts(library, binary)["kernel"]["present"]
+        build.verify_runtime_artifacts(library, binary)
+    with pytest.raises(ValueError, match="Only full FFN"):
+        build.verify_runtime_artifacts(library, binary, require_full_ffn=False)
 
 
 def test_build_tool_validates_existing_mixed_elf_and_is_host_only(tmp_path):
@@ -390,60 +398,18 @@ def test_build_rejects_missing_or_non_elf_kernel(tmp_path, payload):
 
 
 @pytest.mark.parametrize(
-    "fault",
-    [
-        None,
-        "missing_op",
-        "missing_prepare_grouped",
-        "wrong_class",
-        "wrong_output_alias",
-        "missing_class",
-        "old_padding_schema",
-        "missing_dynamic_grouped_rows",
-        "wrong_dynamic_grouped_rows_schema",
-        "unsupported_dynamic_grouped_rows",
-        "missing_dynamic_device_rows",
-        "wrong_dynamic_device_rows_schema",
-        "unsupported_dynamic_device_rows",
-        "missing_sparse_prefill_output",
-        "unsupported_sparse_prefill_output",
-        "old_output_fill_schema",
-        "unsafe_output_fill_default",
-    ],
+    "fault", [None, "missing_routes", "missing_class", "wrong_class", "old_padding_schema", "immutable_output"]
 )
 def test_build_schema_check_requires_typed_device_routes_and_mutable_output(fault):
-    schemas = dict(build.REQUIRED_DEVICE_SCHEMAS)
-    if fault == "missing_op":
+    schemas = dict(build.REQUIRED_FULL_FFN_SCHEMAS)
+    if fault == "missing_routes":
         del schemas["prepare_device_routes"]
-    elif fault == "missing_prepare_grouped":
-        del schemas["prepare_grouped"]
     elif fault == "wrong_class":
-        schemas["project_grouped_device"] = schemas["project_grouped_device"].replace(
-            ".DeviceRoutes ", ".GroupedRoutes "
-        )
-    elif fault == "wrong_output_alias":
-        schemas["project_grouped_device"] = schemas["project_grouped_device"].replace("Tensor(a!)", "Tensor")
+        schemas["full_ffn_device"] = schemas["full_ffn_device"].replace(".DeviceRoutes ", ".GroupedRoutes ")
     elif fault == "old_padding_schema":
         schemas["prepare_device_routes"] = schemas["prepare_device_routes"].replace(", bool allow_padding=False", "")
-    elif fault == "missing_dynamic_grouped_rows":
-        del schemas["supports_dynamic_grouped_rows"]
-        schemas["grouped_max_routed_rows"] = "vq2a8_gs32_stage::grouped_max_routed_rows() -> int"
-    elif fault == "wrong_dynamic_grouped_rows_schema":
-        schemas["supports_dynamic_grouped_rows"] = schemas["supports_dynamic_grouped_rows"].replace(
-            "-> bool", "-> Tensor"
-        )
-    elif fault == "missing_dynamic_device_rows":
-        del schemas["supports_dynamic_device_rows"]
-    elif fault == "wrong_dynamic_device_rows_schema":
-        schemas["supports_dynamic_device_rows"] = schemas["supports_dynamic_device_rows"].replace("-> bool", "-> int")
-    elif fault == "missing_sparse_prefill_output":
-        del schemas["supports_sparse_prefill_output"]
-    elif fault == "old_output_fill_schema":
-        schemas["project_grouped_device"] = schemas["project_grouped_device"].replace(", bool zero_output=True", "")
-    elif fault == "unsafe_output_fill_default":
-        schemas["project_grouped_device"] = schemas["project_grouped_device"].replace(
-            "bool zero_output=True", "bool zero_output=False"
-        )
+    elif fault == "immutable_output":
+        schemas["full_ffn_device"] = schemas["full_ffn_device"].replace("Tensor(c!)", "Tensor")
 
     def find_schema(name, overload):
         assert overload == ""
@@ -452,20 +418,19 @@ def test_build_schema_check_requires_typed_device_routes_and_mutable_output(faul
             raise RuntimeError("missing op")
         return SimpleNamespace(schema=lambda: schemas[key])
 
-    classes = {} if fault == "missing_class" else {"DeviceRoutes": object()}
+    classes = {"FullFFNPlan": object()}
+    if fault != "missing_class":
+        classes["DeviceRoutes"] = object()
     fake_torch = SimpleNamespace(
         classes=SimpleNamespace(vq2a8_gs32_stage=SimpleNamespace(**classes)),
-        _C=SimpleNamespace(_dispatch_find_schema_or_throw=find_schema),
-        ops=SimpleNamespace(
-            vq2a8_gs32_stage=SimpleNamespace(
-                supports_dynamic_grouped_rows=lambda: fault != "unsupported_dynamic_grouped_rows",
-                supports_dynamic_device_rows=lambda: fault != "unsupported_dynamic_device_rows",
-                supports_sparse_prefill_output=lambda: fault != "unsupported_sparse_prefill_output",
-            )
+        _C=SimpleNamespace(
+            _dispatch_find_schema_or_throw=find_schema,
+            _dispatch_has_kernel_for_dispatch_key=lambda *args: True,
         ),
+        ops=SimpleNamespace(vq2a8_gs32_stage=SimpleNamespace(full_ffn_abi_version=lambda: build.FULL_FFN_ABI_VERSION)),
     )
     if fault:
-        with pytest.raises(RuntimeError, match="schema|DeviceRoutes|does not support"):
+        with pytest.raises(RuntimeError, match="schema|DeviceRoutes"):
             build.verify_registered_device_schemas(fake_torch)
     else:
         assert build.verify_registered_device_schemas(fake_torch) == schemas
@@ -490,74 +455,100 @@ def test_build_schema_check_is_a_separate_host_only_process(tmp_path, monkeypatc
         build.verify_library_schemas(library, log)
     command, options = calls[0]
     assert command[0] == build.sys.executable and command[1] == "-c"
-    assert "verify_loaded_library" in command[2]
+    assert "torch.ops.load_library(sys.argv[1])" in command[2]
+    assert "verify_registered_device_schemas(torch)" in command[2]
+    assert "register_counts_implementation()" in command[2]
+    assert command[2].index("torch.ops.load_library(") < command[2].index("register_counts_implementation()")
+    assert "verify_loaded_library" not in command[2]
+    for forbidden in ("initialize(", "set_device(", "npu.synchronize(", "NPUStream("):
+        assert forbidden not in command[2]
     assert command[-1] == str(library.resolve())
     assert options["timeout"] == build.SCHEMA_CHECK_TIMEOUT_SECONDS
     assert options["stderr"] is subprocess.STDOUT and options["check"] is False
     assert log.read_text() == "schema child output\n"
 
 
-@pytest.mark.parametrize("execution", ["serial", "batched", "fused", "full_graph"])
-def test_build_load_check_only_imports_and_queries_registration(tmp_path, monkeypatch, execution):
+@pytest.mark.parametrize("execution", ["fused", "full_graph"])
+def test_build_load_check_validates_artifacts_before_loading_and_queries_only_host_registration(
+    tmp_path, monkeypatch, execution
+):
     library = tmp_path / "adapter.so"
     library.write_bytes(b"extension")
+    binary = tmp_path / "mixed.o"
     calls = []
-    fake_torch = SimpleNamespace(ops=SimpleNamespace(load_library=lambda path: calls.append(path)))
+    fake_torch = SimpleNamespace(ops=SimpleNamespace(load_library=lambda path: calls.append(("load", path))))
     monkeypatch.setitem(build.sys.modules, "torch", fake_torch)
     monkeypatch.setitem(build.sys.modules, "torch_npu", SimpleNamespace())
+    monkeypatch.setattr(build, "verify_runtime_artifacts", lambda lib, obj: calls.append(("verify", lib, obj)))
+    monkeypatch.setattr(build, "register_counts_implementation", lambda: calls.append(("register",)))
     monkeypatch.setattr(
-        build, "verify_registered_device_schemas", lambda module, mode: {"checked": module is fake_torch, "mode": mode}
+        build,
+        "verify_registered_device_schemas",
+        lambda module, mode, fusion: {"checked": module is fake_torch, "mode": mode, "fusion": fusion},
     )
-    assert build.verify_loaded_library(str(library), execution) == {"checked": True, "mode": execution}
-    assert calls == [str(library.resolve())]
-
-
-@pytest.mark.parametrize("bridge_version,kernel_version", [(None, 2), (3, 2), (3, 3)])
-def test_legacy_projection_preflight_requires_kernel_matching_loaded_bridge(
-    tmp_path, monkeypatch, bridge_version, kernel_version
-):
-    library = write_elf(tmp_path / build.LIBRARY_NAME)
-    binary = write_elf(tmp_path / build.KERNEL_NAME)
-    if kernel_version == 2:
-        binary.write_bytes(b"\x7fELFold-kernel")
-    namespace = SimpleNamespace()
-    if bridge_version is not None:
-        namespace.full_ffn_abi_version = lambda: bridge_version
-    fake_torch = SimpleNamespace(ops=SimpleNamespace(load_library=lambda _: None, vq2a8_gs32_stage=namespace))
-    monkeypatch.setitem(build.sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(build.sys.modules, "torch_npu", SimpleNamespace())
-    monkeypatch.setattr(build, "verify_registered_device_schemas", lambda *args: {"checked": True})
-    if bridge_version == 3 and kernel_version == 2:
-        with pytest.raises(ValueError, match="ABI"):
-            build.verify_loaded_library(library, "fused", fusion="none", binary=binary)
-    else:
-        assert build.verify_loaded_library(library, "fused", fusion="none", binary=binary) == {"checked": True}
+    assert build.verify_loaded_library(library, execution, binary=binary) == {
+        "checked": True,
+        "mode": execution,
+        "fusion": "full_ffn",
+    }
+    assert calls == [("verify", library, binary), ("load", str(library.resolve())), ("register",)]
 
 
 @pytest.mark.parametrize(
-    "execution,required",
-    [
-        ("serial", build.REQUIRED_SERIAL_SCHEMAS),
-        ("batched", build.REQUIRED_BATCHED_SCHEMAS),
-        ("fused", build.REQUIRED_FUSED_SCHEMAS),
-    ],
+    "execution,fusion",
+    [("serial", "full_ffn"), ("batched", "full_ffn"), ("fused", "none"), ("full_graph", "swiglu_quant")],
 )
-def test_build_schema_check_only_requires_selected_execution_ops(execution, required):
+def test_preflight_rejects_removed_modes_before_loading_torch(execution, fusion):
+    with pytest.raises(ValueError, match="Unsupported GS32"):
+        build.verify_loaded_library("unused.so", execution, fusion, binary="unused.o")
+    with pytest.raises(ValueError, match="Unsupported GS32"):
+        build.verify_registered_device_schemas(None, execution, fusion)
+
+
+def test_default_preflight_requires_abi_v3_kernel_and_manifest_before_loading(tmp_path, monkeypatch):
+    library = write_elf(tmp_path / build.LIBRARY_NAME)
+    binary = tmp_path / build.KERNEL_NAME
+    binary.write_bytes(b"\x7fELFold-kernel")
+
+    def reject_load(_):
+        pytest.fail("an invalid artifact pair must never be loaded")
+
+    monkeypatch.setitem(build.sys.modules, "torch", SimpleNamespace(ops=SimpleNamespace(load_library=reject_load)))
+    monkeypatch.setitem(build.sys.modules, "torch_npu", SimpleNamespace())
+    with pytest.raises(ValueError, match="kernel binary path"):
+        build.verify_loaded_library(library)
+    with pytest.raises(ValueError, match="ABI"):
+        build.verify_loaded_library(library, binary=binary)
+    write_elf(binary)
+    with pytest.raises(ValueError, match="build-manifest"):
+        build.verify_loaded_library(library, binary=binary)
+
+
+@pytest.mark.parametrize("execution", ["fused", "full_graph"])
+@pytest.mark.parametrize("legacy_exports", [False, True])
+def test_schema_check_requires_only_full_ffn_ops_and_ignores_extra_exports(execution, legacy_exports):
+    required = dict(build.REQUIRED_FULL_FFN_SCHEMAS)
     schemas = dict(required)
+    if legacy_exports:
+        schemas["project"] = "legacy schema"
+        schemas["supports_dynamic_device_rows"] = "legacy schema"
     queried = []
 
     def find_schema(name, overload):
         key = name.removeprefix("vq2a8_gs32_stage::")
         queried.append(key)
-        assert key in schemas, "Lower execution modes must not require graph-only operators."
         return SimpleNamespace(schema=lambda: schemas[key])
 
     fake_torch = SimpleNamespace(
-        _C=SimpleNamespace(_dispatch_find_schema_or_throw=find_schema),
-        ops=SimpleNamespace(vq2a8_gs32_stage=SimpleNamespace(supports_dynamic_grouped_rows=lambda: True)),
+        classes=SimpleNamespace(vq2a8_gs32_stage=SimpleNamespace(DeviceRoutes=object(), FullFFNPlan=object())),
+        _C=SimpleNamespace(
+            _dispatch_find_schema_or_throw=find_schema,
+            _dispatch_has_kernel_for_dispatch_key=lambda *args: True,
+        ),
+        ops=SimpleNamespace(vq2a8_gs32_stage=SimpleNamespace(full_ffn_abi_version=lambda: build.FULL_FFN_ABI_VERSION)),
     )
-    assert build.verify_registered_device_schemas(fake_torch, execution) == schemas
-    assert queried == list(schemas)
+    assert build.verify_registered_device_schemas(fake_torch, execution) == required
+    assert queried == list(required)
 
 
 @pytest.mark.parametrize("schema_error", [False, True])
@@ -607,3 +598,46 @@ def test_build_pass_requires_schema_verification_and_does_not_claim_graph_execut
     assert manifest["graph_execution_verified"] is False
     assert manifest["device_execution_verified"] is False
     assert manifest["status"] == ("failed" if schema_error else "built")
+
+
+def test_route_sanitization_preserves_opaque_ownership_and_rejects_missing_registration():
+    source = source_text()
+    body = function(source, "SanitizeDeviceCounts")
+    assert "findSchemaOrThrow(" in body and "hasKernelForDispatchKey(c10::DispatchKey::PrivateUse1)" in body
+    assert "_sanitize_device_counts" in body
+    assert 'CheckNpuTensor(safe_counts, counts, at::kLong, 1, "sanitized_counts")' in body
+    assert 'CheckNpuTensor(status, counts, at::kInt, 1, "count_status")' in body
+    assert "safe_counts.numel() == counts.numel() && status.numel() == 1" in body
+    assert (
+        'CheckNoAlias({{"input_counts", counts}, {"sanitized_counts", safe_counts}, {"count_status", status}})' in body
+    )
+    for removed in ("counts.clone()", ".clamp(", ".sum()", ".cpu(", ".item("):
+        assert removed not in body
+    prepare = function(source, "PrepareDeviceRoutes")
+    assert "RecordStream({counts, sanitized.first, sanitized.second}, stream)" in prepare
+    assert "std::move(sanitized.first), std::move(sanitized.second), stream.stream(false)" in prepare
+    assert "routes->Status().clone()" in function(source, "DeviceRoutesStatus")
+
+
+@pytest.mark.parametrize("fault", ("missing_schema", "missing_backend"))
+def test_preflight_requires_new_bridge_sanitizer_schema_and_device_implementation(fault):
+    schemas = dict(build.REQUIRED_FULL_FFN_SCHEMAS)
+    if fault == "missing_schema":
+        del schemas["_sanitize_device_counts"]
+
+    def find_schema(name, overload):
+        key = name.removeprefix("vq2a8_gs32_stage::")
+        if key not in schemas:
+            raise RuntimeError("missing operator")
+        return SimpleNamespace(schema=lambda: schemas[key])
+
+    fake_torch = SimpleNamespace(
+        classes=SimpleNamespace(vq2a8_gs32_stage=SimpleNamespace(DeviceRoutes=object(), FullFFNPlan=object())),
+        _C=SimpleNamespace(
+            _dispatch_find_schema_or_throw=find_schema,
+            _dispatch_has_kernel_for_dispatch_key=lambda *args: False,
+        ),
+        ops=SimpleNamespace(vq2a8_gs32_stage=SimpleNamespace(full_ffn_abi_version=lambda: build.FULL_FFN_ABI_VERSION)),
+    )
+    with pytest.raises(RuntimeError, match="sanitize|sanitizer"):
+        build.verify_registered_device_schemas(fake_torch)

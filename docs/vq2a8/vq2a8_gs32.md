@@ -6,16 +6,11 @@
 两者输入列均为自然顺序，带 `.perm` 的旧交付（包括恒等排列）会被明确拒绝。
 Attention、共享专家和其他模型组件保留 checkpoint 中的数据类型，使用常规模型实现。
 
-本集成面向 Ascend950 上的 DeepSeek-V4，默认使用 Model Runner V2，并保留 V1 支持。
-代码提取自开发提交 `592a69733`；框架行为基于 `0a8761f07`，
-V2 适配来自 `d4b4e6157`。本次迁移不包含实验性的固定 I32 prefill 图。
-
-`feat/test2` 分支在上述增量基础上 rebase 到上游 `releases/v0.30.0`
-的 `b411aca2577f5e1858cd431fba183eaad4a37086`。
-该分支沿用 v0.30 的 MoE 分派、MXFP4 GMM 接口、MixedQuantSparseFlashMla
-和 QLI v2，并适配 MRV1/MRV2 的执行与图回放流程。
-本地 CPU 合同测试不能替代 Ascend950 上的数值、图回放和服务验收；
-切换软件基线后应在配套 vLLM、torch-npu、CANN 环境中重新构建扩展并运行 NPU CI。
+本集成面向 Ascend950 上的 DeepSeek-V4，默认使用 Model Runner V2，并保留 V1 的既有边界。
+生产运行时只保留 native 完整 FFN，设备入口为 ABI v3 的 `mixed_w2w4_moe_ffn_v3`。
+支持同一专家的 GateUp/Down 组合为 VQ2/VQ2、VQ2/MXFP4、MXFP4/MXFP4；MXFP4/VQ2 明确拒绝。
+本次精简不改变设备内核、裁剪或舍入顺序；更新后的 Torch 桥接库和构建清单仍需重建。
+本地 CPU 合同测试不能替代目标软件栈上的数值、图回放和服务验收。
 
 相关文档：[底层运行时](vq2a8_gs32_runtime.md) ·
 [混合专家权重导出规范](vq2_mixed_gs32_export_spec_20261103.md) ·
@@ -23,14 +18,15 @@ V2 适配来自 `d4b4e6157`。本次迁移不包含实验性的固定 I32 prefil
 
 ## 支持的执行模式
 
-| 配置 | 行为 |
+| 启动方式 | 行为 |
 | --- | --- |
-| `serial` | 严格 eager 参考路径，按专家执行分阶段投影 |
-| `batched` | eager 执行，共享激活准备和启动计划 |
-| `fused` | 按各专家实际路由行数执行 eager 分组投影 |
-| `full_graph` | MRV2 支持 B1～B64 decode 图回放，默认 B1；prefill 使用 eager 设备侧路由 |
-| `--gs32-fusion none` | 独立执行激活准备 |
-| `--gs32-fusion swiglu_quant` | 可选的 SwiGLU 与 Down 激活准备融合 |
+| 默认配置 | native、full_ffn、full_graph；decode 捕获和回放，prefill eager 执行同一完整融合 |
+| `--enforce-eager` | 关闭模型图捕获，仍调用相同的完整 FFN；运行记录中 execution 为 `fused` |
+
+公开启动参数只需 `--gs32-runtime-dir` 指定匹配的构建目录，不再选择 backend/fusion。
+旧脚本显式传入 `native`、`full_ffn`、`fused/full_graph` 及两个产物路径仍兼容，
+但 `none`、`swiglu_quant`、`reference_mxfp8`、`serial`、`batched` 均明确报错，不静默降级。
+独立量化和官方 GMM oracle 只存在于测试目录，不参与服务加载、图捕获或回放。
 
 默认 `--parallel-mode tp-ep`：普通层使用 TP，路由专家使用整专家 EP，规模为 1、2、4、8。
 新增 `--parallel-mode dp-ep --ep-size 4`：使用 TP1+DP4+EP4，普通层按 DP 复制，路由专家按 EP 分片。
@@ -38,9 +34,15 @@ DP 路径允许 MRV2、单节点内部 MP、DP2/DP4/DP8；不开放 TP 与 DP �
 每个 EP rank 保存完整的本地专家参数，专家按线性方式放置，公共 MoE 流程负责合并结果。
 通信、容量及验收边界见[运行时并行说明](vq2a8_gs32_runtime.md#dp-ep-通信与容量)。
 当前路径在分发过程中保持 BF16，随后按 K32 准备 MXFP8 激活。权重输入列必须为自然顺序；
-运行时不再支持 `.perm`，但 token 按专家分发和结果归位仍保留。
+运行时不再支持 `.perm`，公共 MoE 流程中的 token 分发与结果合并仍保留。
+完整 FFN 的本地专家按逻辑编号递增存储，设备端校验缺席专家的计数必须为零，
+因此有效 token 行已与权重顺序一致；FFN 内部直接量化这些行，不再构造 gather/inverse 或执行归位拷贝。
+专用 metadata 只输出计数、有效性和 live-row summary，量化阶段不读取尾部 padding。
+原生输出直接作为返回张量，合并检查仍清零非有限输出和 padding，并校验输入、路由及中间量化状态。
+这也适用于含空缺专家的 EP 本地分片；乱序、重复或越界的专家编号会被拒绝。
+详细执行与存储边界见[完整 FFN 框架开销优化](vq2a8_gs32_runtime.md#完整-ffn-框架开销优化)。
 
-分组原生路径没有额外施加任意的 Python 侧单专家行数 M 或总路由行数 R 上限。
+完整 FFN 路径使用实际路由计数；容量仍受原生 ABI、整数尺寸及设备显存约束。
 调度器仍通过 `max_num_batched_tokens` 限制每个 prefill 步骤的规模，
 内存分配也必须满足设备可用显存的约束。
 MRV2 的每 engine decode batch 上限通过 `--max-num-seqs` 设置，支持 1～64 的整数，默认 1。
@@ -49,7 +51,7 @@ B64 为 `[1,2,4,8,16,32,64]`。实际 decode batch 可以是区间内的任意�
 调度器将其补齐到可容纳的图桶，结束的请求不要求其他请求同时结束。
 DP1 时每个 rank 的路由容量为 `图桶 batch × top-k`，不除以 EP 数；当前模型 B64、top-k=6 时最多 384 行。
 DP 模式还需乘以 DP 数，因为本地专家会处理各 DP engine 收集后的 token；DP4、本地 B16 的全局上限为 B64。
-超过八行的执行使用设备端元数据路由，支持单专家热点超过 128 行。
+所有行数复用设备端元数据路由，保留单专家热点超过 128 行的处理。
 增大 prefill chunk 不会扩大 decode 图；eager prefill 也不受上述 decode 图容量限制。
 
 配置检查会在专家内存分配之前拒绝不支持的组合，包括：专家参数按张量切分、
@@ -72,8 +74,9 @@ DSpark5 按验证 query token 计量，预算和图桶容量需覆盖最大活�
 
 按照[混合算子集成说明](../../csrc/mixed_w2w4_moe_ffn/INTEGRATION.md)
 和[运行时构建说明](vq2a8_gs32_runtime.md)构建原生混合算子及 Torch 桥接库。
-必须显式提供生成的 `libvq2a8_gs32_stage.so` 和 `mixed_w2w4_moe_ffn.o`，
-不依赖开发者本地的固定构建目录。
+使用 `--gs32-runtime-dir "$BUILD"` 指向构建目录，其中必须有 `build-manifest.json`、
+`libvq2a8_gs32_stage.so` 和 `mixed_w2w4_moe_ffn.o`。启动器验证清单、ABI 和 SHA256，
+缺失或不兼容时直接报错，不自动构建或选择其他路径。
 
 **仅构建 GS32 桥接库不足以运行完整的 DeepSeek-V4 模型。**
 还需要针对同一目标软件栈构建并安装完整的 `vllm_ascend_C` 扩展及其 ACLNN 算子。
@@ -95,7 +98,8 @@ SWA 和压缩 KV 都使用 608 字节的物理行；模型的 BF16 计算 dtype 
 更新 Python 代码后重新启动服务即可应用此项修复，无须因此重新转换 checkpoint。
 应先确认 `/v1/models` 返回成功，再验证首个生成请求；仅通过启动预热不代表完整推理验收。
 
-当前主线使用 `DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3`，无需 repack。
+当前主线使用 `DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3-export-20261103`；
+非 routed 张量的导出与 repack 规则见[说明](repack_non_routed.md)。
 历史 source-v1 的布局转换工具仅接收已满足自然输入列顺序的源权重，拒绝带 `.perm` 的输入：
 
 ```bash
@@ -143,13 +147,10 @@ NPU 数值回归、服务延迟和模型回答精度是独立的检查项。
 
 [NPU CI 指南](vq2a8_npu_ci.md)介绍 `kernels`、`pr`、`nightly` 套件，
 默认 Model Runner V2、可选 V1、产物要求、日志和通过条件。
-如果 checkpoint 中不存在真实的 `mxfp4 -> vq2` GateUp 到 Down 专家组合，
-默认命令会打印提示、记录未覆盖用例，并自动继续执行剩余阶段，无须额外添加命令行选项。
-其他跳过、xfail 和实际失败仍会导致 CI 失败。
-具体适用范围及其他缺失组合的可选处理方式，见
-[checkpoint 缺少真实专家组合时](vq2a8_npu_ci.md#checkpoint-缺少真实专家组合时)。
-存在覆盖缺口但其余检查成功的运行会报告为 `passed_with_coverage_gaps`，
-报告中仍会保留这些覆盖缺口。
+默认组件为初始激活、设备路由、完整 FFN、EP 路由和 attention。真实专家数值对照只覆盖生产支持的三种组合，
+缺少其中任一组合默认阻断；显式接受覆盖缺口的报告不能作为完整验收。
+MXFP4/VQ2 不属于支持范围，不再自动接受这一历史组合的缺失。
+具体规则见 [checkpoint 缺少真实专家组合时](vq2a8_npu_ci.md#checkpoint-缺少真实专家组合时)。
 
 ### 单项测试入口
 
@@ -163,8 +164,8 @@ VQ2A8 启动器默认通过上游已有的环境变量 `VLLM_USE_V2_MODEL_RUNNER
 直接调用 vLLM 或单独运行整模型测试时，应显式设置所需 runner。
 两种 runner 使用相同的 checkpoint、原生产物和 GS32 执行选项。
 在 `full_graph` 模式下，prefill 仍以 eager 方式运行，MRV2 可配置 B1～B64 decode 图。
-大于八个路由行的 warmup、捕获和 eager 执行使用相同元数据路径；
-捕获所引用的激活、路由和扫描临时缓冲区随图保留，多次回放不会继续增加保留对象。
+warmup、捕获和 eager 执行使用相同的完整 FFN 与元数据路径；
+每次捕获独立分配的量化、中间激活、路由状态及输出缓冲区随图保留，多次回放不会继续增加保留对象。
 
 两种 runner 使用相同的有效性检查职责划分：每个专家层写入固定的设备状态视图，
 由一次汇总检查在采样前拒绝无效输出。

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU metadata/ownership checks for asynchronous activation, not NPU execution."""
+"""Full FFN input preparation contracts; CPU transport is not NPU proof."""
 
-import ast
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,426 +10,289 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.ut.quantization.test_vq2a8_gs32_fused_activation import (
-    HostFlags,
-    activation_module,
-    tagged,
-    valid_inputs,
-)
+from tests.ut.quantization.test_vq2a8_gs32_device_routes import evaluate_row_kernel
+from tests.ut.quantization.test_vq2a8_gs32_fused_activation import activation_module, tagged
 
 
 @pytest.fixture
 def activation(monkeypatch):
-    monkeypatch.setattr(
-        torch,
-        "npu",
-        SimpleNamespace(is_current_stream_capturing=lambda: True, device=lambda device: nullcontext()),
-        raising=False,
-    )
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(device=lambda device: nullcontext()), raising=False)
     return activation_module()
 
 
-def test_gs32_activation_async_prepare_rejects_cpu(activation):
+def test_prepare_rejects_cpu(activation):
     with pytest.raises(ValueError, match="NPU"):
-        activation.prepare_unchecked(torch.zeros(1, 64, dtype=torch.bfloat16))
+        activation.prepare_unchecked(torch.zeros(3, 64, dtype=torch.bfloat16))
 
 
-def test_gs32_activation_async_prepare_preserves_flags_without_host_read(activation, monkeypatch):
-    args = valid_inputs()
-    raw_gate = tagged(torch.zeros(3, 128, dtype=torch.bfloat16))
-    flags = HostFlags([1, 0, 1])
-    data, scales = torch.zeros(3, 64, dtype=torch.uint8), torch.ones(3, 2, dtype=torch.uint8)
+def test_prepare_preserves_device_flags_and_original_buffers(activation, monkeypatch):
+    hidden = tagged(torch.zeros(3, 64, dtype=torch.bfloat16))
+    rows = tagged(torch.tensor([2, 0, -1], dtype=torch.int64))
+    route = tagged(torch.tensor([1], dtype=torch.int32))
+    sentinel = object()
     calls = []
+
+    def launch(received, **options):
+        calls.append((received, options))
+        return sentinel
+
+    monkeypatch.setattr(activation, "prepare_activation", launch)
+    assert activation.prepare_unchecked(hidden, source_rows=rows, route_flags=route) is sentinel
+    assert calls[0][0] is hidden
+    assert calls[0][1]["source_rows"] is rows
+    assert calls[0][1]["route_flags"] is route
+
+
+@pytest.mark.parametrize("fault", ["dtype", "width", "row_dtype", "row_shape", "flag_dtype", "flag_shape", "device"])
+def test_prepare_rejects_bad_metadata_before_launch(activation, monkeypatch, fault):
+    hidden = tagged(torch.zeros(3, 64, dtype=torch.float32 if fault == "dtype" else torch.bfloat16))
+    if fault == "width":
+        hidden = tagged(torch.zeros(3, 63, dtype=torch.bfloat16))
+    rows = tagged(
+        torch.zeros(2 if fault == "row_shape" else 3, dtype=torch.int32 if fault == "row_dtype" else torch.int64)
+    )
+    flags = tagged(
+        torch.ones(2 if fault == "flag_shape" else 1, dtype=torch.int64 if fault == "flag_dtype" else torch.int32),
+        index=1 if fault == "device" else 0,
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid metadata reached device launch")
+
+    monkeypatch.setattr(activation, "prepare_activation", forbidden)
+    with pytest.raises(ValueError):
+        activation.prepare_unchecked(hidden, source_rows=rows, route_flags=flags)
+
+
+def test_empty_prepare_does_not_launch(activation, monkeypatch):
+    monkeypatch.setattr(activation, "prepare_activation", lambda *args, **kwargs: pytest.fail("empty launch"))
+    result = activation.prepare_unchecked(tagged(torch.zeros(0, 64, dtype=torch.bfloat16)))
+    assert [tuple(value.shape) for value in result] == [(0, 64), (0, 2), (0,)]
+    assert [value.dtype for value in result] == [torch.uint8, torch.uint8, torch.int32]
+
+
+@pytest.mark.parametrize("legacy", ["raw_gate", "swiglu_limit", "perm"])
+def test_removed_partial_fusion_arguments_fail(activation, legacy):
+    with pytest.raises(TypeError):
+        activation.prepare_unchecked(tagged(torch.zeros(3, 64, dtype=torch.bfloat16)), **{legacy: None})
+
+
+def test_identity_prepare_forwards_device_summary_without_host_reads(activation, monkeypatch):
+    hidden = tagged(torch.zeros(3, 64, dtype=torch.bfloat16))
+    summary = tagged(torch.tensor([2, 1], dtype=torch.int64))
+    route = tagged(torch.ones(1, dtype=torch.int32))
+    sentinel = object()
+
+    def launch(received, *, source_rows, route_flags, route_metadata):
+        assert received is hidden and source_rows is None
+        assert route_flags is route and route_metadata is summary
+        return sentinel
+
+    monkeypatch.setattr(activation, "prepare_activation", launch)
+    monkeypatch.setattr(type(summary), "item", lambda *args: pytest.fail("device scalar read"))
+    monkeypatch.setattr(type(summary), "cpu", lambda *args: pytest.fail("device host transfer"))
+    assert activation.prepare_unchecked(hidden, route_flags=route, route_metadata=summary) is sentinel
+
+
+@pytest.mark.parametrize("fault", ["dtype", "shape", "device", "noncontiguous", "both_mappings"])
+def test_identity_prepare_rejects_invalid_summary_before_launch(activation, monkeypatch, fault):
+    hidden = tagged(torch.zeros(3, 64, dtype=torch.bfloat16))
+    summary = tagged(
+        torch.tensor([2, 1], dtype=torch.int32 if fault == "dtype" else torch.int64), index=int(fault == "device")
+    )
+    if fault == "shape":
+        summary = tagged(torch.ones(3, dtype=torch.int64))
+    if fault == "noncontiguous":
+        summary = tagged(torch.ones(4, dtype=torch.int64)[::2])
+    options = {"route_metadata": summary}
+    if fault == "both_mappings":
+        options["source_rows"] = tagged(torch.arange(3))
+    monkeypatch.setattr(activation, "prepare_activation", lambda *a, **k: pytest.fail("invalid launch"))
+    with pytest.raises(ValueError):
+        activation.prepare_unchecked(hidden, **options)
+
+
+def finish_inputs():
+    return [
+        tagged(torch.ones(3, 64, dtype=torch.bfloat16)),
+        tagged(torch.full((3, 2), 127, dtype=torch.uint8)),
+        tagged(torch.ones(3, dtype=torch.int32)),
+        tagged(torch.ones(1, dtype=torch.int32)),
+        tagged(torch.ones(1, dtype=torch.int32)),
+        tagged(torch.tensor([2, 1], dtype=torch.int64)),
+        tagged(torch.zeros((), dtype=torch.bool)),
+    ]
+
+
+def test_finish_forwards_original_storage_and_status_without_host_reads(activation, monkeypatch):
+    inputs = finish_inputs()
+    sentinel = object()
 
     def launch(*received):
-        calls.append(received)
-        return data, scales, flags
+        assert all(actual is expected for actual, expected in zip(received, inputs, strict=True))
+        return sentinel
 
-    monkeypatch.setattr(activation, "prepare_activation", launch)
-    actual = activation.prepare_unchecked(*args, raw_gate=raw_gate)
-    assert all(got is expected for got, expected in zip(actual, (data, scales, flags), strict=True))
-    assert all(got is expected for got, expected in zip(calls[0], (*args, raw_gate), strict=True))
-    assert flags.transfers == 0
-
-
-@pytest.mark.parametrize("field", ["dtype", "width", "raw_gate"])
-def test_gs32_activation_async_invalid_metadata_never_launches(activation, monkeypatch, field):
-    args, raw_gate = list(valid_inputs()), None
-    if field == "dtype":
-        args[0] = tagged(torch.zeros(3, 64, dtype=torch.float32))
-    elif field == "width":
-        args[0] = tagged(torch.zeros(3, 63, dtype=torch.bfloat16))
-    else:
-        raw_gate = tagged(torch.zeros(3, 127, dtype=torch.bfloat16))
-
-    def forbidden(*args):
-        pytest.fail("Invalid metadata reached asynchronous preparation.")
-
-    monkeypatch.setattr(activation, "prepare_activation", forbidden)
-    with pytest.raises(ValueError):
-        activation.prepare_unchecked(*args, raw_gate=raw_gate)
-
-
-def test_gs32_activation_async_finish_forwards_device_flags_without_reading(activation, monkeypatch):
-    output = tagged(torch.zeros(3, 64, dtype=torch.bfloat16))
-    gate = tagged(torch.tensor([1, 0, 1], dtype=torch.int32))
-    down = tagged(torch.ones(3, dtype=torch.int32))
-    final = HostFlags([0])
-    calls = []
-
-    def finish(*args):
-        calls.append(args)
-        return final
-
-    monkeypatch.setattr(activation, "finish_activation_flags", finish)
-    assert activation.finish_flags(output, gate, down) is final
-    assert all(got is expected for got, expected in zip(calls[0], (output, gate, down), strict=True))
-    assert final.transfers == 0
-
-
-def test_gs32_activation_async_finish_includes_route_and_native_flags(activation, monkeypatch):
-    output = tagged(torch.zeros(3, 64, dtype=torch.bfloat16))
-    gate = tagged(torch.ones(3, dtype=torch.int32))
-    down = tagged(torch.ones(3, dtype=torch.int32))
-    route = tagged(torch.zeros(1, dtype=torch.int32))
-    native = tagged(torch.ones(1, dtype=torch.int32))
-    final, calls = HostFlags([0]), []
-
-    def finish(*args, **kwargs):
-        calls.append((args, kwargs))
-        return final
-
-    monkeypatch.setattr(activation, "finish_activation_flags", finish)
-    assert activation.finish_flags(output, gate, down, route_flags=route, native_flags=native) is final
-    assert calls[0][1] == {"route_flags": route, "native_flags": native}
-    assert final.transfers == 0
-
-
-@pytest.mark.parametrize("kind", ["cpu", "dtype", "empty", "rank", "device"])
-def test_gs32_activation_async_finish_rejects_invalid_external_flags(activation, monkeypatch, kind):
-    output = tagged(torch.zeros(3, 64, dtype=torch.bfloat16))
-    flags = tagged(torch.ones(3, dtype=torch.int32))
-    external = tagged(torch.ones(1, dtype=torch.int32))
-    if kind == "cpu":
-        external = torch.ones(1, dtype=torch.int32)
-    elif kind == "dtype":
-        external = tagged(torch.ones(1, dtype=torch.int64))
-    elif kind == "empty":
-        external = tagged(torch.empty(0, dtype=torch.int32))
-    elif kind == "rank":
-        external = tagged(torch.ones(1, 1, dtype=torch.int32))
-    else:
-        external = tagged(torch.ones(1, dtype=torch.int32), index=1)
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("Invalid external flag metadata reached a kernel.")
-
-    monkeypatch.setattr(activation, "finish_activation_flags", forbidden)
-    for name in ("route_flags", "native_flags"):
-        with pytest.raises(ValueError):
-            activation.finish_flags(output, flags, flags, **{name: external})
-
-
-@pytest.mark.parametrize("field", ["output_cpu", "output_dtype", "rank", "gate_dtype", "down_rows", "device"])
-def test_gs32_activation_async_finish_rejects_invalid_metadata(activation, monkeypatch, field):
-    output = tagged(torch.zeros(3, 64, dtype=torch.bfloat16))
-    gate = tagged(torch.ones(3, dtype=torch.int32))
-    down = tagged(torch.ones(3, dtype=torch.int32))
-    if field == "output_cpu":
-        output = torch.zeros(3, 64, dtype=torch.bfloat16)
-    elif field == "output_dtype":
-        output = tagged(torch.zeros(3, 64, dtype=torch.int32))
-    elif field == "rank":
-        output = tagged(torch.zeros(3, 64, 1, dtype=torch.bfloat16))
-    elif field == "gate_dtype":
-        gate = tagged(torch.ones(3, dtype=torch.int64))
-    elif field == "down_rows":
-        down = tagged(torch.ones(4, dtype=torch.int32))
-    else:
-        down = tagged(torch.ones(3, dtype=torch.int32), index=1)
-
-    def forbidden(*args):
-        pytest.fail("Invalid metadata reached final validity kernel.")
-
-    monkeypatch.setattr(activation, "finish_activation_flags", forbidden)
-    with pytest.raises(ValueError):
-        activation.finish_flags(output, gate, down)
-
-
-def test_gs32_activation_async_does_not_relax_strict_capture_guard(activation):
-    with pytest.raises(RuntimeError, match="capture"):
-        activation.prepare(*valid_inputs())
-    with pytest.raises(RuntimeError, match="capture"):
-        activation.require_finite_fused(tagged(torch.ones(3, 64, dtype=torch.bfloat16)), "output")
-
-
-def test_gs32_activation_async_empty_returns_empty_flags_without_launch(activation, monkeypatch):
-    args = list(valid_inputs())
-    args[0] = tagged(torch.empty(0, 64, dtype=torch.bfloat16))
-
-    def forbidden(*args):
-        pytest.fail("Empty preparation launched a kernel.")
-
-    monkeypatch.setattr(activation, "prepare_activation", forbidden)
-    data, scales, flags = activation.prepare_unchecked(*args)
-    assert data.shape == (0, 64) and scales.shape == (0, 2) and flags.shape == (0,)
-    assert data.dtype == scales.dtype == torch.uint8 and flags.dtype == torch.int32
-
-
-@pytest.mark.parametrize("limit", [0.0, 10.0])
-def test_fused_swiglu_async_preserves_device_flags_and_raw_buffer(activation, monkeypatch, limit):
-    raw = tagged(torch.ones(3, 128, dtype=torch.bfloat16))
-    flags, calls = HostFlags([1, 0, 1]), []
-    result = torch.zeros(3, 64, dtype=torch.uint8), torch.ones(3, 2, dtype=torch.uint8), flags
-
-    def launch(*args, **kwargs):
-        calls.append((args, kwargs))
-        return result
-
-    monkeypatch.setattr(activation, "prepare_activation", launch)
-    actual = activation.prepare_unchecked(raw, swiglu_limit=limit)
-    assert all(a is b for a, b in zip(actual, result, strict=True))
-    assert calls[0][0][0] is raw and calls[0][1] == {"swiglu_limit": limit}
-    assert flags.transfers == 0
-
-
-def test_fused_swiglu_async_empty_and_strict_capture_boundary(activation, monkeypatch):
-    def forbidden(*args, **kwargs):
-        pytest.fail("Empty or strict captured SwiGLU reached launch.")
-
-    monkeypatch.setattr(activation, "prepare_activation", forbidden)
-    raw = tagged(torch.empty(0, 128, dtype=torch.bfloat16))
-    data, scales, flags = activation.prepare_unchecked(raw, swiglu_limit=10.0)
-    assert data.shape == (0, 64) and scales.shape == (0, 2) and flags.shape == (0,)
-    with pytest.raises(RuntimeError, match="capture"):
-        activation.prepare(raw, swiglu_limit=10.0)
-
-
-@pytest.mark.parametrize("swiglu_limit", [None, 0.0, 10.0])
-def test_gathered_prepare_forwards_original_buffers_without_host_reads(activation, monkeypatch, swiglu_limit):
-    (hidden,) = valid_inputs()
-    raw = tagged(torch.ones(3, 128, dtype=torch.bfloat16))
-    source = tagged(torch.tensor([2, -1, 0], dtype=torch.int64))
-    route = tagged(torch.ones(1, dtype=torch.int32))
-    flags, calls = HostFlags([1, 1, 1]), []
-    result = torch.zeros(3, 64, dtype=torch.uint8), torch.full((3, 2), 127, dtype=torch.uint8), flags
-
-    def launch(*args, **kwargs):
-        calls.append((args, kwargs))
-        return result
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("Gathered preparation performed a host read or materialized a Torch gather.")
-
-    monkeypatch.setattr(activation, "prepare_activation", launch)
-    for name in ("cpu", "item", "tolist", "index_select", "gather"):
-        monkeypatch.setattr(torch.Tensor, name, forbidden)
-    options = {"source_rows": source, "route_flags": route}
-    if swiglu_limit is None:
-        options["raw_gate"] = raw
-    else:
-        hidden = raw
-        options["swiglu_limit"] = swiglu_limit
-    actual = activation.prepare_unchecked(hidden, **options)
-    assert all(a is b for a, b in zip(actual, result, strict=True))
-    assert calls[0][0][0] is hidden
-    assert calls[0][0][1] is (raw if swiglu_limit is None else None)
-    assert calls[0][1]["source_rows"] is source and calls[0][1]["route_flags"] is route
-    assert flags.transfers == 0
-
-
-@pytest.mark.parametrize("field", ["source_rows", "route_flags"])
-@pytest.mark.parametrize("fault", ["cpu", "dtype", "rows", "rank", "device", "contiguous"])
-def test_gathered_prepare_rejects_metadata_before_launch(activation, monkeypatch, field, fault):
-    rows, dtype = (3, torch.int64) if field == "source_rows" else (1, torch.int32)
-    value = torch.ones(rows, dtype=dtype)
-    if fault == "dtype":
-        value = value.float()
-    elif fault == "rows":
-        value = torch.ones(rows + 1, dtype=dtype)
-    elif fault == "rank":
-        value = value[:, None]
-    elif fault == "contiguous":
-        # Even a one-element vector is contiguous; use a wrong-length strided
-        # flag vector to exercise the shared contiguous metadata requirement.
-        value = torch.ones(2 * max(rows, 2), dtype=dtype)[::2]
-    if fault != "cpu":
-        value = tagged(value, index=int(fault == "device"))
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("Invalid gathered metadata reached the activation launch.")
-
-    monkeypatch.setattr(activation, "prepare_activation", forbidden)
-    with pytest.raises(ValueError):
-        activation.prepare_unchecked(*valid_inputs(), **{field: value})
-
-
-def evaluate_gathered_prepare(hidden, *, raw_gate=None, source_rows=None, route_flags=None, limit=None):
-    """Run production indexing/register expressions on CPU, not an NPU emulator."""
-    source = Path(__file__).resolve().parents[3] / "vllm_ascend/ops/triton/activation/vq2a8_gs32.py"
-    module = ast.parse(source.read_text())
-
-    class CpuExpressions(ast.NodeTransformer):
-        def visit_FunctionDef(self, node):
-            self.generic_visit(node)
-            node.decorator_list = []
-            for argument in node.args.args:
-                argument.annotation = None
-            return node
-
-        def visit_Call(self, node):
-            self.generic_visit(node)
-            if any(keyword.arg == "bitcast" for keyword in node.keywords):
-                node.func.attr = "view"
-            node.keywords = [
-                keyword for keyword in node.keywords if keyword.arg not in ("bitcast", "fp_downcast_rounding")
-            ]
-            return node
-
-    reads = []
-
-    class Pointer:
-        def __init__(self, storage, name, offsets=0):
-            self.storage, self.name, self.offsets = storage.flatten(), name, torch.as_tensor(offsets)
-            self.dtype = SimpleNamespace(element_ty=storage.dtype)
-
-        def __add__(self, offsets):
-            return Pointer(self.storage, self.name, self.offsets + offsets)
-
-    def load(pointer, mask=True, other=0):
-        mask, offsets = torch.broadcast_tensors(torch.as_tensor(mask), pointer.offsets)
-        reads.append(pointer.name)
-        selected = offsets[mask]
-        assert ((selected >= 0) & (selected < pointer.storage.numel())).all(), "Unmasked out-of-range input read."
-        result = torch.full(offsets.shape, other, dtype=pointer.storage.dtype)
-        result[mask] = pointer.storage[selected]
-        return result
-
-    def store(pointer, value, mask=True):
-        values = torch.as_tensor(value)
-        # Torch accepts integer -> FP8 casts that Ascend Triton rejects.
-        # Require explicitly typed FP8 values so the CPU oracle cannot hide
-        # an unsupported implicit conversion in the production store.
-        if pointer.storage.dtype == torch.float8_e4m3fn:
-            assert values.dtype == pointer.storage.dtype, "FP8 stores require explicitly typed FP8 values."
-        mask, offsets, values = torch.broadcast_tensors(torch.as_tensor(mask), pointer.offsets, values)
-        pointer.storage[offsets[mask]] = values[mask].to(pointer.storage.dtype)
-
-    def where(condition, left, right):
-        return torch.where(torch.as_tensor(condition), torch.as_tensor(left), torch.as_tensor(right))
-
-    namespace = {
-        "tl": SimpleNamespace(
-            arange=torch.arange,
-            full=lambda shape, value, dtype: torch.full(shape, value, dtype=dtype),
-            load=load,
-            store=store,
-            where=where,
-            abs=torch.abs,
-            sigmoid=torch.sigmoid,
-            min=lambda values, axis: values.amin(dim=axis),
-            max=lambda values, axis: values.amax(dim=axis),
-            minimum=lambda a, b: torch.minimum(torch.as_tensor(a), torch.as_tensor(b)),
-            maximum=lambda a, b: torch.maximum(torch.as_tensor(a), torch.as_tensor(b)),
-            reshape=torch.reshape,
-            int64=torch.int64,
-            int32=torch.int32,
-            uint8=torch.uint8,
-            float32=torch.float32,
-            bfloat16=torch.bfloat16,
-        )
-    }
-    functions = [
-        node
-        for node in module.body
-        if isinstance(node, ast.FunctionDef) and node.name in ("_quantize_groups", "_prepare_activation_kernel")
-    ]
-    expressions = ast.fix_missing_locations(CpuExpressions().visit(ast.Module(body=functions, type_ignores=[])))
-    exec(compile(expressions, str(source), "exec"), namespace)
-    rows, width = hidden.shape
-    if limit is not None:
-        width //= 2
-    data = torch.empty((rows, width), dtype=torch.float8_e4m3fn)
-    scales, flags = torch.empty((rows, width // 32), dtype=torch.uint8), torch.empty(rows, dtype=torch.int32)
-    buffers = (
-        hidden,
-        hidden if raw_gate is None else raw_gate,
-        hidden if source_rows is None else source_rows,
-        hidden if route_flags is None else route_flags,
-        data,
-        scales,
-        flags,
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.ops.triton.activation.vq2a8_gs32", SimpleNamespace(finish_full_ffn=launch)
     )
-    pointers = [
-        Pointer(value, name)
-        for value, name in zip(
-            buffers,
-            ("hidden", "raw_gate", "source_rows", "route_flags", "data", "scales", "flags"),
-            strict=True,
-        )
-    ]
-    for row in range(rows):
-        namespace["tl"].program_id = lambda axis, row=row: torch.tensor(row, dtype=torch.int32)
-        namespace["_prepare_activation_kernel"](
-            *pointers,
-            K=width,
-            INPUT_ROWS=rows,
-            BLOCK_K=1 << (width - 1).bit_length(),
-            HAS_RAW_GATE=raw_gate is not None,
-            HAS_SOURCE_ROWS=source_rows is not None,
-            HAS_ROUTE_FLAGS=route_flags is not None,
-            FUSE_SWIGLU=limit is not None,
-            SWIGLU_LIMIT=0.0 if limit is None else limit,
-            GROUP=32,
-            FLOAT_MAX=torch.finfo(torch.float32).max,
-        )
-    return data.view(torch.uint8), scales, flags, reads
-
-
-@pytest.mark.parametrize("width", [32, 96, 160])
-@pytest.mark.parametrize("limit", [None, 0.0, 10.0])
-def test_gathered_registers_match_explicit_gather_bytes(width, limit):
-    generator = torch.Generator().manual_seed(3208)
-    hidden = (torch.randn(5, width, generator=generator) * 20).bfloat16()
-    if limit is not None:
-        hidden = torch.cat((hidden, hidden.roll(17, 1) * 2), dim=1)
-    source = torch.tensor([4, 0, 4, 2, 1], dtype=torch.int64)
-    actual = evaluate_gathered_prepare(hidden, source_rows=source, limit=limit)
-    expected = evaluate_gathered_prepare(hidden.index_select(0, source), limit=limit)
-    assert all(torch.equal(a, b) for a, b in zip(actual[:3], expected[:3], strict=True))
-    assert actual[2].tolist() == [1] * 5
+    monkeypatch.setattr(type(inputs[0]), "item", lambda *args: pytest.fail("device scalar read"))
+    monkeypatch.setattr(type(inputs[0]), "cpu", lambda *args: pytest.fail("device host transfer"))
+    assert activation.finish_full_ffn(*inputs) is sentinel
 
 
 @pytest.mark.parametrize(
-    "source,route,expected", [(-1, 1, 1), (-2, 1, 0), (3, 1, 0), (2**40, 1, 0), (0, 0, 0), (-1, 2, 0)]
+    "fault",
+    [
+        "output_dtype",
+        "zero_rows",
+        "scale_dtype",
+        "scale_rows",
+        "input_dtype",
+        "input_rows",
+        "route_dtype",
+        "native_shape",
+        "metadata_dtype",
+        "metadata_shape",
+        "status_dtype",
+        "status_shape",
+        "device",
+        "noncontiguous",
+        "output_alias",
+        "status_alias",
+    ],
 )
-@pytest.mark.parametrize("limit", [None, 0.0, 10.0])
-@pytest.mark.parametrize("width", [96, 4096])
-def test_inactive_gathered_registers_skip_input_and_quantization(source, route, expected, limit, width):
-    hidden = torch.full((3, width if limit is None else 2 * width), float("nan"), dtype=torch.bfloat16)
-    result = evaluate_gathered_prepare(
-        hidden,
-        source_rows=torch.full((3,), source, dtype=torch.int64),
-        route_flags=torch.tensor([route], dtype=torch.int32),
-        limit=limit,
+def test_finish_rejects_bad_buffers_before_launch(activation, monkeypatch, fault):
+    inputs = finish_inputs()
+    replacements = {
+        "output_dtype": (0, torch.ones(3, 64)),
+        "zero_rows": (0, torch.empty(0, 64, dtype=torch.bfloat16)),
+        "scale_dtype": (1, torch.ones(3, 2, dtype=torch.int32)),
+        "scale_rows": (1, torch.ones(2, 2, dtype=torch.uint8)),
+        "input_dtype": (2, torch.ones(3, dtype=torch.int64)),
+        "input_rows": (2, torch.ones(2, dtype=torch.int32)),
+        "route_dtype": (3, torch.ones(1, dtype=torch.int64)),
+        "native_shape": (4, torch.ones(2, dtype=torch.int32)),
+        "metadata_dtype": (5, torch.ones(2, dtype=torch.int32)),
+        "metadata_shape": (5, torch.ones(3, dtype=torch.int64)),
+        "status_dtype": (6, torch.ones((), dtype=torch.uint8)),
+        "status_shape": (6, torch.ones(1, dtype=torch.bool)),
+        "noncontiguous": (1, torch.ones(3, 4, dtype=torch.uint8)[:, ::2]),
+    }
+    if fault in replacements:
+        index, replacement = replacements[fault]
+        inputs[index] = tagged(replacement)
+    if fault == "device":
+        inputs[4] = tagged(torch.ones(1, dtype=torch.int32), index=1)
+    if fault == "output_alias":
+        inputs[1] = tagged(inputs[0].view(torch.uint8).reshape(-1)[:6].view(3, 2))
+    if fault == "status_alias":
+        inputs[6] = tagged(inputs[1].view(torch.bool).reshape(-1)[0])
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.ops.triton.activation.vq2a8_gs32",
+        SimpleNamespace(finish_full_ffn=lambda *a: pytest.fail("invalid launch")),
     )
-    assert result[0].count_nonzero() == 0 and (result[1] == 127).all()
-    assert result[2].tolist() == [expected] * 3
-    assert set(result[3]) == {"source_rows", "route_flags"}
+    with pytest.raises(ValueError):
+        activation.finish_full_ffn(*inputs)
 
 
-@pytest.mark.parametrize("fused", [False, True])
-@pytest.mark.parametrize("fault", [float("nan"), float("inf")])
-def test_gathered_raw_gate_invalidity_survives_mapping_and_clipping(fused, fault):
-    width = 96
-    raw = torch.ones(3, 2 * width, dtype=torch.bfloat16)
-    raw[2, width + 95] = fault
-    source = torch.tensor([2, 1, 0])
-    options = {"limit": 10.0} if fused else {"raw_gate": raw}
-    hidden = raw if fused else torch.ones(3, width, dtype=torch.bfloat16)
-    result = evaluate_gathered_prepare(hidden, source_rows=source, **options)
-    assert result[2].tolist() == [0, 1, 1]
-    assert torch.isfinite(result[0].view(torch.float8_e4m3fn).float()).all()
-    expected_options = {"limit": 10.0} if fused else {"raw_gate": raw.index_select(0, source)}
-    expected = evaluate_gathered_prepare(hidden.index_select(0, source), **expected_options)
-    assert all(torch.equal(a, b) for a, b in zip(result[:3], expected[:3], strict=True))
+def activation_kernel_path():
+    return Path(__file__).resolve().parents[3] / "vllm_ascend/ops/triton/activation/vq2a8_gs32.py"
+
+
+@pytest.mark.parametrize("width", [64, 4097])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "none",
+        "live_nan",
+        "live_inf",
+        "scale255",
+        "padding_scale255",
+        "input",
+        "padding_input",
+        "route",
+        "native",
+        "metadata",
+        "negative_live",
+        "oversized_live",
+        "empty",
+    ],
+)
+def test_finish_kernel_register_semantics_ignore_padding_and_keep_all_validity_sources(width, fault):
+    rows, live = 3, 2
+    output = torch.full((rows, width), 2.0, dtype=torch.bfloat16)
+    output[2].fill_(float("nan"))
+    tensors = {
+        "output_ptr": output,
+        "middle_scales_ptr": torch.full((rows, 2), 127, dtype=torch.uint8),
+        "input_flags_ptr": torch.ones(rows, dtype=torch.int32),
+        "route_flags_ptr": torch.ones(1, dtype=torch.int32),
+        "native_flags_ptr": torch.ones(1, dtype=torch.int32),
+        "route_metadata_ptr": torch.tensor([live, 1], dtype=torch.int64),
+        "block_flags_ptr": torch.empty(rows * ((width + 4095) // 4096), dtype=torch.int32),
+    }
+    if fault in ("live_nan", "live_inf"):
+        output[0, width - 1] = float("nan" if fault == "live_nan" else "inf")
+    if fault in ("scale255", "padding_scale255"):
+        tensors["middle_scales_ptr"][2 if fault == "padding_scale255" else 0, 0] = 255
+    if fault in ("input", "padding_input"):
+        tensors["input_flags_ptr"][2 if fault == "padding_input" else 0] = 0
+    if fault in ("route", "native"):
+        tensors[f"{fault}_flags_ptr"].zero_()
+    if fault == "metadata":
+        tensors["route_metadata_ptr"][1] = 0
+    if fault in ("negative_live", "oversized_live", "empty"):
+        live = {"negative_live": -1, "oversized_live": rows + 1, "empty": 0}[fault]
+        tensors["route_metadata_ptr"][0] = live
+    blocks = (width + 4095) // 4096
+    for row in range(rows):
+        for block in range(blocks):
+            accesses, _ = evaluate_row_kernel(
+                "_finish_full_ffn_kernel",
+                tensors,
+                {
+                    "ROWS": rows,
+                    "WIDTH": width,
+                    "SCALE_WIDTH": 2,
+                    "COLUMN_BLOCK": min(4096, 1 << (width - 1).bit_length()),
+                    "SCALE_BLOCK": 2,
+                    "COLUMN_BLOCKS": blocks,
+                    "NONFINITE_SCALE": 255,
+                },
+                (row, block),
+                source_path=activation_kernel_path(),
+            )
+            if row >= live or fault in ("route", "native", "metadata", "negative_live", "oversized_live"):
+                assert all(
+                    count == 0 for operation, name, count in accesses if operation == "load" and name == "output_ptr"
+                )
+    assert bool((tensors["block_flags_ptr"] == 1).all()) == (fault in ("none", "empty"))
+    assert bool(torch.isfinite(output).all())
+    if fault in ("route", "native", "metadata", "negative_live", "oversized_live", "empty"):
+        assert not output.count_nonzero()
+    else:
+        assert not output[2].count_nonzero()
+        if fault in ("live_nan", "live_inf"):
+            assert output[0, width - 1] == 0
+        else:
+            assert bool((output[:2] == 2).all())
+
+
+@pytest.mark.parametrize("size", [1, 1024, 1025, 2050])
+def test_finish_reduction_fixed_tiles_cover_boundary_and_overwrite_status(size):
+    flags = torch.ones(size, dtype=torch.int32)
+    validity = torch.zeros((), dtype=torch.bool)
+    for bad_index in (None, 0, size - 1, None):
+        flags.fill_(1)
+        if bad_index is not None:
+            flags[bad_index] = 0
+        validity.fill_(bad_index is not None)
+        evaluate_row_kernel(
+            "_reduce_full_ffn_validity_kernel",
+            {"block_flags_ptr": flags, "validity_ptr": validity},
+            {"FLAGS": size, "BLOCK": 1024},
+            (0,),
+            source_path=activation_kernel_path(),
+        )
+        assert bool(validity) == (bad_index is None)

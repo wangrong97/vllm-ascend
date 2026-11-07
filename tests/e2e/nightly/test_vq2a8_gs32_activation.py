@@ -10,7 +10,6 @@ NumPy/ml_dtypes reference, never the new fused implementation.
 import importlib.util
 import json
 from pathlib import Path
-from time import perf_counter
 from types import SimpleNamespace
 
 import numpy as np
@@ -23,15 +22,15 @@ def activation_runtime(request):
     if not selected:
         pytest.skip("Pass a source-v3 GS32 --vq2a8-model to opt into real Ascend activation execution.")
     model = Path(selected).resolve(strict=True)
-    config = json.loads((model / "config.json").read_text())
+    config = json.loads((model / "config.json").read_text(encoding="utf-8"))
     assert config["quantization_config"]["format"] == "vq2_mixed_gs32_source"
     assert config["quantization_config"]["format_version"] == 3
 
     import torch
     import torch_npu  # noqa: F401
 
-    from vllm_ascend.ops.fused_moe.vq2a8_gs32_activation import prepare, require_finite_fused
-    from vllm_ascend.quantization.methods.w2a8.vq2a8_gs32_staged import quantize_mxfp8_k32, staged_swiglu
+    from tests.support.vq2a8_oracle import quantize_mxfp8_k32, staged_swiglu
+    from vllm_ascend.ops.fused_moe.vq2a8_gs32_activation import finish_full_ffn, prepare_unchecked
 
     assert torch.npu.is_available(), "Explicit activation tests require a real Ascend NPU."
     # This is a required independent oracle for explicitly requested hardware
@@ -45,8 +44,8 @@ def activation_runtime(request):
     return SimpleNamespace(
         torch=torch,
         device=device,
-        prepare=prepare,
-        finite=require_finite_fused,
+        prepare=prepare_unchecked,
+        finish=finish_full_ffn,
         strict_quantize=quantize_mxfp8_k32,
         strict_swiglu=staged_swiglu,
         reference=reference,
@@ -65,13 +64,14 @@ def compare_activation(runtime, host_inputs, *, raw_gate=None, check_strict=True
     (hidden,) = host_inputs
     expected_data, expected_scale = runtime.reference.quantize_h(hidden.float().numpy())
     device_inputs = tuple(value.to(runtime.device) for value in host_inputs)
-    device_raw = None if raw_gate is None else raw_gate.to(runtime.device)
-    actual_data, actual_scale = runtime.prepare(*device_inputs, raw_gate=device_raw)
+    assert raw_gate is None
+    actual_data, actual_scale, flags = runtime.prepare(*device_inputs)
+    assert bool(flags.cpu().all())
     torch.npu.synchronize()
     np.testing.assert_array_equal(actual_data.cpu().numpy(), expected_data.view(np.uint8))
     np.testing.assert_array_equal(actual_scale.cpu().numpy(), expected_scale)
     if check_strict:
-        strict_data, strict_scale = runtime.strict_quantize(device_inputs[0])
+        strict_data, strict_scale = runtime.strict_quantize(hidden.cpu())
         assert torch.equal(actual_data.cpu(), strict_data.cpu())
         assert torch.equal(actual_scale.cpu(), strict_scale.cpu())
     return actual_data, actual_scale
@@ -147,96 +147,6 @@ def test_gs32_fused_activation_mixed_ties_and_e8m0_boundaries(activation_runtime
     )
 
 
-@pytest.mark.parametrize("limit", [0.0, 10.0])
-def test_gs32_fused_activation_down_preserves_original_swiglu_rounding(activation_runtime, limit):
-    runtime, torch = activation_runtime, activation_runtime.torch
-    generator = torch.Generator(device="cpu").manual_seed(791)
-    gate = (torch.randn(6, 128, generator=generator) * torch.arange(1, 7)[:, None] * 3).bfloat16()
-    gate[:, 0], gate[:, 64] = -20, -30
-    gate[:, 1], gate[:, 65] = 20, 30
-    # SwiGLU remains the SAME Torch/NPU arithmetic; fusion starts after its
-    # mandated BF16 round. CPU quantization then independently checks bytes.
-    middle = runtime.strict_swiglu(gate.to(runtime.device), limit).cpu()
-    compare_activation(runtime, (middle,), raw_gate=gate)
-
-
-@pytest.mark.parametrize(
-    "fault",
-    [
-        "input_nan",
-        "input_inf",
-        "swiglu_overflow",
-        "raw_gate_inf",
-    ],
-)
-def test_gs32_fused_activation_invalid_data_never_reaches_projection(activation_runtime, fault):
-    runtime, torch = activation_runtime, activation_runtime.torch
-    (hidden,) = activation_inputs(runtime, 3, 64)
-    raw_gate = None
-    if fault in ("input_nan", "input_inf"):
-        hidden[2, 17] = float("nan") if fault == "input_nan" else float("inf")
-    elif fault == "swiglu_overflow":
-        raw_gate = torch.full((3, 128), torch.finfo(torch.bfloat16).max, dtype=torch.bfloat16)
-        gate, up = raw_gate.to(runtime.device).float().chunk(2, dim=-1)
-        hidden = (torch.nn.functional.silu(gate) * up).bfloat16().cpu()
-        assert not torch.isfinite(hidden).all()
-    else:
-        raw_gate = torch.zeros(3, 128, dtype=torch.bfloat16)
-        raw_gate[2, 17] = float("inf")
-        # Gate clamping could make the arithmetic finite. Its original
-        # nonfinite input must remain an error instead of being hidden.
-        gate, up = raw_gate.to(runtime.device).float().chunk(2, dim=-1)
-        hidden = (torch.nn.functional.silu(gate.clamp(max=10)) * up.clamp(-10, 10)).bfloat16().cpu()
-        assert torch.isfinite(hidden).all()
-    device_inputs = tuple(value.to(runtime.device) for value in (hidden,))
-    native_consumed = []
-    with pytest.raises(ValueError, match="finite|invalid"):
-        prepared = runtime.prepare(*device_inputs, raw_gate=None if raw_gate is None else raw_gate.to(runtime.device))
-        native_consumed.append(prepared)
-    assert native_consumed == []
-    torch.npu.synchronize()
-    # An error flag is local to a launch and must not poison the next request.
-    compare_activation(runtime, activation_inputs(runtime, 3, 64))
-
-
-def test_gs32_fused_activation_output_holes_and_empty_dispatch(activation_runtime):
-    runtime, torch = activation_runtime, activation_runtime.torch
-    output = torch.full((3, 128), float("nan"), dtype=torch.bfloat16, device=runtime.device)
-    output.flatten()[:-1].fill_(1)
-    with pytest.raises(ValueError, match="partial native output"):
-        runtime.finite(output, "partial native output")
-    output.fill_(1)
-    runtime.finite(output, "complete native output")
-    empty = tuple(value.to(runtime.device) for value in activation_inputs(runtime, 0, 64))
-    data, scale = runtime.prepare(*empty)
-    assert data.shape == (0, 64) and scale.shape == (0, 2)
-    assert data.dtype == scale.dtype == torch.uint8
-
-
-@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16", "float32"])
-def test_gs32_finite_runtime_lengths_mask_tails_and_recover(activation_runtime, dtype_name):
-    runtime, torch = activation_runtime, activation_runtime.torch
-    timings = []
-    # Run in one process: lengths within/across tile boundaries must reuse the
-    # runtime-size kernel. Timings include the intentional eager flag transfer.
-    for elements in (1, 1023, 1024, 1025, 2047, 2048, 2049, 1025):
-        padded = ((elements + 1023) // 1024) * 1024
-        storage = torch.full((padded,), float("nan"), dtype=getattr(torch, dtype_name), device=runtime.device)
-        output = storage[:elements]
-        output.fill_(1)
-        torch.npu.synchronize()
-        start = perf_counter()
-        runtime.finite(output, "runtime-length output")
-        timings.append({"elements": elements, "seconds": perf_counter() - start})
-        for invalid in (float("nan"), float("inf")):
-            output[-1] = invalid
-            with pytest.raises(ValueError, match="runtime-length output"):
-                runtime.finite(output, "runtime-length output")
-            output[-1] = 1
-            runtime.finite(output, "recovered runtime-length output")
-    print("GS32_DYNAMIC_FINITE " + json.dumps({"dtype": dtype_name, "timings": timings}), flush=True)
-
-
 def test_gs32_fused_activation_nondefault_stream_repeated_fresh_values(activation_runtime):
     runtime, torch = activation_runtime, activation_runtime.torch
     stream = torch.npu.Stream(device=runtime.device)
@@ -252,53 +162,153 @@ def test_gs32_fused_activation_nondefault_stream_repeated_fresh_values(activatio
 def test_source_v3_mxfp4_activation_uses_natural_columns(activation_runtime):
     runtime = activation_runtime
     (hidden,) = activation_inputs(runtime, 8, 4096)
-    actual, actual_scale = runtime.prepare(hidden.to(runtime.device))
+    actual, actual_scale, flags = runtime.prepare(hidden.to(runtime.device))
+    assert bool(flags.cpu().all())
     expected, expected_scale = runtime.reference.quantize_h(hidden.float().numpy())
     np.testing.assert_array_equal(actual.cpu().numpy(), expected.view(np.uint8))
     np.testing.assert_array_equal(actual_scale.cpu().numpy(), expected_scale)
 
 
-@pytest.mark.parametrize("rows,width", [(1, 64), (3, 96), (8, 2048)])
-@pytest.mark.parametrize("limit", [0.0, 10.0])
-def test_swiglu_prepare_fusion_matches_same_npu_staged_bytes(activation_runtime, rows, width, limit):
-    """A hardware acceptance test, not an assumption of bit-identical SiLU."""
+@pytest.mark.parametrize("capacity", [7, 129])
+def test_identity_activation_graph_masks_nan_padding_and_recovers(activation_runtime, capacity):
     runtime, torch = activation_runtime, activation_runtime.torch
-    generator = torch.Generator(device="cpu").manual_seed(795)
-    raw = (torch.randn(rows, 2 * width, generator=generator) * 20).bfloat16()
-    # Include max/clip boundaries, very negative gates, and signed zero.
-    raw[:, :8] = torch.tensor([-100, -20, -10, -0.0, 0.0, 10, 20, 40])
-    raw[:, width : width + 8] = torch.tensor([30, -30, 10, -0.0, 0.0, -10, 30, 1.7578125])
-    raw = raw.to(runtime.device)
-    middle = runtime.strict_swiglu(raw, limit)
-    expected = runtime.prepare(middle, raw_gate=raw)
-    actual = runtime.prepare(raw, swiglu_limit=limit)
-    # E8M0/FP8 are discrete outputs: report byte mismatches instead of hiding
-    # a possible sigmoid rounding change behind a floating-point tolerance.
-    for label, found, reference in zip(("FP8", "E8M0"), actual, expected, strict=True):
-        found, reference = found.cpu(), reference.cpu()
-        different = int((found != reference).sum())
-        assert different == 0, f"Fused SwiGLU {label} differs in {different}/{found.numel()} bytes from Torch/NPU"
+    hidden = torch.ones(capacity, 64, dtype=torch.bfloat16, device=runtime.device)
+    metadata = torch.tensor([capacity, 1], dtype=torch.int64, device=runtime.device)
+    route_flags = torch.ones(1, dtype=torch.int32, device=runtime.device)
+
+    def forward():
+        return runtime.prepare(hidden, route_flags=route_flags, route_metadata=metadata)
+
+    for _ in range(2):
+        forward()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        data, scales, flags = forward()
+    addresses = tuple(value.data_ptr() for value in (data, scales, flags))
+    for live, meta_valid, route_valid, active_nan in (
+        (1, 1, 1, False),
+        (0, 1, 1, False),
+        (capacity, 1, 1, False),
+        (1, 1, 1, True),
+        (-1, 1, 1, False),
+        (capacity + 1, 1, 1, False),
+        (1, 0, 1, False),
+        (1, 1, 0, False),
+        (2, 1, 1, False),
+    ):
+        host = torch.full((capacity, 64), float("nan"), dtype=torch.bfloat16)
+        bounded = max(0, min(capacity, live))
+        host[:bounded] = -0.1875
+        if active_nan and bounded:
+            host[0, 0] = float("nan")
+        hidden.copy_(host)
+        metadata.copy_(torch.tensor([live, meta_valid], dtype=torch.int64))
+        route_flags.fill_(route_valid)
+        graph.replay()
+        torch.npu.synchronize()
+        valid = meta_valid == route_valid == 1 and 0 <= live <= capacity and not active_nan
+        assert bool(flags.cpu().all()) == valid
+        assert addresses == tuple(value.data_ptr() for value in (data, scales, flags))
+        if valid:
+            safe = torch.zeros_like(host)
+            safe[:live] = host[:live]
+            expected_data, expected_scale = runtime.strict_quantize(safe)
+            expected_scale[live:] = 127
+            assert torch.equal(data.cpu(), expected_data)
+            assert torch.equal(scales.cpu(), expected_scale)
 
 
-@pytest.mark.parametrize("fault", ["gate_nan", "gate_inf", "up_inf", "fp32_overflow", "bf16_overflow"])
-def test_swiglu_prepare_fusion_rejects_before_clamp_and_both_rounding_overflows(activation_runtime, fault):
+@pytest.mark.parametrize("capacity,width", [(7, 64), (129, 4097)])
+def test_finish_full_ffn_graph_checks_all_states_and_recovers(activation_runtime, capacity, width):
     runtime, torch = activation_runtime, activation_runtime.torch
-    raw = torch.ones(3, 128, dtype=torch.bfloat16)
-    limit = 10.0
-    if fault == "gate_nan":
-        raw[2, 7] = float("nan")
-    elif fault == "gate_inf":
-        raw[2, 7] = float("inf")
-    elif fault == "up_inf":
-        raw[2, 64 + 7] = -float("inf")
-    elif fault == "fp32_overflow":
-        limit = 0.0
-        raw[2, 7] = raw[2, 64 + 7] = torch.finfo(torch.bfloat16).max
-    else:
-        limit = 0.0
-        raw[2, 7], raw[2, 64 + 7] = 181.0 * 2**56, 181.0 * 2**57
-    with pytest.raises(ValueError, match="finite|invalid"):
-        runtime.prepare(raw.to(runtime.device), swiglu_limit=limit)
-    data, scales = runtime.prepare(torch.ones_like(raw, device=runtime.device), swiglu_limit=limit)
-    assert torch.isfinite(data.view(torch.float8_e4m3fn).float()).all()
-    assert ((scales >= 1) & (scales <= 254)).all()
+    output = torch.ones(capacity, width, dtype=torch.bfloat16, device=runtime.device)
+    middle_scales = torch.full((capacity, 2), 127, dtype=torch.uint8, device=runtime.device)
+    input_flags = torch.ones(capacity, dtype=torch.int32, device=runtime.device)
+    route_flags = torch.ones(1, dtype=torch.int32, device=runtime.device)
+    native_flags = torch.ones_like(route_flags)
+    metadata = torch.tensor([capacity - 1, 1], dtype=torch.int64, device=runtime.device)
+    validity = torch.zeros((), dtype=torch.bool, device=runtime.device)
+    inputs = (output, middle_scales, input_flags, route_flags, native_flags, metadata, validity)
+    for _ in range(2):
+        runtime.finish(*inputs)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        block_flags = runtime.finish(*inputs)
+    pointers = tuple(value.data_ptr() for value in (*inputs, block_flags))
+    faults = (
+        "none",
+        "live_nan",
+        "live_inf",
+        "scale255",
+        "padding_scale255",
+        "input",
+        "padding_input",
+        "route",
+        "native",
+        "metadata",
+        "negative_live",
+        "oversized_live",
+        "empty",
+    )
+    for fault in faults:
+        # Replay every fault followed by a clean request: status must overwrite
+        # previous success and failure, and padding must not be read.
+        for case in (fault, "none"):
+            live = capacity - 1
+            output.fill_(2)
+            output[-1].fill_(float("nan"))
+            middle_scales.fill_(127)
+            input_flags.fill_(1)
+            route_flags.fill_(1)
+            native_flags.fill_(1)
+            validity.fill_(True)
+            if case in ("live_nan", "live_inf"):
+                output[0, 0] = float("nan" if case == "live_nan" else "inf")
+            if case in ("scale255", "padding_scale255"):
+                middle_scales[-1 if case == "padding_scale255" else 0, 0] = 255
+            if case in ("input", "padding_input"):
+                input_flags[-1 if case == "padding_input" else 0] = 0
+            if case == "route":
+                route_flags.zero_()
+            if case == "native":
+                native_flags.zero_()
+            if case == "negative_live":
+                live = -1
+            if case == "oversized_live":
+                live = capacity + 1
+            if case == "empty":
+                live = 0
+                output.fill_(float("nan"))
+            metadata.copy_(torch.tensor([live, 0 if case == "metadata" else 1], dtype=torch.int64))
+            graph.replay()
+            torch.npu.synchronize()
+            assert bool(validity.cpu()) == (case in ("none", "empty"))
+            result = output.cpu()
+            assert bool(torch.isfinite(result).all())
+            if case in ("route", "native", "metadata", "negative_live", "oversized_live", "empty"):
+                assert not result.count_nonzero()
+            else:
+                assert not result[-1].count_nonzero()
+                if case in ("live_nan", "live_inf"):
+                    assert result[0, 0] == 0
+                else:
+                    assert bool((result[:-1] == 2).all())
+            assert pointers == tuple(value.data_ptr() for value in (*inputs, block_flags))
+
+
+@pytest.mark.parametrize("size", [1, 1024, 1025, 2050])
+def test_full_ffn_validity_reduction_device_tile_boundaries(activation_runtime, size):
+    from vllm_ascend.ops.triton.activation.vq2a8_gs32 import _reduce_full_ffn_validity_kernel
+
+    runtime, torch = activation_runtime, activation_runtime.torch
+    flags = torch.ones(size, dtype=torch.int32, device=runtime.device)
+    validity = torch.zeros((), dtype=torch.bool, device=runtime.device)
+    for bad_index in (None, 0, size - 1, None):
+        flags.fill_(1)
+        if bad_index is not None:
+            flags[bad_index] = 0
+        validity.fill_(bad_index is not None)
+        _reduce_full_ffn_validity_kernel[(1,)](flags, validity, FLAGS=size, BLOCK=1024)
+        assert bool(validity.cpu()) == (bad_index is None)

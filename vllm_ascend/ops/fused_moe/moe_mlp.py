@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+from vllm_ascend.quantization.quant_type import QuantType
 
 
 def apply_moe_mlp(
@@ -32,6 +33,25 @@ def apply_moe_mlp(
     Unified MoE MLP entry.
     Quant path is dispatched by each FusedMoEMethod with explicit typed kernel flags.
     """
+
+    if mlp_compute_input.quant.quant_type == QuantType.VQ2A8:
+        vq2a8 = mlp_compute_input.weights.vq2a8
+        if vq2a8 is None:
+            raise ValueError("VQ2A8 expert payload is required.")
+        if (
+            mlp_compute_input.dynamic_scale is not None
+            or mlp_compute_input.dynamic_eplb
+            or mlp_compute_input.lora_context is not None
+        ):
+            raise ValueError("VQ2A8 requires BF16 dispatch without EPLB or LoRA.")
+        if getattr(mlp_compute_input.activation, "value", mlp_compute_input.activation) != "silu":
+            raise ValueError("VQ2A8 experts currently support silu activation only.")
+        return vq2a8.apply(
+            mlp_compute_input.hidden_states,
+            mlp_compute_input.group_list,
+            mlp_compute_input.group_list_type,
+            mlp_compute_input.swiglu_limit,
+        )
 
     # When LoRA adapter is used in quantized weight, use individual lora impl.
     if mlp_compute_input.quant.is_quant and mlp_compute_input.lora_context is not None:

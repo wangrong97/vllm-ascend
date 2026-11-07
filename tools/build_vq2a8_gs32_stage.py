@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Build the GS32 projection/full-FFN Torch adapter around a matching mixed ELF."""
+"""Build the GS32 full-FFN Torch adapter around a matching ABI v3 mixed ELF."""
 
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ from tools.vq2a8_live_log import LiveChildLog
 REPO = Path(__file__).resolve().parents[1]
 SOURCE = REPO / "csrc/vq2a8_gs32_stage"
 BINDING = SOURCE / "torch_binding.cpp"
+COUNTS_WRAPPER = REPO / "vllm_ascend/ops/fused_moe/vq2a8_gs32_counts.py"
+COUNTS_KERNEL = REPO / "vllm_ascend/ops/triton/activation/vq2a8_gs32_counts.py"
 MIXED_SOURCE = REPO / "csrc/mixed_w2w4_moe_ffn"
 TARGET = "vq2a8_gs32_stage"
 LIBRARY_NAME = f"lib{TARGET}.so"
@@ -51,11 +53,7 @@ def _runtime_helpers():
     return (
         module.FULL_FFN_ABI_VERSION,
         module.KERNEL_ENTRY,
-        module.REQUIRED_BATCHED_SCHEMAS,
-        module.REQUIRED_DEVICE_SCHEMAS,
         module.REQUIRED_FULL_FFN_SCHEMAS,
-        module.REQUIRED_FUSED_SCHEMAS,
-        module.REQUIRED_SERIAL_SCHEMAS,
         module.kernel_evidence,
         module.sha256,
         module.verify_registered_device_schemas,
@@ -66,11 +64,7 @@ def _runtime_helpers():
 (
     FULL_FFN_ABI_VERSION,
     KERNEL_ENTRY,
-    REQUIRED_BATCHED_SCHEMAS,
-    REQUIRED_DEVICE_SCHEMAS,
     REQUIRED_FULL_FFN_SCHEMAS,
-    REQUIRED_FUSED_SCHEMAS,
-    REQUIRED_SERIAL_SCHEMAS,
     kernel_evidence,
     sha256,
     verify_registered_device_schemas,
@@ -78,43 +72,47 @@ def _runtime_helpers():
 ) = _runtime_helpers()
 
 
-def verify_loaded_library(library, execution="full_graph", fusion="none", binary=None):
+def register_counts_implementation():
+    # Standalone registration must not import ops/__init__.py, which registers
+    # unrelated model operators. The wrapper itself imports only Torch; its
+    # Triton kernel remains lazy until actual device route preparation.
+    spec = importlib.util.spec_from_file_location("vq2a8_gs32_counts_build", COUNTS_WRAPPER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+
+def verify_loaded_library(library, execution="full_graph", fusion="full_ffn", binary=None):
     """Run in a fresh process so an earlier .so cannot mask stale registration."""
+    if execution not in ("fused", "full_graph"):
+        raise ValueError(f"Unsupported GS32 execution mode: {execution}; use fused or full_graph")
+    if fusion != "full_ffn":
+        raise ValueError(f"Unsupported GS32 fusion mode: {fusion}; only full_ffn is supported")
+    if binary is None:
+        raise ValueError("Full FFN preflight requires the kernel binary path")
+    verify_runtime_artifacts(library, binary)
+
     import torch
     import torch_npu  # noqa: F401
 
-    if fusion == "full_ffn":
-        if binary is None:
-            raise ValueError("Full FFN preflight requires the kernel binary path")
-        verify_runtime_artifacts(library, binary, require_full_ffn=True)
     torch.ops.load_library(str(Path(library).resolve(strict=True)))
-    if binary is not None and fusion != "full_ffn":
-        namespace = getattr(torch.ops, "vq2a8_gs32_stage", None)
-        abi_version = getattr(namespace, "full_ffn_abi_version", None)
-        if abi_version is not None:
-            if abi_version() != FULL_FFN_ABI_VERSION:
-                raise ValueError("GS32 bridge has an unsupported mixed-kernel ABI; rebuild the runtime")
-            # ABI v3 renamed every stage entry, including projection-only
-            # launches. Retain old .so/.o pairs for explicit legacy execution,
-            # while rejecting a new bridge paired with an old kernel early.
-            kernel_evidence(binary, require_abi=True)
-    if fusion == "none":
-        return verify_registered_device_schemas(torch, execution)
+    register_counts_implementation()
     return verify_registered_device_schemas(torch, execution, fusion)
 
 
 def verify_library_schemas(library, log):
     # Import/load/query only: no initialize(), device selection, allocation,
     # kernel launch or graph capture. This can run while an NPU is occupied.
+    # The manifest is not finalized until this build-time registration check
+    # passes. Runtime preflight separately verifies the completed artifact pair.
     command = [
         sys.executable,
         "-c",
         "import json, sys\n"
-        "from tools.build_vq2a8_gs32_stage import verify_loaded_library\n"
-        "from tools.build_vq2a8_gs32_stage import verify_registered_device_schemas\n"
-        "verify_loaded_library(sys.argv[1])\n"
-        "import torch\n"
-        "print(json.dumps(verify_registered_device_schemas(torch, fusion='full_ffn'), sort_keys=True))\n",
+        "from tools.build_vq2a8_gs32_stage import register_counts_implementation, verify_registered_device_schemas\n"
+        "import torch, torch_npu\n"
+        "torch.ops.load_library(sys.argv[1])\n"
+        "register_counts_implementation()\n"
+        "print(json.dumps(verify_registered_device_schemas(torch), sort_keys=True))\n",
         str(library.resolve()),
     ]
     print(f"GS32_STAGE_BUILD_STAGE=schema LOG={log}", flush=True)
@@ -134,6 +132,8 @@ def verify_library_schemas(library, log):
 def source_hashes():
     required = (
         BINDING,
+        COUNTS_WRAPPER,
+        COUNTS_KERNEL,
         MIXED_SOURCE / "mixed_tiling.h",
         MIXED_SOURCE / "tiling_builders.h",
         *sorted((MIXED_SOURCE / "components").rglob("*tiling*.h")),
@@ -481,7 +481,10 @@ def build(args):
             flush=True,
         )
         if cross:
-            print("Run verify_loaded_library() on the target x86/ARM Linux before NPU validation.", flush=True)
+            print(
+                "Run verify_loaded_library(library, binary=kernel) on the target x86/ARM Linux before NPU validation.",
+                flush=True,
+            )
         return 0
     except Exception as exc:
         report.update(status="failed", error=str(exc))

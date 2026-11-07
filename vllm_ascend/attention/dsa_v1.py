@@ -1946,6 +1946,12 @@ class AscendDSAImpl(AttentionImplBase[Any]):
     ):
         """Run the MLA prolog on the current stream."""
         share_hs_quant = _is_w8a8_dynamic(self.wq_a) and _is_w8a8_dynamic(self.wkv)
+        share_hs_mxfp8 = (
+            write_swa_cache
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and self.cv_wq_a.can_share_mxfp8_input(self.cv_wkv)
+        )
         if share_hs_quant:
             hs_int8, hs_pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
             q_a = torch_npu.npu_quant_matmul(
@@ -1956,6 +1962,9 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 bias=self.wq_a.bias,
                 output_dtype=hidden_states.dtype,
             )
+        elif share_hs_mxfp8:
+            hs_fp8, hs_mx_scale = self.cv_wq_a.quantize(hidden_states)
+            q_a = self.cv_wq_a.matmul(hs_fp8, hs_mx_scale, bias=None if self.wq_a.skip_bias_add else self.wq_a.bias)
         else:
             q_a = self.wq_a(hidden_states)
 
@@ -1974,8 +1983,24 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             ).unflatten(-1, (self.n_local_heads, self.head_dim))
         else:
             qr = self.q_norm(q_a)
-            q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-            qr_pertoken_scale = None
+            share_qr_mxfp8 = (
+                qr.dtype == torch.bfloat16
+                and qr.ndim == 2
+                and self.compress_ratio == 4
+                and self.indexer is not None
+                and not self.indexer.skip_topk
+                and self.cv_wq_b.can_share_mxfp8_input(self.indexer.cv_wq_b)
+            )
+            if share_qr_mxfp8:
+                # Only the compatible indexer consumes qr after this prolog.
+                # Reuse its existing quantized-qr/scale contract within this forward.
+                qr, qr_pertoken_scale = self.cv_wq_b.quantize(qr)
+                q = self.cv_wq_b.matmul(
+                    qr, qr_pertoken_scale, bias=None if self.wq_b.skip_bias_add else self.wq_b.bias
+                ).unflatten(-1, (self.n_local_heads, self.head_dim))
+            else:
+                q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+                qr_pertoken_scale = None
         q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
 
         torch.ops._C_ascend.inplace_partial_rotary_mul(
@@ -1997,6 +2022,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                     bias=self.wkv.bias,
                     output_dtype=hidden_states.dtype,
                 )
+            elif share_hs_mxfp8:
+                kv = self.cv_wkv.matmul(hs_fp8, hs_mx_scale, bias=None if self.wkv.skip_bias_add else self.wkv.bias)
             else:
                 kv = self.wkv(hidden_states)
             kv = self.kv_norm(kv)

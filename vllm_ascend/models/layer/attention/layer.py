@@ -14,12 +14,11 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 # from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
-from vllm_ascend.attention.dsa_attn_kv_plan import is_a5_bf16_kv_enabled
+from vllm_ascend.attention.dsa_attn_kv_plan import get_dsv4_attn_kv_dtype, is_a5_bf16_kv_enabled
 from vllm_ascend.attention.dsa_v1 import (
     AscendDSAC4Backend,
     AscendDSAC128Backend,
@@ -191,13 +190,15 @@ class DSAAttention(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         if self.compress_ratio <= 1:  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
-        kv_cache_dtype = kv_cache_dtype_str_to_dtype(self.kv_cache_dtype, vllm_config.model_config)
         if is_turboquant(vllm_config):
             kv_cache_dtype = torch.uint8 if self.compress_ratio == 4 else torch.bfloat16
-        use_bf16_kv = is_a5_bf16_kv_enabled(vllm_config)
+        else:
+            kv_cache_dtype = get_dsv4_attn_kv_dtype(vllm_config)
         has_compressed_cache = get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
 
-        cached_head_size = self.head_size + 96 if has_compressed_cache and not use_bf16_kv else self.head_size
+        cached_head_size = (
+            self.head_size + 96 if has_compressed_cache and kv_cache_dtype == torch.float8_e4m3fn else self.head_size
+        )
         if is_turboquant(vllm_config) and self.compress_ratio == 4:
             cached_head_size = SLOT_BYTES
         storage_block_size = dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][0][0]

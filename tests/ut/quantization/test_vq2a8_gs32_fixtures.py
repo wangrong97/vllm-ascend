@@ -84,7 +84,7 @@ def modules(monkeypatch):
 
 def serving_config():
     return SimpleNamespace(
-        additional_config={},
+        additional_config={"vq2a8": {"gs32_execution": "fused"}},
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
@@ -111,7 +111,7 @@ def source_layer_spec(modules, ids=(0, 1, 2, 3), hidden=128, intermediate=64):
         {"gate_up": GS32ProjectionSpec(2 * intermediate, hidden), "down": GS32ProjectionSpec(hidden, intermediate)},
         {
             "gate_up": {expert: "vq2" if expert % 4 < 2 else "mxfp4" for expert in ids},
-            "down": {expert: "vq2" if expert % 2 == 0 else "mxfp4" for expert in ids},
+            "down": {expert: "vq2" if expert % 4 == 0 else "mxfp4" for expert in ids},
         },
     )
 
@@ -130,10 +130,8 @@ def source_field(spec, quant_type, field, expert=0):
 
 
 def source_parameters(modules, spec, moe_config=None):
-    # These fixtures exercise the independent staged baseline, including the
-    # W4+W2 diagnostic combination not supported by the complete-FFN kernel.
     scheme = modules.method.AscendGS32FusedMoEScheme(
-        spec, native_options={"gs32_fusion": "none"}, moe_config=moe_config
+        spec, native_options={"gs32_execution": "fused"}, moe_config=moe_config
     )
     count = len(spec.expert_ids) if moe_config is None else moe_config.num_local_experts
     tensors = scheme.get_weight(count, spec.specs["down"].columns, spec.specs["down"].rows, torch.bfloat16)

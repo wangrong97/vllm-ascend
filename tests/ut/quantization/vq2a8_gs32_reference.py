@@ -12,12 +12,12 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from vllm_ascend.quantization.methods.w2a8.vq2a8_gs32_staged import (
+from tests.support.vq2a8_oracle import (
     MX_GROUP,
     quantize_mxfp8_k32,
     require_finite,
 )
-from vllm_ascend.quantization.methods.w2a8.vq2a8_gs32_staged import (
+from tests.support.vq2a8_oracle import (
     staged_swiglu as staged_swiglu,
 )
 

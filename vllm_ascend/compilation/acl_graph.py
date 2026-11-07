@@ -61,6 +61,7 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    num_replays: int = 0
 
 
 class ACLGraphWrapper:
@@ -299,6 +300,7 @@ class ACLGraphWrapper:
         else:
             entry.aclgraph.replay()
         logger.info_once("ACL graph replay is active (logged once).")
+        entry.num_replays += 1
         return entry.output
 
     def _updatable_graph_replay(

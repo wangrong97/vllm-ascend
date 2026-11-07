@@ -73,8 +73,8 @@ python -m pip install --only-binary=:all: --no-deps "pyarrow==25.0.1"
 ## 指定 NPU 卡并启动精度评测服务
 
 在终端 A 使用 **物理卡 4、5、6、7，native、MRV2、TP4/EP4、DP1、B64 decode 图、fusion=full_ffn** 启动服务。
-首次升级先按[完整 FFN ABI v3 重建](packed_weight_batch_throughput.md#0-首次升级完整-ffn重建-abi-v3)一起构建 `.o/.so`。
-卡号按实际空闲四卡调整；`BUILD` 指向已有且与当前分支匹配的 `.so` 和 `.o` 所在目录。
+更新后按[完整 FFN 构建说明](packed_weight_batch_throughput.md#0-首次升级完整-ffn重建-abi-v3)重建桥接库及清单，使用兼容 ABI v3 的设备对象。
+卡号按实际空闲四卡调整；`BUILD` 指向含 `build-manifest.json`、`.so` 和 `.o` 的匹配产物目录。
 下面为精度评测配置 **262144（256K）总上下文、8192 prefill chunk**，为每题最多 128K 输出保留输入空间：
 
 ```bash
@@ -96,12 +96,8 @@ VLLM_USE_V2_MODEL_RUNNER=1 VLLM_USE_BREAKABLE_CUDAGRAPH=0 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 python -u tools/serve_vq2a8.py \
   --model "$MODEL" --no-dspark \
-  --gs32-backend native \
-  --gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
-  --gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o" \
+  --gs32-runtime-dir "$BUILD" \
   --parallel-mode tp-ep --ep-size 4 \
-  --gs32-execution full_graph \
-  --gs32-fusion full_ffn \
   --max-model-len 262144 \
   --max-num-batched-tokens 8192 \
   --max-num-seqs 64 \
@@ -132,12 +128,9 @@ B64 是活动序列上限，不保证 64 条请求都能同时占满 256K 上下
 [无 perm 混精四卡吞吐服务](packed_weight_batch_throughput.md) 使用 8192 上下文，需按本节改为 262144 并重启，
 才能接收下面的 131072 输出预算。评测期间不要同时在相同卡上运行性能或 NPU CI 测试。
 
-测同一权重的 reference 精度时，复用本节启动命令：将 `--gs32-backend native` 改为
-`--gs32-backend reference_mxfp8`，移除 `--gs32-library` 和 `--gs32-binary` 两项及保存 `gs32-files.sha256` 的命令，将端口改为 `8004`，
-并将 `--gs32-fusion full_ffn` 改为 `--gs32-fusion none`，日志目录名中的 `native` 改为 `reference`。
-其余拓扑、上下文、B64 和 `--no-dspark` 保持一致。
-客户端复用下方脚本，将 `--base-url` 改为 `http://127.0.0.1:8004`，标签中的 `native-full-ffn` 改为 `reference_mxfp8-none`。
-同一组卡上两种后端依次测试；后文可选的官方 baseline 也使用 8004，需分开启动。
+生产入口仅保留完整 FFN。需要检查 eager/graph 差异时，在上述启动命令添加 `--enforce-eager`，
+重建服务记录并保持其余评测参数一致。独立数值 oracle 仅用于 [NPU 回归](vq2a8_npu_ci.md)，不作为服务后端。
+后文可选的官方 baseline 仍是独立模型服务；同一组卡上的服务依次启动。
 
 终端 B 等待服务就绪并检查名称：
 

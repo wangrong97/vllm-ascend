@@ -28,7 +28,7 @@ class Mode(Enum):
 @pytest.fixture
 def runner():
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
-    tree = ast.parse(path.read_text())
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
     names = {"_determine_batch_execution_and_padding"}
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
@@ -52,7 +52,7 @@ def runner():
     result.model_config = NS(is_encoder_decoder=False, is_hybrid=False, quantization="vq2a8")
     result.vllm_config = NS(
         quant_config=NS(is_gs32=True),
-        additional_config={"vq2a8": {"gs32_execution": "full_graph", "gs32_fusion": "none"}},
+        additional_config={"vq2a8": {"gs32_execution": "full_graph", "gs32_fusion": "full_ffn"}},
         parallel_config=NS(data_parallel_size=1),
         observability_config=NS(cudagraph_metrics=False),
     )
@@ -94,7 +94,7 @@ def test_decode_graph_dispatch_after_long_chunked_prefill(runner, computed, toke
 
 def _load_methods(filename, class_name, names, scope):
     path = Path(__file__).resolve().parents[3] / filename
-    tree = ast.parse(path.read_text())
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
     cls.bases = []

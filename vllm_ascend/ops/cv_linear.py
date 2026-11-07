@@ -9,6 +9,8 @@ from vllm_ascend.quantization.methods import (
     AscendW8A8MXFP8DynamicLinearMethod,
 )
 
+MXFP8_INPUT_GROUP_SIZE = 32
+
 
 class CVLinearWrapper:
     """
@@ -117,6 +119,37 @@ class CVLinearWrapper:
             return quantized_x, pertoken_scale
 
         return x, None
+
+    def can_share_mxfp8_input(self, other) -> bool:
+        """Whether both projections consume the same unpadded MXFP8 input.
+
+        Sharing must not bypass TP communication or mix quantization policies.
+        The caller must also preserve the input/output dtype and token shape.
+        """
+        if (
+            not isinstance(other, CVLinearWrapper)
+            or self._has_communication
+            or other._has_communication
+            or not self._is_mxfp8_dynamic
+            or not other._is_mxfp8_dynamic
+        ):
+            return False
+        first, second = self._mxfp8_quant_method, other._mxfp8_quant_method
+        width = getattr(self.linear, "input_size", 0)
+        return (
+            first.group_size == second.group_size == MXFP8_INPUT_GROUP_SIZE
+            and first.dynamic_mx_quant_scale_alg == second.dynamic_mx_quant_scale_alg
+            and width > 0
+            and width % MXFP8_INPUT_GROUP_SIZE == 0
+            and width == getattr(other.linear, "input_size", None)
+            and all(
+                getattr(wrapper.linear, "input_size_per_partition", width) == width
+                and getattr(wrapper.linear, "mxfp8_tp_padding", (0, 0)) == (0, 0)
+                and not getattr(wrapper.linear, "return_bias", False)
+                and wrapper.linear.weight.dtype == torch.float8_e4m3fn
+                for wrapper in (self, other)
+            )
+        )
 
     def matmul(self, quantized_x: torch.Tensor, pertoken_scale=None, bias=None):
         """

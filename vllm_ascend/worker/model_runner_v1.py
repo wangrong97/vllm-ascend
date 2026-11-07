@@ -2546,6 +2546,14 @@ class NPUModelRunner(GPUModelRunner):
         defer_kv_connector_finalize = self.speculative_config is not None and (
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
+        # This generation path always submits logits before publishing sampling
+        # state. Other callers retain the check at the end of _model_forward.
+        defer_quantization_validity = (
+            getattr(self, "_quantization_validity", None) is not None
+            and get_pp_group().is_last_rank
+            and not self.is_pooling_model
+            and not self.broadcast_pp_output
+        )
         active_device_metadata_executor = self._prepare_device_metadata_for_forward(cudagraph_mode)
         with (
             record_function_or_nullcontext("forward"),
@@ -2593,12 +2601,21 @@ class NPUModelRunner(GPUModelRunner):
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
             self._restore_c8_mxfp_loaded_v_scales(scheduler_output)
             hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                num_tokens_padded,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                # Other runner subclasses may forward unknown keywords to
+                # their models. Only the GS32 owner receives this option.
+                **({"defer_quantization_validity": True} if defer_quantization_validity else {}),
+                **model_kwargs,
             )
             self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
                 profiling_chunk_config,
                 execution_start_time,
             )
+            check_quantization_validity = defer_quantization_validity and not get_forward_context().capturing
             # Verify every scheduled layer executed its deferred copy.
             if self.cache_config.mamba_cache_mode == "align" and mamba_copy_connector is not None:
                 mamba_copy_connector.finish_mamba_state_copy()
@@ -2631,7 +2648,9 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = self._compute_logits(
+                    sample_hidden_states, check_quantization_validity=check_quantization_validity
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3188,6 +3207,17 @@ class NPUModelRunner(GPUModelRunner):
             "block_table": block_table.get_device_tensor(num_reqs),
         }
 
+    def _initialize_quantization_validity(self) -> None:
+        from vllm_ascend.ops.fused_moe.vq2a8_gs32 import initialize_quantization_validity
+
+        initialize_quantization_validity(
+            self,
+            breakable=(
+                self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                and breakable_cudagraph.is_breakable_cudagraph_enabled()
+            ),
+        )
+
     def _model_forward(
         self,
         num_tokens_padded: int,
@@ -3195,6 +3225,8 @@ class NPUModelRunner(GPUModelRunner):
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        *,
+        defer_quantization_validity: bool = False,
         **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
@@ -3203,6 +3235,11 @@ class NPUModelRunner(GPUModelRunner):
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             if hasattr(self.model, "set_attn_backend"):
                 self.model.set_attn_backend(self.attn_backend)
+
+        validity = getattr(self, "_quantization_validity", None)
+        if validity is not None:
+            # This runs outside ACLGraphWrapper, including on every replay.
+            validity.zero_()
 
         model_inputs: dict[str, Any] = {
             "input_ids": input_ids,
@@ -3256,7 +3293,29 @@ class NPUModelRunner(GPUModelRunner):
             if executor is not None and executor.submission_in_flight:
                 executor.release()
 
+        # Capture only records device writes. Eager/profile callers check here;
+        # normal generation may first submit LM Head, then check before sampling.
+        if not defer_quantization_validity and not forward_context.capturing:
+            self._check_quantization_validity()
         return hidden_states
+
+    def _check_quantization_validity(self) -> None:
+        from vllm_ascend.ops.fused_moe.vq2a8_gs32 import check_quantization_validity
+
+        if getattr(self, "_quantization_validity", None) is not None:
+            with record_function_or_nullcontext("quantization validity"):
+                check_quantization_validity(self)
+
+    def _compute_logits(
+        self, hidden_states: torch.Tensor, *, check_quantization_validity: bool = False
+    ) -> torch.Tensor | None:
+        with record_function_or_nullcontext("compute logits"):
+            logits = self.model.compute_logits(hidden_states)
+        # Even a None logits result must consume this forward's validity. A
+        # failed check never reaches execute_model_state or token sampling.
+        if check_quantization_validity:
+            self._check_quantization_validity()
+        return logits
 
     def _prepare_device_metadata_for_forward(
         self, cudagraph_runtime_mode: CUDAGraphMode
@@ -3324,6 +3383,7 @@ class NPUModelRunner(GPUModelRunner):
         return self.sync_and_slice_intermediate_tensors(
             num_tokens, intermediate_tensors, sync_self
         )
+
 
     def _determine_batch_execution_and_padding(
         self,
@@ -3906,6 +3966,113 @@ class NPUModelRunner(GPUModelRunner):
         self._maybe_eager_restore_copy_sfa_tails(attn_metadata)
         return attn_metadata, spec_decode_common_attn_metadata
 
+    @contextmanager
+    def _gs32_prefill_warmup(self, num_tokens: int):
+        """Borrow only the pages touched by a startup-only fresh prefill."""
+        if self.input_batch.num_reqs:
+            raise RuntimeError("GS32 startup prefill warmup requires an empty input batch.")
+        if not 0 < num_tokens <= min(self.max_num_tokens, self.max_model_len):
+            raise ValueError("GS32 startup prefill warmup exceeds the configured token capacity.")
+        torch.npu.synchronize()
+        # The worker supplies the scheduler's prefill budget. Exercise that
+        # shape rather than leaving larger requests to compile on first use.
+        # These capacities come from the common KV configuration, never from
+        # per-rank routing or expert inventory. All EP ranks choose the same N.
+        block_sizes = []
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            table = self.input_batch.block_table[gid]
+            table_capacity = table.block_table.cpu.shape[1] // table.blocks_per_phys_block
+            block_sizes.append(group.kv_cache_spec.block_size)
+            num_tokens = min(num_tokens, table_capacity * group.kv_cache_spec.block_size)
+        # DeepSeek-V4 groups can share the same physical cache storage. Borrow
+        # disjoint page ranges across groups, just as the shared allocator does.
+        available_blocks = max(self.kv_cache_config.num_blocks - 1, 0)
+        lower, upper = 0, num_tokens
+        while lower < upper:
+            candidate = (lower + upper + 1) // 2
+            if sum(cdiv(candidate, size) for size in block_sizes) <= available_blocks:
+                lower = candidate
+            else:
+                upper = candidate - 1
+        num_tokens = lower
+        if num_tokens < 1:
+            raise ValueError("GS32 startup prefill warmup requires at least one available KV page per group.")
+        tables = []
+        cache_views = []
+        first_block = 1
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            table = self.input_batch.block_table[gid]
+            num_blocks = cdiv(num_tokens, group.kv_cache_spec.block_size)
+            table_capacity = table.block_table.cpu.shape[1] // table.blocks_per_phys_block
+            end_block = first_block + num_blocks
+            if num_blocks > table_capacity or end_block > self.kv_cache_config.num_blocks:
+                raise ValueError("GS32 startup prefill warmup has insufficient KV pages or block-table capacity.")
+            tables.append((table, first_block, num_blocks, int(table.num_blocks_per_row[0])))
+            for name in group.layer_names:
+                caches = self.compilation_config.static_forward_context[name].kv_cache[0]
+                for cache in caches if isinstance(caches, (list, tuple)) else (caches,):
+                    if cache.shape[0] < end_block:
+                        raise ValueError("GS32 startup prefill warmup exceeds an allocated cache tensor.")
+                    cache_views.append(cache[first_block:end_block])
+            first_block = end_block
+
+        # Cache snapshots scale with this prefill, not max_model_len or the KV
+        # budget. Restore bytes/values instead of assuming compressor state is zero.
+        buffers = [
+            self.positions[:num_tokens],
+            self._dsa_positions_cpu_buf[:num_tokens],
+            self.input_ids.gpu[:num_tokens],
+            self.query_pos.cpu[:num_tokens],
+            self.query_start_loc.cpu[:2],
+            self.query_start_loc.gpu[:2],
+            self.optimistic_seq_lens_cpu,
+            self.seq_lens,
+            *cache_views,
+        ]
+        for table, _, _, _ in tables:
+            buffers.extend((table.block_table.cpu[0], table.block_table.gpu[0], table.slot_mapping.gpu[:num_tokens]))
+        snapshots = [(buffer, buffer.clone()) for buffer in buffers]
+        old_prompt_tokens = self.input_batch.num_prompt_tokens[0]
+        old_computed_tokens = self.input_batch.num_computed_tokens_cpu[0]
+        old_attn_state = self.attn_state
+        old_query_lens = getattr(self, "query_lens", None)
+        try:
+            self._gs32_prefill_warmup_active = True
+            self.input_batch.num_prompt_tokens[0] = num_tokens
+            self.input_batch.num_computed_tokens_cpu[0] = 0
+            self.query_start_loc.cpu[0] = 0
+            self.input_ids.gpu[:num_tokens].copy_(
+                torch.arange(num_tokens, device=self.device) % self.model_config.get_vocab_size()
+            )
+            for table, first_block, num_blocks, _ in tables:
+                # Block zero is the null page: compressor skips its state
+                # writes. Borrow distinct non-null pages for a complete prefill.
+                table.block_table.cpu[0].zero_()
+                table.add_row(list(range(first_block, first_block + num_blocks)), 0)
+                table.slot_mapping.gpu[:num_tokens].copy_(
+                    torch.arange(num_tokens, dtype=table.slot_mapping.gpu.dtype, device=self.device)
+                    + first_block * table.physical_block_size
+                )
+            yield num_tokens
+        finally:
+            try:
+                # Metadata and DSA compression may use auxiliary streams.
+                torch.npu.synchronize()
+            finally:
+                for buffer, snapshot in snapshots:
+                    buffer.copy_(snapshot)
+                for table, _, _, old_num_blocks in tables:
+                    table.num_blocks_per_row[0] = old_num_blocks
+                self.input_batch.num_prompt_tokens[0] = old_prompt_tokens
+                self.input_batch.num_computed_tokens_cpu[0] = old_computed_tokens
+                self.attn_state = old_attn_state
+                self.query_lens = old_query_lens
+                self._gs32_prefill_warmup_active = False
+                executor = self.device_metadata_executor
+                if executor is not None and executor.submission_in_flight:
+                    executor.release()
+                torch.npu.synchronize()
+
     def _should_build_dummy_attn_metadata(
         self,
         force_attention: bool = False,
@@ -4049,7 +4216,11 @@ class NPUModelRunner(GPUModelRunner):
                     raise NotImplementedError(
                         "create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it"
                     )
-                self.attn_state = AscendAttentionState.DecodeOnly
+                gs32_startup_prefill = getattr(self, "_gs32_prefill_warmup_active", False)
+                gs32_prefill = gs32_startup_prefill
+                self.attn_state = (
+                    AscendAttentionState.PrefillNoCache if gs32_prefill else AscendAttentionState.DecodeOnly
+                )
                 if self.speculative_config and self.speculative_config.method == "mtp":
                     # `AscendAttentionState.SpecDecoding` is only designed for mla
                     if self.vllm_config.model_config.use_mla:
@@ -4131,7 +4302,7 @@ class NPUModelRunner(GPUModelRunner):
 
                 # Invalidate real-request slots before attention backends derive
                 # or copy their backend-specific metadata for dummy execution.
-                if not is_graph_capturing:
+                if not is_graph_capturing and not gs32_startup_prefill:
                     for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
                         blk_table = self.input_batch.block_table[kv_cache_gid]
                         blk_table.slot_mapping.gpu.fill_(-1)
@@ -4151,8 +4322,14 @@ class NPUModelRunner(GPUModelRunner):
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 # check how to build dummy
                 if self.use_compress:
-                    self.positions.fill_(127)
-                    self._dsa_positions_cpu_buf.fill_(127)
+                    if gs32_prefill:
+                        # Match a fresh prefill, not the decode sentinel
+                        # positions used by the existing capture routine.
+                        self._dsa_positions_cpu_buf[:num_tokens].copy_(torch.arange(num_tokens))
+                        self.positions[:num_tokens].copy_(self._dsa_positions_cpu_buf[:num_tokens], non_blocking=True)
+                    else:
+                        self.positions.fill_(127)
+                        self._dsa_positions_cpu_buf.fill_(127)
                 elif self.uses_positions_for_attention:
                     # A dummy batch reports seq_lens == max_query_len but leaves
                     # self.positions holding the previous real step's values.
@@ -4296,7 +4473,7 @@ class NPUModelRunner(GPUModelRunner):
             if not is_profile and self.dynamic_eplb:
                 self.eplb_updator.forward_end(self.eplb_heat_collection_status)
             self._finalize_dump_data(dump=False)
-            if self.use_compress and force_attention:
+            if self.use_compress and force_attention and not getattr(self, "_gs32_prefill_warmup_active", False):
                 self.positions.fill_(0)
                 self._dsa_positions_cpu_buf.fill_(0)
             return hidden_states, hidden_states
@@ -4501,6 +4678,8 @@ class NPUModelRunner(GPUModelRunner):
             and mm_config is not None
             and mm_config.is_multimodal_pruning_enabled()
         ) # type: bool
+
+        self._initialize_quantization_validity()
 
         # wrap the model with full graph wrapper if needed.
         cudagraph_mode = self.compilation_config.cudagraph_mode
@@ -4849,8 +5028,10 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in group_kv_cache_spec.layer_names:
                 if isinstance(group_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec[layer_name] = group_spec.kv_cache_specs[layer_name]
-                else:
-                    layer_kv_cache_spec[layer_name] = group_spec
+                    # Keep the engine's planned per-layer storage geometry.
+                    # The scheduler's smallest block size is not a DSV4 table key.
+                    continue
+                layer_kv_cache_spec[layer_name] = group_spec
                 if static_forward_context is not None:
                     attn_layer = static_forward_context.get(layer_name)
                     if isinstance(attn_layer, AttentionLayerBase):

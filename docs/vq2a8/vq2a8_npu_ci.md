@@ -19,12 +19,12 @@ NPU 回归、服务 TTFT/TPOT 和模型答题准确率是三类独立检查。�
 - `MODEL` 沿用已准备好的 **DeepSeek-V4 mixed GS32 source-v3 checkpoint 的绝对路径**。
   目录中必须有 `config.json` 和 `model.safetensors.index.json`；旧版 source/artifact 布局不能替代 source-v3。
 - `BUILD` 沿用已有原生构建产物目录的**绝对路径**，其中包含
-  `libvq2a8_gs32_stage.so` 和 `mixed_w2w4_moe_ffn.o`。它不是需要新建的固定目录名。
+  `build-manifest.json`、`libvq2a8_gs32_stage.so` 和 `mixed_w2w4_moe_ffn.o`。
 - 整模型测试还需要完整的 `vllm_ascend_C` 扩展及配套 ACLNN 算子，包括 SAS/QLI AICPU metadata 修复。
   仅构建 GS32 bridge 不足以运行整模型；更新相关源码后应重建对应原生产物。
   构建与 checkpoint 说明见[集成文档](vq2a8_gs32.md#构建与-checkpoint-准备)。
-- checkpoint 用于验证其中实际存在的 VQ2/MXFP4 混合投影组合。若缺少真实的 `mxfp4 -> vq2` 专家，
-  一键 CI 会自动提示、记录覆盖缺口并继续；无需额外参数。其他 skip 和真实测试失败仍会阻断。
+- 真实专家对照覆盖生产支持的 VQ2/VQ2、VQ2/MXFP4、MXFP4/MXFP4 三种组合；缺失默认阻断。
+  MXFP4/VQ2 不属于完整 FFN 支持范围，不再自动允许这一历史组合的缺失。
 
 先确认当前终端中的既有路径：
 
@@ -33,6 +33,7 @@ NPU 回归、服务 TTFT/TPOT 和模型答题准确率是三类独立检查。�
 : "${BUILD:?请设置已有 GS32 原生构建产物目录的绝对路径}"
 test -f "$MODEL/config.json"
 test -f "$MODEL/model.safetensors.index.json"
+test -f "$BUILD/build-manifest.json"
 test -f "$BUILD/libvq2a8_gs32_stage.so"
 test -f "$BUILD/mixed_w2w4_moe_ffn.o"
 ```
@@ -56,7 +57,7 @@ test -f "$BUILD/mixed_w2w4_moe_ffn.o"
 
 ```bash
 export MODEL=/mnt/share/g00872988/DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3-export-20261103
-export BUILD="$PWD/build/vq2a8-gs32-runtime"
+export BUILD="$PWD/build/vq2a8-gs32-runtime-ffn"
 export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
 export TMPDIR=/tmp
 export VLLM_RPC_BASE_PATH=/tmp
@@ -67,24 +68,20 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 ```
 
-首次使用完整融合须按[ABI v3 重建](packed_weight_batch_throughput.md#0-首次升级完整-ffn重建-abi-v3)一起重建 `.o/.so`。
-旧设备对象即使文件名相同也不兼容；预检核对 v3 符号和构建清单 SHA256。
+按[完整 FFN 构建说明](packed_weight_batch_throughput.md#0-首次升级完整-ffn重建-abi-v3)更新桥接 `.so` 及清单。
+本次保留设备 ABI v3 和数学逻辑；设备对象必须与当前目标和 CANN 兼容，预检核对 v3 符号及 SHA256。
 先校验主模型扩展和 native GS32 bridge 的注册接口。此命令不加载权重、不启动服务，也不执行设备算子：
 
 ```bash
 python tools/serve_vq2a8.py \
   --model "$MODEL" --no-dspark \
-  --gs32-backend native \
-  --gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
-  --gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o" \
+  --gs32-runtime-dir "$BUILD" \
   --parallel-mode tp-ep --ep-size 4 \
-  --gs32-execution full_graph --gs32-fusion full_ffn \
   --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 64 \
   --check-native-only
 ```
 
 正常 native 服务启动也会执行此前置检查；`--dry-run` 仍只检查配置，不加载扩展。
-`reference_mxfp8` 不依赖独立 GS32 bridge，但仍需主模型扩展。
 接口检查不证明 `.o` 已成功执行或图捕获已通过；若提示重建，按[构建说明](vq2a8_gs32.md#构建与-checkpoint-准备)更新对应产物。
 
 先执行 B1 的同权重 eager/decode graph 对照，覆盖 127/128/129-token 输入边界及恢复请求：
@@ -109,8 +106,8 @@ ASCEND_RT_VISIBLE_DEVICES=4 python -m pytest -vv -s -x -o addopts= \
   --vq2a8-gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o"
 ```
 
-然后执行四卡完整 FFN B64 验收。该用例依次加载 `none+fused`、`full_ffn+fused`、
-`full_ffn+full_graph`，比较分步/完整融合及 eager/graph 的同权重结果：
+然后执行四卡完整 FFN B64 验收。该用例依次加载完整 FFN 的 eager 和 graph，
+比较同权重结果并检查实际完整 FFN 图回放：
 
 ```bash
 python -m pytest -vv -s -x -o addopts= \
@@ -125,16 +122,15 @@ python -m pytest -vv -s -x -o addopts= \
 用于正确性验收；性能服务仍按吞吐文档使用 8192-token 预算和 16 GiB KV，不能用该测试耗时作性能比较。
 
 以上检查通过后，再按[四卡吞吐](packed_weight_batch_throughput.md)及[四卡精度](vq2a8_accuracy.md)测新目录。
-本轮默认 native 使用 `full_ffn`，参考后端仍使用 `none`；本地 CPU 检查不代替上述新模型真机验收。
-下方原有一键套件仍可用于组件回归，不能代替本节新增的完整 FFN 和 EP4 对照。
+完整 FFN 的独立数值 oracle 仅供测试使用，不作为服务后端。CPU 检查不代替上述真机验收。
+下方一键套件包含完整 FFN 组件回归，但不代替本节的 EP4/B64 整模型对照。
 repack 前后的非 routed 量化不同，不能要求两份权重逐 token 一致；eager/graph 对照始终使用同一份权重。
 
 ## 一键执行
 
-日常 PR 回归使用空闲卡 4、5，默认运行九个组件阶段和 MRV2 的 `ep2-v2` 整模型阶段，共十个阶段。
+日常 PR 回归使用空闲卡 4、5，默认运行五个组件阶段和 MRV2 的 `ep2-v2` 整模型阶段，共六个阶段。
 一键 CI 默认选择 Model Runner V2；`ep2-v1` 已从自动计划移除，MRV1 的整模型 eager/decode graph 对照仍可手动运行。
-下面的命令已自动处理 checkpoint 缺少真实 `mxfp4 -> vq2` 专家的情况，不需要在命令中增加允许跳过的参数。
-具体提示与结果含义见[缺失组合处理](#checkpoint-缺少真实专家组合时)。
+缺少支持的真实专家组合默认使验收失败；显式接受覆盖缺口的规则见[缺失组合处理](#checkpoint-缺少真实专家组合时)。
 
 ```bash
 python tools/tests/run_vq2a8_npu_ci.py \
@@ -175,72 +171,56 @@ python tools/tests/run_vq2a8_npu_ci.py \
 
 ## checkpoint 缺少真实专家组合时
 
-例如，`batched` 显示 `18 passed, 4 skipped`，四个 skip 的原因均为缺少真实的 `mxfp4 -> vq2` 专家。
-这表示 GateUp 使用 MXFP4、Down 使用 VQ2 的同一专家未在 checkpoint 中找到；不是四个数值比较失败。
-其中两项检查 `fused/full_graph` 下的激活融合对照，另外两项检查 `none/swiglu_quant` 下的 prefill 对照。
-一键 CI **默认自动接受这类缺失组合**，打印提示并继续所选套件的后续阶段，无需修改上面的命令。
-只有对应真实专家测试报告该专家组合不存在时，才采用此处理；如果 checkpoint 含有该组合，测试照常执行，失败仍会阻断。
+完整 FFN 测试要求真实 checkpoint 覆盖 `vq2_to_vq2`、`vq2_to_mxfp4` 和 `mxfp4_to_mxfp4`。
+混合图测试还要求同一层中存在这三种真实组合，以验证单次完整 FFN 调用中的混合专家布局。
+缺少真实组合或混合层时会报告未覆盖，默认阻断验收；不再设置任何自动允许缺失组合。
+`mxfp4_to_vq2` 是不支持的生产组合，不能通过允许缺失参数启用。
 
-该阶段其余检查通过时，终端会显示类似提示：
+仅需要检查已有支持组合时，可显式添加例如 `--allow-missing-checkpoint-pairs vq2_to_mxfp4`。
+它只接受已识别的真实专家缺失用例，不能忽略混合层缺失、其他 skip、xfail、错误或数值失败。
+即使显式接受缺失，阶段也必须有实际通过用例；整阶段全 skip 不算完成。
 
-```text
-STAGE=batched STATUS=passed_with_coverage_gaps
-STAGE=batched NOTICE=Checkpoint has no real expert for mxfp4 -> vq2; recorded 4 untested cases and continuing remaining checks. MODEL=/path/to/checkpoint
-```
+其余检查全部通过时，显式接受覆盖缺口的运行报告为 `passed_with_coverage_gaps`、
+`coverage_complete=false`，退出码为 `0`；没有覆盖缺口时才是 `passed`。
+`coverage_gaps` 保留阶段、checkpoint、测试 nodeid、组合和原因，原始 skip 计数也会保留。
+`automatic_missing_checkpoint_pairs` 为空，`allowed_missing_checkpoint_pairs` 仅记录显式接受的组合。
+后续阶段失败时总状态仍为 `failed`。
 
-自动处理只适用于 `batched` 中上述两个真实专家测试的四个确切参数化用例，
-且 pytest skip 原因必须与“checkpoint 中不存在真实 mxfp4 -> vq2 专家”完全一致。
-缺少 NPU、依赖、模型参数等其他 skip，以及 xfail、失败、错误、整阶段无实际通过用例，仍会使 CI 失败。
-其他专家组合的缺失默认仍阻断；旧参数 `--allow-missing-checkpoint-pairs` 保留兼容，供明确接受其他组合缺口时使用。
-已使用该参数指定 `mxfp4_to_vq2` 的旧命令也继续有效，但现在可以直接移除这一参数。
-
-全部其余检查通过后，汇总为 **`passed_with_coverage_gaps`**，`coverage_complete=false`，退出码为 `0`。
-这表示已执行的检查通过，不能报告为全组合覆盖通过。原始 `skipped` 计数保留，
-`coverage_gaps` 逐项记录阶段、checkpoint、测试 nodeid、组合和原因，终端也实时打印 `COVERAGE_GAP`。
-`automatic_missing_checkpoint_pairs` 记录默认自动处理的组合，`allowed_missing_checkpoint_pairs` 记录自动与显式指定的有效并集。
-阶段中的 `skipped_tests` 保留全部 skip/xfail 的类型和原因，方便识别其他缺口。
-后续阶段若失败，总状态仍为 `failed`，之前的缺口记录不会丢失。
-
-补齐含该真实专家组合的 checkpoint 后，使用同一命令重新运行；人工拼接不同专家权重不能替代真实专家覆盖。
-内部 CI 若额外要求完整覆盖，应检查 `status=passed`、`coverage_complete=true`。
-这里的完整覆盖仅指所选套件的必跑用例，不包含已移除的 `ep2-v1`、未选择的 EP1、长上下文性能或数据集精度评测。
+完整验收应要求 `status=passed` 且 `coverage_complete=true`，并保存原始日志。
+这里的完整覆盖只针对所选套件，不包括未选择的 EP1、EP4/B64、长上下文性能或答题精度。
 
 ## 三套件的覆盖范围
 
 | 套件 | 设备要求 | 默认覆盖 |
 | --- | --- | --- |
-| `kernels` | 恰好一张，例如 `--devices 4` | 九个组件测试文件，共九个阶段 |
-| `pr`，默认 | 恰好两张，例如 `--devices 4,5` | 九个组件阶段，再运行 MRV2 的真实 EP2 eager/decode graph 对照 `ep2-v2`，默认共十个阶段 |
-| `nightly` | 恰好两张 | PR 覆盖加 `recovery-v2` 短/16K/短恢复测试，默认共十一个阶段 |
+| `kernels` | 恰好一张，例如 `--devices 4` | 五个组件测试文件，共五个阶段 |
+| `pr`，默认 | 恰好两张，例如 `--devices 4,5` | 五个组件阶段，再运行 MRV2 的真实 EP2 eager/decode graph 对照 `ep2-v2`，默认共六个阶段 |
+| `nightly` | 恰好两张 | PR 覆盖加 `recovery-v2` 短/16K/短恢复测试，默认共七个阶段 |
 
-九个组件文件均位于 `tests/e2e/nightly/`，文件名前缀为 `test_vq2a8_gs32_`：
+五个组件文件均位于 `tests/e2e/nightly/`：
 
-| 文件后缀 | 主要验证内容 |
+| 文件 | 主要验证内容 |
 | --- | --- |
-| `activation.py` | 激活准备、量化及动态长度边界 |
-| `activation_async.py` | 异步有效性检查 |
-| `device_routes.py` | 设备端路由和元数据 |
-| `device_native.py` | 原生设备投影 |
-| `grouped.py` | grouped 投影、大 M 和尾部边界 |
-| `device_bank.py` | 混合权重 bank、多图桶捕获回放及大路由容量 |
-| `batched.py` | 混合 FFN、prefill 和本地 EP2 容量 |
-| `ep_routes.py` | EP 专家归属及路由布局 |
-| `ep_attention.py` | attention 相关回归 |
+| `test_vq2a8_gs32_activation.py` | 完整 FFN 初始激活量化及有效性边界 |
+| `test_vq2a8_gs32_device_routes.py` | 设备 metadata、counts/prefixes、padding、无效路由与恢复 |
+| `test_vq2a8_gs32_full_ffn.py` | 三种真实专家与独立官方 GMM oracle 对照、中间 FP8/E8M0、混精动态路由、图捕获及恢复 |
+| `test_vq2a8_gs32_ep_routes.py` | EP 专家归属及路由布局 |
+| `test_vq2a8_gs32_ep_attention.py` | attention 相关回归 |
 
 组件阶段始终使用 `--devices` 中的**第一张卡**，runner 使用 `--model-runners` 中的首个值；
 默认是 V2，显式选择 `v1` 或 `v1 v2` 时组件阶段使用 V1。
-已有参数化测试覆盖大 M、两个本地 EP2 rank bank 的 4096/8192 token 容量，以及适用的两种激活融合设置。
-本地构造 EP 形状的 FFN 测试不执行 HCCL；真实 EP2 模型阶段才检查 dispatch、combine、collective 和专家归属。
+完整 FFN 组件使用独立 `OfficialFFNOracle`，不依赖已删除的 staged/reference 生产模块。
+组件测试不执行多卡 HCCL；真实 EP2 模型阶段才检查 dispatch、combine、collective 和专家归属。
 
 `--model-runners` 默认是 `v2`，仍可显式选择 `v1` 或 `v1 v2`；
 首个值决定组件阶段使用的 runner，全部所选值决定 `pr`、`nightly` 的整模型阶段；不会重新启用 `ep2-v1`。
-九个组件阶段验证各自的算子或组件，不能代替整模型执行验证。
+五个组件阶段验证各自的算子或组件，不能代替整模型执行验证。
 
 | runner 选择 | `pr` 阶段 | `nightly` 阶段 |
 | --- | --- | --- |
-| 默认，或 `--model-runners v2` | 九个组件 + `ep2-v2`，共十个 | 九个组件 + `ep2-v2` + `recovery-v2`，共十一个 |
-| `--model-runners v1` | 仅九个组件，共九个 | 九个组件 + `recovery-v1`，共十个 |
-| `--model-runners v1 v2` | 九个组件 + `ep2-v2`，共十个 | 九个组件 + `ep2-v2` + `recovery-v1` + `recovery-v2`，共十二个 |
+| 默认，或 `--model-runners v2` | 五个组件 + `ep2-v2`，共六个 | 五个组件 + `ep2-v2` + `recovery-v2`，共七个 |
+| `--model-runners v1` | 仅五个组件，共五个 | 五个组件 + `recovery-v1`，共六个 |
+| `--model-runners v1 v2` | 五个组件 + `ep2-v2`，共六个 | 五个组件 + `ep2-v2` + `recovery-v1` + `recovery-v2`，共八个 |
 
 **一键 CI 通过不代表 MRV1 的整模型 EP2 eager/decode graph 对照已通过。**
 该检查已移出计划，组件阶段和 `recovery-v1` 不能代替它；需要该项验收时，使用下文的手动 EP2 命令。
@@ -257,10 +237,9 @@ STAGE=batched NOTICE=Checkpoint has no real expert for mxfp4 -> vq2; recorded 4 
 
 ### 多序列 decode 图验收
 
-MRV2 新增 B1～B64 支持。组件阶段 `device_bank` 捕获并交替回放多个 FFN 路由容量，
-包括 top-k=6 的 B64（384 行）和 top-k=8 的 B64（512 行）；
-检查动态路由、单专家超过 128 行、空 bank、填充行、无效输入和后续恢复。
-该测试复用三专家 fixture，不能代替完整 EP2 模型的多序列验收。
+MRV2 支持 B1～B64。完整 FFN 组件捕获并交替回放 6、128、129、384 路由行的图桶，
+从空路由捕获后切换到热点或混合专家，检查 padding、无效输入及恢复。
+这是组件验收；top-k=6 的 384 行边界不能代替完整 EP2/EP4 模型的多序列验收。
 
 完整模型 batch smoke 是独立手动入口，不加入默认 CI，也不恢复已移除的 `ep2-v1`。
 在两张空闲卡上运行：
@@ -328,8 +307,7 @@ DP eager 还须与 TP/EP B1 参考逐请求匹配 greedy token，并按已有 EP
 
 - 返回 `0`：所有选定阶段均至少有一个实际通过用例，并且无 failure、error、xfail 或不支持的 skip。
   驱动同时启用 `xfail_strict=True`，不能用意外通过的预期失败用例掩盖结果。
-  若仅存在自动接受的 `mxfp4 -> vq2` 缺失，或通过旧参数额外声明的组合缺失，汇总为 `passed_with_coverage_gaps`；
-  若实际没有 skip，汇总为 `passed`。两者均不会因为这些已识别的数据缺口报错。
+  若仅存在显式接受的支持组合缺失，汇总为 `passed_with_coverage_gaps`；无 skip 时为 `passed`。
 - 返回 `1`：环境预检失败、测试失败、超时、零测试，或 JUnit 缺失、格式错误、计数不一致。
   其他未接受的 skip、xfail 或整阶段全 skip，也属于未完成验收。
 - Ctrl+C 或 SIGTERM：保存已完成部分及中断状态，返回 `130`。
@@ -345,9 +323,9 @@ DP eager 还须与 TP/EP B1 参考逐请求匹配 greedy token，并按已有 EP
 benchmark-results/npu-ci/vq2a8-npu-ci-<时间戳>-<随机后缀>/
   summary.json
   environment.log
-  activation.log
-  activation.xml
-  activation-tmp/
+  full_ffn.log
+  full_ffn.xml
+  full_ffn-tmp/
   ep2-v2.log
   ep2-v2.xml
   ep2-v2-tmp/
@@ -376,8 +354,8 @@ EP 整模型测试的内层子进程输出单独写入 `ep2-v2-tmp/` 下的 `ep2
 
 ```bash
 RESULT=/path/to/the/printed/result-directory
-sed -n '1,220p' "$RESULT/activation.log"
-tail -n 80 "$RESULT/activation.log"
+sed -n '1,220p' "$RESULT/full_ffn.log"
+tail -n 80 "$RESULT/full_ffn.log"
 ```
 
 可以把上面的一键命令作为内部 Linux NPU CI job 的步骤，归档整个结果目录，使用进程退出码判定 job 成败。
@@ -404,58 +382,29 @@ python -m pytest --noconftest -o addopts= -q \
 CPU 测试使用隔离的框架测试支架，执行真实 tensor 运算和模型加载方法。
 它们不能验证 CANN 编译、HCCL、ACLGraph 或目标硬件性能。
 
-### 路由 metadata 内核的 BiSheng 编译失败
+### 路由或图捕获故障定位
 
-如果 `device_bank_decode_graph_buckets_and_recovery[prefix]` 在
-`CapturedBank.__init__` 的预热 `bank.apply` 中报
-`LLVM ERROR: consolidateToTail produced invalid IR`，此时尚未进入图捕获。
-最初首个桶是六个路由行，失败栈指向 `_route_metadata_kernel`，还没有执行该次调用的原生矩阵投影。
-这是 BiSheng 后端编译失败，不能据此判断四卡通信、DSpark 或大 batch 数值错误。
-
-在 Ascend950DT_9582 / CANN 9.2.0 / `triton_ascend 3.6.0+dev20261007182438` /
-`torch_npu 2.10.0.post7` 上，保留 `tl.static_range(ROWS)` 后仍能复现。
-使用缓存的 `_route_metadata_kernel.bcmlir` 和相同编译参数做离线对照：
-`--enable-auto-vectorize-v2=true` 退出 134 并报上述错误，设为 `false` 退出 0。
-因此 `_route_metadata_kernel` 设置 `enable_auto_vectorize_v2=False`，使用旧向量化路径。
-后续实机复测中，六行路由的 prefix/counts 两项通过；bank 测试继续运行到
-`_apply_prefill -> prepare_metadata -> _prefill_metadata_kernel`，再次出现同一编译器错误。
-大行路径也用于超过八个路由行的 Decode 桶，并不表示请求阶段变成了 Prefill。
-现将同一局部开关扩展到 `_prefill_metadata_kernel`，该扩展仍待 NPU 编译、数值及图回放复测。
-行构造、激活、原生投影及 restore 内核保持各自的编译选项。
-报错命令中添加的 `TRITON_ASCEND_ENABLE_AUTO_VECTORIZE_V2=0` 未使这次 BiSheng 命令带上
-`--enable-auto-vectorize-v2=False`，复测应去掉该变量，使用代码中的显式 kernel 参数。
-这里的 AutoVectorize V2 是编译器优化，与 MRV2 和 Decode 图模式独立。
-六行路由通过不代表 bank 全桶、四卡或 DSpark 已通过；图回放及性能仍需在 NPU 上验收。
-修改仅涉及 Python/Triton，无须重新编译 GS32 `.so` 和 `.o`，也无须清除原 Triton 缓存。
-
-先运行只检查路由的用例，覆盖六行以及 12/512 行 metadata、256 个逻辑专家、
-prefix/counts 和混合权重子集：
+完整 FFN 仍依赖 Triton 激活和路由 metadata。需要单独定位这些组件时，运行：
 
 ```bash
-env -u TRITON_ASCEND_ENABLE_AUTO_VECTORIZE_V2 ASCEND_RT_VISIBLE_DEVICES=4 \
-python -m pytest -vv -s -x -ra -o addopts= \
-  tests/e2e/nightly/test_vq2a8_gs32_device_routes.py::test_gs32_routes_three_expert_decode_warmup \
-  tests/e2e/nightly/test_vq2a8_gs32_device_routes.py::test_gs32_routes_three_expert_metadata_warmup \
-  'tests/e2e/nightly/test_vq2a8_gs32_device_routes.py::test_gs32_routes_runtime_expert_bounds_subset_graph_recovery[6-prefix]' \
-  'tests/e2e/nightly/test_vq2a8_gs32_device_routes.py::test_gs32_routes_runtime_expert_bounds_subset_graph_recovery[6-counts]' \
+ASCEND_RT_VISIBLE_DEVICES=4 python -m pytest -vv -s -x -ra -o addopts= \
+  tests/e2e/nightly/test_vq2a8_gs32_activation.py \
+  tests/e2e/nightly/test_vq2a8_gs32_device_routes.py \
   --vq2a8-model "$MODEL"
 ```
 
-这些用例读取模型配置并执行真实 NPU 路由，不加载整模型或执行原生投影。
-通过后再运行原来的 `test_gs32_device_bank_decode_graph_buckets_and_recovery` 三组测试，
-最后进行四卡整模型验证。若仍然崩溃，保留异常中打印的 Triton 缓存目录和完整 stderr，
-同时记录 `python -m pip show triton-ascend torch torch-npu` 的版本信息；
-不要先清空缓存，以免丢失提交编译器问题所需的 IR。
+这些组件测试不替代完整 FFN 或整模型验收。出现 BiSheng 编译错误时保留完整 stderr、
+异常中的 Triton 缓存目录及 `python -m pip show triton-ascend torch torch-npu` 版本输出，
+再区分失败发生在预热、捕获还是回放。清空缓存会丢失定位编译器问题所需的 IR。
 
 ### FFN 与整模型检查
 
-单卡检查混合 FFN prefill 数值和本地 EP2 bank 容量：
+单卡检查真实混合专家的完整 FFN 数值与图桶：
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=4 VLLM_USE_V2_MODEL_RUNNER=1 \
 python -m pytest -vv -s -x \
-  tests/e2e/nightly/test_vq2a8_gs32_batched.py \
-  -k 'device_prefill_compare or device_prefill_ep2_capacity' \
+  tests/e2e/nightly/test_vq2a8_gs32_full_ffn.py \
   --vq2a8-model "$MODEL" \
   --vq2a8-gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
   --vq2a8-gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o"

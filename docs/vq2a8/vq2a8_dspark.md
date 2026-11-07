@@ -77,15 +77,14 @@ python tools/repack_vq2a8_dspark.py --output "$MODEL/dspark" --verify-only
 
 ```bash
 MODEL=/mnt/share/g00872988/DeepSeek-V4-Flash-0731-vq2a8-mixed-gs32-repack
-BUILD="$PWD/build/vq2a8-gs32-runtime"
+BUILD="$PWD/build/vq2a8-gs32-runtime-ffn"
 mkdir -p benchmark-results/performance-vq2a8-dspark
 set -o pipefail
 
 ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 VLLM_USE_V2_MODEL_RUNNER=1 \
 bash tools/tests/serve_vq2a8_dspark_performance.sh \
   --model "$MODEL" \
-  --gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
-  --gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o" \
+  --gs32-runtime-dir "$BUILD" \
   2>&1 | tee benchmark-results/performance-vq2a8-dspark/serve-dp4-b4-dspark5.log
 ```
 
@@ -95,7 +94,7 @@ bash tools/tests/serve_vq2a8_dspark_performance.sh \
 | --- | --- | --- |
 | 草稿 | `--dspark` | 从 `$MODEL/dspark` 加载，DSpark5 |
 | 并行 | `--parallel-mode dp-ep --ep-size 4` | TP1、DP4、EP4 |
-| 图执行 | `--gs32-execution full_graph --gs32-fusion none` | 目标 decode 图及原始草稿图路径 |
+| 图执行 | 默认完整 FFN、decode 图回放 | 目标 decode 图及原始草稿图路径 |
 | 序列上限 | `--max-num-seqs 4` | 每 engine B4，全局上限 16 |
 | 上下文上限 | `--max-model-len 8192` | 每个请求输入与输出的总 token 上限 |
 | 调度预算 | `--max-num-batched-tokens 8192` | 每轮调度的 token 预算，保持 8192 |
@@ -153,14 +152,13 @@ C 是全局客户端并发，DP4 会将请求分给不同 engine，因此 C=4 �
 
 ```bash
 MODEL=/mnt/share/g00872988/DeepSeek-V4-Flash-0731-vq2a8-mixed-gs32-repack
-BUILD="$PWD/build/vq2a8-gs32-runtime"
+BUILD="$PWD/build/vq2a8-gs32-runtime-ffn"
 set -o pipefail
 
 ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 VLLM_USE_V2_MODEL_RUNNER=1 \
 bash tools/tests/serve_vq2a8_dspark_performance.sh \
   --model "$MODEL" \
-  --gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
-  --gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o" \
+  --gs32-runtime-dir "$BUILD" \
   --no-dspark \
   2>&1 | tee benchmark-results/performance-vq2a8-dspark/serve-dp4-b4-baseline.log
 ```
@@ -210,7 +208,7 @@ python tools/tests/run_vq2a8_performance_suite.py \
 ```bash
 MODEL=/mnt/share/g00872988/DeepSeek-V4-Flash-0731-vq2a8-mixed-gs32-repack
 DRAFT_MODEL="$MODEL/dspark"
-BUILD="$PWD/build/vq2a8-gs32-runtime"
+BUILD="$PWD/build/vq2a8-gs32-runtime-ffn"
 mkdir -p benchmark-results/accuracy-vq2a8-dspark
 set -o pipefail
 
@@ -220,10 +218,8 @@ python -u tools/serve_vq2a8.py \
   --model "$MODEL" \
   --dspark-model "$DRAFT_MODEL" \
   --num-speculative-tokens 5 \
-  --gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
-  --gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o" \
+  --gs32-runtime-dir "$BUILD" \
   --parallel-mode dp-ep --ep-size 4 \
-  --gs32-execution full_graph --gs32-fusion none \
   --max-model-len 262144 \
   --max-num-seqs 16 --max-num-batched-tokens 2048 \
   --kv-cache-mib 16384 --reserve-gib 16 \
@@ -297,7 +293,7 @@ no-thinking 可改为 `--no-thinking`，同时去掉 `--reasoning-effort high`�
 ```bash
 MODEL=/mnt/share/g00872988/DeepSeek-V4-Flash-0731-vq2a8-mixed-gs32-repack
 DRAFT_MODEL="$MODEL/dspark"
-BUILD="$PWD/build/vq2a8-gs32-runtime"
+BUILD="$PWD/build/vq2a8-gs32-runtime-ffn"
 
 ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 VLLM_USE_V2_MODEL_RUNNER=1 \
 python -m pytest -vv -s -x \

@@ -7,7 +7,7 @@
 - 固定 TP4/EP4、DP1、MRV2、B64，关闭 MTP/DSpark。
 - 客户端并发为 1、2、4、8、16、32、64，输入 1024、输出 128 tokens。
 - 每档正式请求数为 4×并发，预热 1 次，正式测量 1 次。
-- 分别提供 native 和 reference_mxfp8 命令，不测 baseline。
+- 固定使用 native 完整 FFN，默认 decode 图；可用 `--enforce-eager` 做同算子对照。
 - 保存吞吐、TTFT、TPOT、P99 E2EL、summary.json 和服务返回的模型路径。
 
 已有完全符合配置的四卡服务可以复用。B64 表示服务活动序列上限，客户端并发不保证实际每步 decode batch。

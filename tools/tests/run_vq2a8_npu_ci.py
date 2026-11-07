@@ -26,12 +26,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_ROOT = "tests/e2e/nightly"
 COMPONENTS = (
     "activation",
-    "activation_async",
     "device_routes",
-    "device_native",
-    "grouped",
-    "device_bank",
-    "batched",
+    "full_ffn",
     "ep_routes",
     "ep_attention",
 )
@@ -41,8 +37,7 @@ TERMINATE_GRACE_SECONDS = 10
 PREFLIGHT_SECONDS = 120
 LOG_TAIL_BYTES = 16384
 LOG_TAIL_LINES = 64
-CHECKPOINT_PAIRS = ("vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_vq2", "mxfp4_to_mxfp4")
-AUTOMATIC_MISSING_CHECKPOINT_PAIRS = ("mxfp4_to_vq2",)
+CHECKPOINT_PAIRS = ("vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_mxfp4")
 ACCEPTED_STAGE_STATUSES = ("passed", "passed_with_coverage_gaps")
 
 
@@ -66,7 +61,7 @@ def parse_args(argv=None):
         nargs="+",
         choices=CHECKPOINT_PAIRS,
         default=[],
-        help="Accept additional missing real-expert pairs; mxfp4_to_vq2 is handled automatically",
+        help="Explicitly allow missing real-expert pairs, reported as incomplete numerical coverage",
     )
     parser.add_argument("--timeout", type=int, default=7200, help="Wall timeout in seconds per pytest stage")
     parser.add_argument("--result-dir", type=Path, default=REPO_ROOT / "benchmark-results/npu-ci")
@@ -84,9 +79,6 @@ def parse_args(argv=None):
         parser.error("--timeout must be positive and --model-runners must be distinct")
     if len(set(args.allow_missing_checkpoint_pairs)) != len(args.allow_missing_checkpoint_pairs):
         parser.error("--allow-missing-checkpoint-pairs must be distinct")
-    args.allow_missing_checkpoint_pairs = list(
-        dict.fromkeys((*AUTOMATIC_MISSING_CHECKPOINT_PAIRS, *args.allow_missing_checkpoint_pairs))
-    )
     args.devices = ",".join(devices)
     for name in ("model", "gs32_library", "gs32_binary", "result_dir"):
         setattr(args, name, getattr(args, name).expanduser().resolve())
@@ -277,33 +269,21 @@ def read_junit(path):
 
 def checkpoint_coverage_gaps(stage, allowed_pairs):
     """Recognize only supported missing-data skips, never hardware skips or xfails."""
-    if stage["name"] != "batched":
+    if stage["name"] != "full_ffn":
         return []
-    classname = "tests.e2e.nightly.test_vq2a8_gs32_batched"
+    classname = "tests.e2e.nightly.test_vq2a8_gs32_full_ffn"
     allowed = {}
     for pair in allowed_pairs:
-        label = pair.replace("_to_", " -> ")
-        for function, variants, reason in (
-            (
-                "test_gs32_real_experts_fusion_compare",
-                ("fused", "full_graph"),
-                f"No real {label} expert exists in this checkpoint; combination was not tested.",
-            ),
-            (
-                "test_gs32_real_mixed_ffn_device_prefill_compare_and_timing",
-                ("none", "swiglu_quant"),
-                f"No real {label} expert exists; this prefill combination was not tested.",
-            ),
-        ):
-            for variant in variants:
-                allowed[(f"{function}[{pair}-{variant}]", reason)] = pair
+        label = tuple(pair.split("_to_"))
+        reason = f"No real {label} expert in this checkpoint; this precision pair was not tested."
+        allowed[(f"test_gs32_real_experts_full_ffn_compare[{pair}]", reason)] = pair
     gaps = []
     for skipped in stage["skipped_tests"]:
         pair = allowed.get((skipped["name"], skipped["reason"]))
         if pair is not None and skipped["classname"] == classname and skipped["type"] == "pytest.skip":
             gaps.append(
                 {
-                    "nodeid": f"{TEST_ROOT}/test_vq2a8_gs32_batched.py::{skipped['name']}",
+                    "nodeid": f"{TEST_ROOT}/test_vq2a8_gs32_full_ffn.py::{skipped['name']}",
                     "pair": pair,
                     "reason": skipped["reason"],
                 }
@@ -414,7 +394,7 @@ def main(argv=None):
         ],
         "single_card_reference": args.single_card_reference
         and any(stage["name"].startswith("ep2-") for stage in stages),
-        "automatic_missing_checkpoint_pairs": list(AUTOMATIC_MISSING_CHECKPOINT_PAIRS),
+        "automatic_missing_checkpoint_pairs": [],
         "allowed_missing_checkpoint_pairs": args.allow_missing_checkpoint_pairs,
         "coverage_complete": False,
         "coverage_gaps": [],

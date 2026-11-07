@@ -22,16 +22,16 @@ def test_gs32_real_model_b1_i32_o4(request):
         pytest.skip("Pass --vq2a8-model and both --vq2a8-gs32-* native paths on Ascend950.")
     assert all(options.values()), "Both GS32 native artifact paths are required."
     paths = {name: str(Path(path).resolve(strict=True)) for name, path in options.items()}
-    config = json.loads((Path(paths["model"]) / "config.json").read_text())
+    config = json.loads((Path(paths["model"]) / "config.json").read_text(encoding="utf-8"))
     assert config["quantization_config"]["format"] == "vq2_mixed_gs32_source"
 
     # Import only after the real-model opt-in, never emulate NPU execution.
     from vllm import LLM, SamplingParams
 
     model = paths.pop("model")
-    execution = request.config.getoption("--vq2a8-gs32-execution")
+    execution = "fused"  # This single-card smoke exercises the eager full-FFN path.
     paths["gs32_execution"] = execution
-    paths["gs32_fusion"] = "none"  # Keep the staged projection acceptance as an explicit control.
+    paths["gs32_fusion"] = "full_ffn"
     llm = LLM(
         model=model,
         quantization="vq2a8",

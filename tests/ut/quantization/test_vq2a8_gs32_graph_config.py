@@ -20,7 +20,7 @@ def graph_config():
             "gs32_binary": str(Path(__file__).resolve().parent / "kernel.o"),
             "gs32_execution": "full_graph",
             "gs32_backend": "native",
-            "gs32_fusion": "none",
+            "gs32_fusion": "full_ffn",
         },
         "ascend_compilation_config": {"enable_npugraph_ex": False},
         "multistream_dsv4_dsa_overlap": False,
@@ -38,7 +38,7 @@ def graph_config():
     return config
 
 
-@pytest.mark.parametrize("fusion", ["none", "swiglu_quant"])
+@pytest.mark.parametrize("fusion", ["full_ffn"])
 @pytest.mark.parametrize("use_v2", [False, True])
 def test_gs32_full_graph_requires_explicit_decode_graph_scope(modules, fusion, use_v2):
     config = graph_config()

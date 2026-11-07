@@ -55,7 +55,7 @@ def test_gs32_ep_routes_padding_graph_dynamic_empty_and_recovery(
     tensors = tuple(value.to(runtime.device) for value in (hidden, host_group(partial), expert_ids, logical_slots))
 
     def forward():
-        return runtime.route(tensors[0], tensors[1], group_type, tensors[2], tensors[3], allow_padding=True)
+        return runtime.metadata(tensors[0], tensors[1], group_type, tensors[2], tensors[3], allow_padding=True)
 
     stream = torch.npu.Stream(device=runtime.device)
     stream.wait_stream(torch.npu.current_stream(runtime.device))
@@ -76,16 +76,20 @@ def test_gs32_ep_routes_padding_graph_dynamic_empty_and_recovery(
             graph.replay()
         stream.synchronize()
         physical, source, inverse, valid = route_reference(
-            group.tolist(), group_type, experts, slots, capacity, allow_padding=True
+            group.tolist(), group_type, experts, slots, capacity, allow_padding=True, max_count=None
         )
         assert result[3].cpu().tolist() == [valid]
-        assert result[1].cpu().tolist() == physical
+        assert result[0].cpu().tolist() == physical
         assert result[2].cpu().tolist() == inverse
         expected = torch.zeros_like(hidden)
         for destination, source_row in enumerate(source):
             if valid and source_row >= 0:
                 expected[destination] = current_hidden[source_row]
-        actual = result[0].cpu()
+        gather = result[1].cpu()
+        actual = torch.zeros_like(current_hidden)
+        if valid:
+            selected = gather >= 0
+            actual[selected] = current_hidden[gather[selected]]
         assert torch.equal(actual, expected)
         if valid:
             live_rows = int(counts.sum())

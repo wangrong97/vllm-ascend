@@ -718,12 +718,12 @@ def test_gs32_batch_progress_requires_live_batch_shrink_on_every_rank(probe, bat
 
 
 @pytest.mark.parametrize("fault", [None, "capture", "replay", "owners"])
-def test_gs32_batch_eager_reference_must_not_report_graph_execution(probe, batch_graph_states, fault):
+def test_gs32_batch_eager_full_ffn_checks_validity_without_graph_execution(probe, batch_graph_states, fault):
     for state in batch_graph_states:
-        state.update(decode={"captures": 0, "replays": 0}, decode_buckets={}, validity_owners=0)
+        state.update(decode={"captures": 0, "replays": 0}, decode_buckets={}, validity_owners=1)
     after = deepcopy(batch_graph_states)
     if fault == "owners":
-        after[-1]["validity_owners"] = 1
+        after[-1]["validity_owners"] = 0
     elif fault:
         after[-1]["decode"]["captures" if fault == "capture" else "replays"] = 1
     if fault:
@@ -776,7 +776,7 @@ def test_gs32_batch_smoke_runs_selected_ep_and_checks_child_reports(probe, tmp_p
             }
             for lengths in budgets
         ]
-        report = {"ep_size": ep_size, "execution": execution, "waves": waves}
+        report = {"ep_size": ep_size, "execution": execution, "fusion": "full_ffn", "waves": waves}
         if execution == "full_graph":
             if fault == "wrong_ep":
                 report["ep_size"] = 8
@@ -825,7 +825,10 @@ def test_gs32_scheme_uses_runner_owned_context_and_global_to_local_map(modules, 
     expected_map[-local_experts:] = torch.arange(local_experts, dtype=torch.int32)
     layer.expert_map = expected_map if use_v2 else torch.full_like(expected_map, -1)
     layer._ascend_expert_map = torch.full_like(expected_map, -1) if use_v2 else expected_map
-    layer.w13_packed_zn = layer.w2_packed_zn = torch.empty(0, dtype=torch.uint8)
+    layer.vq2a8_full_ffn_bank = {
+        "expert_ids": (0,),
+        "fields": {name: torch.empty(0, dtype=torch.uint8) for name in ("gate_weight", "down_weight")},
+    }
     layer.vq2a8_weights = object()
     layer.global_redundant_expert_num = 0
     layer.ascend_mc2_mask = layer.ascend_pertoken_scale = None
@@ -855,7 +858,7 @@ def test_gs32_scheme_uses_runner_owned_context_and_global_to_local_map(modules, 
     assert torch.equal(expected_map[topk_ids], torch.tensor([[-1, local_experts - 1], [-1, 0]], dtype=torch.int32))
 
 
-@pytest.mark.parametrize("execution", ["serial", "batched", "fused", "full_graph"])
+@pytest.mark.parametrize("execution", ["fused", "full_graph"])
 def test_mrv2_reuses_source_v3_eager_and_decode_graph_configuration(modules, execution):
     config = long_graph_config() if execution == "full_graph" else serving_config()
     config.additional_config["vq2a8"] = {
@@ -863,7 +866,7 @@ def test_mrv2_reuses_source_v3_eager_and_decode_graph_configuration(modules, exe
         "gs32_binary": str(Path("stage.o").resolve()),
         "gs32_execution": execution,
         "gs32_backend": "native",
-        "gs32_fusion": "none",
+        "gs32_fusion": "full_ffn",
     }
     config.use_v2_model_runner = True
     assert modules.config.validate_vq2a8_config(config) == config.additional_config["vq2a8"]

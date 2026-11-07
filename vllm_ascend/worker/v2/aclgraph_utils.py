@@ -271,7 +271,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         metadata = getattr(model_state, "device_metadata", None)
-        model = ModelWithContext(model, device_metadata=metadata)
+        model = ModelWithContext(model, device_metadata=metadata, model_runner=self.model_runner)
         pcp_manager = getattr(self.model_runner, "pcp_manager", None)
         if pcp_manager is not None:
             cudagraph_utils.prepare_inputs_to_capture = partial(
@@ -305,12 +305,21 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False, device_metadata=None):
+    def __init__(
+        self,
+        original_model,
+        is_draft_model=False,
+        is_draft_model_prefill=False,
+        device_metadata=None,
+        *,
+        model_runner=None,
+    ):
         super().__init__()
         self.original_model = original_model
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
         self.device_metadata = device_metadata
+        self.model_runner = model_runner
 
     def forward(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -328,7 +337,15 @@ class ModelWithContext(nn.Module):
         try:
             if self.device_metadata is not None:
                 self.device_metadata.begin_forward()
-            return self.original_model(*args, **kwargs)
+            validity = getattr(self.model_runner, "_quantization_validity", None)
+            # Capture records only device writes. Its uncaptured warmup owns
+            # status reset and rejection before a usable graph can be recorded.
+            if validity is not None and not _EXTRA_CTX.capturing:
+                validity.zero_()
+            output = self.original_model(*args, **kwargs)
+            if validity is not None and not _EXTRA_CTX.capturing:
+                self.model_runner._check_quantization_validity()
+            return output
         finally:
             # Warmup and actual capture receive separate prepare_attn calls.
             # Retire each submission, including unused producers, after its

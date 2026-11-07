@@ -363,6 +363,17 @@ def _select_capacity_and_world_size_moe_comm_method(
     return MoECommType.ALLTOALL
 
 
+def gs32_ep_uses_allgather(vllm_config: VllmConfig) -> bool:
+    """Keep whole-expert GS32 on TP-replicated or DP-gathered tokens."""
+    parallel = vllm_config.parallel_config
+    return (
+        getattr(vllm_config.model_config, "quantization", None) == "vq2a8"
+        and getattr(getattr(vllm_config, "quant_config", None), "is_gs32", False)
+        and parallel.enable_expert_parallel
+        and parallel.tensor_parallel_size * getattr(parallel, "data_parallel_size", 1) > 1
+    )
+
+
 _MOE_COMM_SELECTORS = {
     MoECommPolicy.CAPACITY_AND_EXPERT_DENSITY: _select_capacity_and_expert_density_moe_comm_method,
     MoECommPolicy.FUSED_OR_CAPACITY: _select_fused_or_capacity_moe_comm_method,
@@ -394,7 +405,13 @@ def select_moe_comm_method(
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     moe_comm_policy = get_current_hardware_profile().moe_comm_policy
     lora_config = getattr(vllm_config, "lora_config", None)
-    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
+    if gs32_ep_uses_allgather(vllm_config):
+        # MC2/AlltoAll use a different token partition and native weight ABI.
+        # ALLGATHER keeps TP-replicated inputs or gathers distinct DP inputs,
+        # then filters local expert routes. DP reduce-scatter returns each
+        # rank's rows; the common runner only reduces remaining TP partials.
+        moe_comm_type = MoECommType.ALLGATHER
+    elif not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
     elif lora_config is not None and vllm_config.parallel_config.enable_expert_parallel:
         # LoRA + EP requires AlltoAll because the MC2/FusedMC2 paths

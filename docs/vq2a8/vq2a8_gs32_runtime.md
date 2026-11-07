@@ -1,19 +1,51 @@
 # GS32 底层运行时
 
-本层将独立的 W2/W4 混合算子接入 Torch 张量，提供原生投影桥接、激活预处理和设备侧路由元数据功能。
-当前分支还包含模型加载、量化方案注册、专家权重组调度、EP 通信及模型运行器接入；下文区分底层接口与整模型验收。
+本层将 W2/W4 混合完整 FFN 接入 Torch 张量，包含初始激活量化、设备侧路由元数据、原生 FFN 和有效性检查。
+模型加载、EP 通信及 runner 有效性检查保留原有职责；生产中不再构造分阶段投影或 reference 后端。
 
 ## 来源与接口
 
-本实现从 `feat/test` 分支的提交 `592a697336e74e2defd9f8920d64793c4f2dac56` 中选取。原生算子源码由前置算子 PR 提供，本次运行时接入不修改这些源码。
+生产执行序列为：恒等路由 metadata → 初始 MXFP8 激活量化 → 原生完整 FFN → 合并有效性检查。
+完整 FFN 在设备内执行 GateUp、裁剪后的 SwiGLU、中间激活量化和 Down；框架优化不改变这个序列的数学逻辑。
 
-- `csrc/vq2a8_gs32_stage/torch_binding.cpp` 注册 `torch.ops.vq2a8_gs32_stage` 以及不透明的投影计划、路由句柄。它在提交所用的流上保留张量所有者，校验张量尺寸关系与别名，并复用独立的 DownW2 投影阶段，实现自然顺序的 GateUp 和 Down 投影。
-- 严格校验接口 `prepare_routes` 接收 CPU 上的计数，并显式上传由其持有的元数据。`prepare_device_routes` 接收设备上的计数，返回设备侧有效性状态，并支持延后校验。调用方必须保留该状态，并在接受结果前完成检查。
-- 分组投影使用实际路由计数，不再受历史上的单专家 4096 行、合计 32768 行上限约束。可用内存、整数尺寸范围及原生算子的专家数量上限仍然适用。串行参考实现仍保留每次启动 128 行的接口约束。
-- 激活算子直接使用自然输入列顺序，保持 BF16 舍入、K32 E8M0 缩放因子及 FP8 字节语义；不接收权重列置换参数。路由算子处理计数或累积结束位置、混合类型子集、无活跃路由的专家、填充、无效元数据以及逻辑行顺序恢复。
-- `vq2a8_gs32_format.py` 定义 source-v3 和原生张量格式约定；`vq2a8_gs32_staged.py` 定义数值参考实现。`w2a8` 包的初始化文件有意保持为空，不执行模型量化方案注册。
+- `csrc/vq2a8_gs32_stage/torch_binding.cpp` 注册 `torch.ops.vq2a8_gs32_stage` 的完整 FFN 计划、执行及设备路由接口。
+  `prepare_full_ffn` 在捕获前创建计划；`full_ffn_device` 使用同一 ABI v3 设备入口，保留张量生命周期、流和别名校验。
+- `prepare_device_routes` 接收设备计数，`device_routes_status` 提供有效性状态；调用方在接受结果前完成检查。
+  桥接层使用独立的 Triton sanitizer，将计数范围、精确总和及安全副本生成合为一次设备调用。
+  内部计数仍由 opaque route handle 持有，公开状态仍返回副本；没有跳过校验的 trusted-counts 开关。
+  图捕获期间不将状态读回主机；runner 沿用采样前的汇总检查。
+- 激活准备使用自然输入列顺序、BF16 舍入、K32 E8M0 缩放及 FP8 字节语义，不接收 `.perm`。
+  Python/Triton 路由保留 counts/prefixes、padding、无活跃专家及无效输入的处理。
+- `vq2a8_gs32_format.py` 定义 source-v3 格式，`vq2a8_gs32_full_ffn_layout.py` 构造完整 FFN 的专家 bank。
+  支持 VQ2/VQ2、VQ2/MXFP4、MXFP4/MXFP4；MXFP4/VQ2 在分配前拒绝。
+- 数值 oracle 位于 `tests/support/vq2a8_oracle.py` 和 nightly 测试 helper，只用于独立正确性对照。
+  旧 staged/reference runtime 已移除，不再加载其投影计划或捕获其计算图。
 
-算子支持安全的图捕获，并不意味着整模型图执行已通过验收。框架接入中的 `full_graph` 模式采用 decode 图回放和 eager 分块 prefill，不包含固定长度 prefill 图实验。
+默认 `full_graph` 使用 decode 图回放与 eager 分块 prefill，两者均执行完整 FFN。
+`--enforce-eager` 只关闭模型图，运行记录使用内部 execution 名称 `fused`。
+接口支持图捕获不等于目标硬件的整模型图验收已完成，仍需执行下述 NPU 测试。
+
+## 完整 FFN 框架开销优化
+
+完整 FFN bank 在加载时要求专家 ID 唯一且递增。dispatch 输出按逻辑专家分段，运行时拒绝非驻留专家的非零计数，
+因此全部有效行已经与 bank 的物理顺序一致；EP 驻留专家 ID 中有空洞也不改变这一性质。
+专用 identity metadata 每次在设备上校验计数、映射和顺序，仅输出 counts、validity 和 live-row summary，
+省去 gather/inverse、三组偏移 scratch 及逐行映射 kernel。通用重排/subset helper 仍供独立测试使用，
+不能把跳过活跃专家的 subset 路由当作恒等路由。
+
+初始量化按原行顺序读取，仅访问 summary 指定的有效前缀；padding 即使包含 NaN/Inf 也不读取，
+其 FP8 字节为零、E8M0 为 127。原生输出直接作为返回张量，省去另一份 BF16 result 及归位拷贝。
+finish kernel 合并输入、路由、native 状态、中间 scale=255 和输出有限性检查：非法有效值清零并标记失败，
+padding 输出清零，再用固定大小寄存器块归约并覆盖已有的每层 validity 标量。
+该固定块循环避免大 prefill 为每个容量生成巨大归约向量；没有省略 runner 的最终汇总检查。
+
+桥接层仍在每次执行时初始化 output 与 middle scales，防止空 rank、非法计数或不同 graph replay 继承旧数据。
+不建立跨 layer、跨 stream 或跨图桶共享的可变 workspace：每次 capture 持有自己的张量及 route handle，
+eager 返回值也不会被后续调用覆盖。图回放本来不会重复执行 Python 分配，优先减少实际缓冲及设备操作。
+
+设备端完整 FFN 源码和 ABI v3 不变，但桥接新增 `_sanitize_device_counts` schema，升级后必须重建 `.so` 和清单。
+Python runtime 在加载 `.so` 后注册对应实现；旧桥接缺少该 schema 时启动预检直接失败。
+目前 CPU 测试只能验证约定和边界，实际 Triton 编译、图回放、显存占用及吞吐收益均需目标 NPU 验收。
 
 ## DP-EP 通信与容量
 
@@ -66,11 +98,12 @@ Linux `aarch64` 和 `x86_64` 宿主共用这套构建流程与算子源码。设
 切换到 x86 机器时安装 x86_64 的 CANN、Torch、TorchNPU 和 Triton/BiSheng，并从干净的源码检出重新构建。
 不要复制 ARM 的 `.so`、宿主可执行文件或 CMake 缓存；`pip install -e .` 的主构建也需要在目标机器重新执行。
 主构建日志中的 AICPU ARM 交叉编译器用于 NPU 设备侧，仍需保留。
-以下命令将桥接层与部署产物按宿主架构分开输出；在 x86 机器上 `uname -m` 应为 `x86_64`，`ASCEND_TOOLKIT_HOME` 指向该机器已加载的 CANN，例如 `/usr/local/Ascend/cann-9.2.0`。
+以下命令在目标机生成完整运行目录；`ASCEND_TOOLKIT_HOME` 指向该机器已加载的 CANN，例如 `/usr/local/Ascend/cann-9.2.0`。
+本次设备 ABI v3 及数学逻辑不变，桥接新增计数 sanitizer 后须重新构建 `.so` 与清单；确认兼容的已有 `.o` 可作为构建输入。
 
 ```bash
 # Run from the repository root. ASCEND_TOOLKIT_HOME names the loaded toolkit.
-BUILD="$PWD/build/vq2a8-gs32-runtime-$(uname -m)"
+export BUILD="$PWD/build/vq2a8-gs32-runtime-ffn"
 bash csrc/mixed_w2w4_moe_ffn/run_mixed_w2w4_moe_ffn_esl.sh
 
 python tools/build_vq2a8_gs32_stage.py \
@@ -81,11 +114,11 @@ python tools/build_vq2a8_gs32_stage.py \
 file "$BUILD/libvq2a8_gs32_stage.so" "$BUILD/mixed_w2w4_moe_ffn.o"
 ```
 
-Shell 脚本编译 AIC/AIV 代码并链接生成算子 ELF。Python 工具基于已有 ELF **仅编译 Torch 桥接层**，在新进程中校验注册的算子 schema，并将 ELF 复制到 `.so` 所在目录。输出文件为 `$BUILD/libvq2a8_gs32_stage.so` 和 `$BUILD/mixed_w2w4_moe_ffn.o`。
+Shell 脚本编译 AIC/AIV 代码并链接生成算子 ELF。Python 工具基于已有 ELF **仅编译 Torch 桥接层**，在新进程中校验注册的算子 schema，并将 ELF 复制到 `.so` 所在目录。输出包括 `$BUILD/libvq2a8_gs32_stage.so`、`$BUILD/mixed_w2w4_moe_ffn.o` 和 `build-manifest.json`。
 
 x86 上 `.so` 应为 x86-64 ELF；`.o` 是 AI Core 设备程序，不要求显示为 x86-64。
 只有设备目标、算子源码与 CANN 版本相兼容时才可复用已有 `.o`，上述命令默认在目标机重新构建它。
-后续测试和服务启动应显式传入这两个新路径。当前仅验证了构建逻辑，x86+950 的实际编译、装载、数值与图回放仍待目标机验收。
+服务启动传入 `--gs32-runtime-dir "$BUILD"`；pytest 的两个独立产物参数保持不变。当前仅验证了构建逻辑，x86+950 的实际编译、装载、数值与图回放仍待目标机验收。
 
 schema 校验只能确认接口可用，不能证明 NPU 数值正确性或图回放正确性。不要将生成的二进制文件或构建日志提交到 Git。使用 `--dry-run` 可检查构建输入，不执行编译或写入文件。
 
@@ -132,7 +165,7 @@ python tools/build_vq2a8_gs32_stage.py \
   --torch-npu-path "$TARGET_SITE/torch_npu" \
   --cann "$SDK/usr/local/Ascend/cann-9.2.0" \
   --driver "$SDK/usr/local/Ascend/driver" \
-  --kernel-binary "$PWD/build/vq2a8-gs32-runtime/mixed_w2w4_moe_ffn.o" \
+  --kernel-binary "$PWD/build/vq2a8-gs32-runtime-ffn/mixed_w2w4_moe_ffn.o" \
   --build-dir "$BUILD"
 ```
 
@@ -145,8 +178,16 @@ python tools/build_vq2a8_gs32_stage.py \
 将 `$BUILD` 中的 `.so`、`.o` 和构建清单复制到 x86 机器，并在该机器的匹配 Python/CANN 环境中、仓库根目录运行已有 schema 检查：
 
 ```bash
-python -c 'import sys; from tools.build_vq2a8_gs32_stage import verify_loaded_library; print(verify_loaded_library(sys.argv[1]))' \
-  /path/to/x86-artifacts/libvq2a8_gs32_stage.so
+python - /path/to/x86-artifacts/libvq2a8_gs32_stage.so <<'PY'
+import sys
+import torch
+import torch_npu
+from tools.build_vq2a8_gs32_stage import register_counts_implementation, verify_registered_device_schemas
+
+torch.ops.load_library(sys.argv[1])
+register_counts_implementation()
+print(verify_registered_device_schemas(torch))
+PY
 ```
 
 通过后再执行下节的 NPU 数值和图回放测试。交叉编译仅覆盖 GS32 宿主桥接库；整套 vLLM Ascend 安装、
@@ -161,20 +202,22 @@ python -m pip install pytest torch numpy regex safetensors ml_dtypes
 python -X utf8 tools/run_vq2a8_cpu_tests.py
 ```
 
-在目标 NPU 上，以下测试覆盖激活与路由边界条件、原生分组投影、非默认流、无效路由恢复以及图捕获与回放。`$MODEL` 必须指向 source-v3 格式的混合 GS32 检查点。测试只读取选定的专家张量，不创建推理服务引擎。
+在目标 NPU 上，以下测试覆盖初始激活量化、设备路由、真实专家完整 FFN 数值及图捕获回放。
+`$MODEL` 必须指向 source-v3 混合 checkpoint；组件测试读取选定专家，不启动整模型服务。
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=4 python -m pytest -vv -s -x \
   tests/e2e/nightly/test_vq2a8_gs32_activation.py \
-  tests/e2e/nightly/test_vq2a8_gs32_activation_async.py \
   tests/e2e/nightly/test_vq2a8_gs32_device_routes.py \
-  tests/e2e/nightly/test_vq2a8_gs32_grouped.py \
-  tests/e2e/nightly/test_vq2a8_gs32_device_native.py \
+  tests/e2e/nightly/test_vq2a8_gs32_full_ffn.py \
   --vq2a8-model "$MODEL" \
   --vq2a8-gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
   --vq2a8-gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o"
 ```
 
-分组投影测试文件支持通过 `large_m and smoke`、`beyond_4096` 和 `beyond_32768` 选择表达式运行范围更小的专项测试。数值断言与投影计时分别进行；这些测试不能证明整模型精度、TTFT 或 TPOT 达标。
-
-本次迁移在 Windows CPU 环境中准备。Linux 编译、NPU 正确性、流行为及图回放必须在目标系统上另行验证；`feat/test` 的历史结果不能替代本次验证。
+完整 FFN 使用测试专用官方 GMM oracle；测试保留动态路由、热点、空 rank、无效输入恢复及多个图桶。
+图验收还会输出 `VQ2A8_GS32_FULL_FFN_TIMING`：6/384 行各预热 3 次、测量 5 次，记录 eager 与 graph 的
+NPUEvent 原始耗时和中位数，排除输入拷贝及 owner 状态读回。该数据用于同环境版本对比，不设固定时延阈值，
+也不能替代整模型吞吐或端到端延迟。
+整模型多卡、B64、答题精度和服务性能分别按 [NPU CI](vq2a8_npu_ci.md)、[精度](vq2a8_accuracy.md)
+和[吞吐](packed_weight_batch_throughput.md)指南验证。CPU 测试和历史结果不能代替本次目标环境验收。

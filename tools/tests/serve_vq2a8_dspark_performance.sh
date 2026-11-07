@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Pass --model, native artifacts and ASCEND_RT_VISIBLE_DEVICES explicitly.
+# Pass --model, --gs32-runtime-dir and ASCEND_RT_VISIBLE_DEVICES explicitly.
 # Defaults: packaged draft at MODEL/dspark, DP4/EP4, B4, 8K context/token budget.
 # Append --no-dspark to restart the same topology as an ordinary-decode baseline.
 set -euo pipefail
@@ -15,7 +15,6 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 
 exec python3 -u "$repo_root/tools/serve_vq2a8.py" \
   --dspark --parallel-mode dp-ep --ep-size 4 \
-  --gs32-execution full_graph --gs32-fusion none \
   --max-model-len 8192 --max-num-seqs 4 --max-num-batched-tokens 8192 \
   --kv-cache-mib 16384 --reserve-gib 16 \
   --tokenizer-mode deepseek_v4 --host 127.0.0.1 --port 8003 \

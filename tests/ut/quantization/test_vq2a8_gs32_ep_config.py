@@ -121,7 +121,7 @@ def test_gs32_ep_long_context_uses_existing_eager_config(modules, size, use_v2):
     assert modules.config.validate_vq2a8_config(config) == config.additional_config["vq2a8"]
 
 
-@pytest.mark.parametrize("execution", ["serial", "batched", "fused", "full_graph"])
+@pytest.mark.parametrize("execution", ["fused", "full_graph"])
 @pytest.mark.parametrize("overlap", [None, False, True])
 def test_gs32_rejects_shared_overlap_without_intermediate_events(modules, execution, overlap):
     config = ep_config(2)

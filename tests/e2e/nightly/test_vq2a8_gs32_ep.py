@@ -82,7 +82,7 @@ def variant_environment(parent_environment):
     return {**parent_environment, **dict(VARIANT_ENVIRONMENT)}
 
 
-def runner_options(execution, library, binary, ep_size, fusion="none"):
+def runner_options(execution, library, binary, ep_size, fusion="full_ffn"):
     if type(ep_size) is not int or ep_size not in (1, *EP_SIZES):
         raise ValueError("GS32 EP acceptance supports only EP1/2/4/8.")
     options = decode_runner_options(execution, library, binary)
@@ -105,7 +105,7 @@ def runner_options(execution, library, binary, ep_size, fusion="none"):
     return options
 
 
-def batch_runner_options(execution, library, binary, ep_size=BATCH_SMOKE_EP_SIZE, fusion="none"):
+def batch_runner_options(execution, library, binary, ep_size=BATCH_SMOKE_EP_SIZE, fusion="full_ffn"):
     if ep_size not in BATCH_SMOKE_EP_SIZES:
         raise ValueError(f"Batch smoke requires ep_size in {BATCH_SMOKE_EP_SIZES}.")
     options = runner_options(execution, library, binary, ep_size, fusion)
@@ -144,44 +144,26 @@ class GS32EPWorkerExtension:
             if bank is None:
                 continue
             assert layer.vq2a8_ep_rank == state["rank"] and layer.vq2a8_ep_size == state["ep_size"]
-            if bank.fusion == "full_ffn":
-                full = bank.full_ffn_bank
-                state["layers"].append(
-                    {
-                        "layer": layer.vq2a8_layer_index,
-                        "expert_ids": list(layer.vq2a8_local_global_expert_ids),
-                        "fusion": bank.fusion,
-                        "full_ffn": {
-                            "expert_ids": [expert + layer.vq2a8_expert_start for expert in full["expert_ids"]],
-                            "gate_w4": full["gate_w4"].tolist(),
-                            "down_w4": full["down_w4"].tolist(),
-                            "field_shapes": {name: list(value.shape) for name, value in full["fields"].items()},
-                        },
-                    }
-                )
-                state["full_ffn"].append(
-                    {
-                        "layer": layer.vq2a8_layer_index,
-                        "submissions": bank.full_ffn_submissions,
-                        "captures": bank.full_ffn_graph_captures,
-                    }
-                )
-                continue
+            assert bank.fusion == "full_ffn"
+            full = bank.full_ffn_bank
             state["layers"].append(
                 {
                     "layer": layer.vq2a8_layer_index,
                     "expert_ids": list(layer.vq2a8_local_global_expert_ids),
-                    "banks": {
-                        kind: {
-                            quant_type: {
-                                "expert_ids": [expert + layer.vq2a8_expert_start for expert in group["expert_ids"]],
-                                "field_names": list(group["fields"]),
-                                "field_counts": [value.shape[0] for value in group["fields"].values()],
-                            }
-                            for quant_type, group in groups.items()
-                        }
-                        for kind, groups in bank.banks.items()
+                    "fusion": bank.fusion,
+                    "full_ffn": {
+                        "expert_ids": [expert + layer.vq2a8_expert_start for expert in full["expert_ids"]],
+                        "gate_w4": full["gate_w4"].tolist(),
+                        "down_w4": full["down_w4"].tolist(),
+                        "field_shapes": {name: list(value.shape) for name, value in full["fields"].items()},
                     },
+                }
+            )
+            state["full_ffn"].append(
+                {
+                    "layer": layer.vq2a8_layer_index,
+                    "submissions": bank.full_ffn_submissions,
+                    "captures": bank.full_ffn_graph_captures,
                 }
             )
         state["layers"].sort(key=lambda item: item["layer"])
@@ -344,44 +326,31 @@ def check_inventory(states, config, ep_size, entries):
             assert layer["expert_ids"] == expected, (
                 f"Incorrect resident experts on rank {rank}, layer {layer['layer']}."
             )
-            if layer.get("fusion") == "full_ffn":
-                full = layer["full_ffn"]
-                assert full["expert_ids"] == expected
-                for kind, mask in (("gate_up", "gate_w4"), ("down", "down_w4")):
-                    assert full[mask] == [types[kind][expert] == "mxfp4" for expert in expected]
-                shapes = full["field_shapes"]
-                assert set(shapes) == {
-                    "gate_weight",
-                    "gate_table",
-                    "gate_row_scale",
-                    "down_weight",
-                    "down_table",
-                    "down_row_scale",
-                }
-                for stage, width in (("gate", 2 * config["moe_intermediate_size"]), ("down", config["hidden_size"])):
-                    assert shapes[f"{stage}_row_scale"] == [len(expected), width]
-                    assert len(shapes[f"{stage}_weight"]) == len(shapes[f"{stage}_table"]) == 1
-                continue
-            assert layer["banks"].keys() == types.keys()
-            for kind, inventory in types.items():
-                grouped = {q: [expert for expert in expected if inventory[expert] == q] for q in ("vq2", "mxfp4")}
-                assert set(layer["banks"][kind]) == {q for q, ids in grouped.items() if ids}
-                for quant_type, group in layer["banks"][kind].items():
-                    ids = grouped[quant_type]
-                    assert group["expert_ids"] == ids
-                    fields = group["field_names"]
-                    required = (
-                        {"packed_zn", "pair_lut", "row_scale_bits"} if quant_type == "vq2" else {"weight", "scale"}
-                    )
-                    assert len(fields) == len(set(fields)) and set(fields) == required
-                    assert group["field_counts"] == [len(ids)] * len(fields)
+            assert layer["fusion"] == "full_ffn"
+            full = layer["full_ffn"]
+            assert full["expert_ids"] == expected
+            for kind, mask in (("gate_up", "gate_w4"), ("down", "down_w4")):
+                assert full[mask] == [types[kind][expert] == "mxfp4" for expert in expected]
+            shapes = full["field_shapes"]
+            assert set(shapes) == {
+                "gate_weight",
+                "gate_table",
+                "gate_row_scale",
+                "down_weight",
+                "down_table",
+                "down_row_scale",
+            }
+            for stage, width in (("gate", 2 * config["moe_intermediate_size"]), ("down", config["hidden_size"])):
+                assert shapes[f"{stage}_row_scale"] == [len(expected), width]
+                assert len(shapes[f"{stage}_weight"]) == len(shapes[f"{stage}_table"]) == 1
 
 
-def check_graph_progress(execution, previous, current, layer_count, input_tokens, fusion="none"):
+def check_graph_progress(execution, previous, current, layer_count, input_tokens, fusion="full_ffn"):
     assert [state["rank"] for state in previous] == [state["rank"] for state in current]
     for before, after in zip(previous, current, strict=True):
         assert before["layers"] == after["layers"], "Resident inventory changed during generation."
-        expected_owners = 0 if execution == "fused" and fusion != "full_ffn" else layer_count
+        assert fusion == "full_ffn"
+        expected_owners = layer_count
         assert before["validity_owners"] == after["validity_owners"] == expected_owners
         for phase in ("prefill", "decode", "other"):
             enabled = execution != "fused" and (phase == "decode")
@@ -415,7 +384,7 @@ def check_route_reports(reports, ep_size, graph_mode):
         assert sorted(case["local_rows"] for case in cases) == [0] * (ep_size - 1) + [ROUTE_CAPACITY]
 
 
-def run_variant(model, library, binary, execution, ep_size, output, fusion="none"):
+def run_variant(model, library, binary, execution, ep_size, output, fusion="full_ffn"):
     startup = {name: os.environ.get(name) for name, _ in VARIANT_ENVIRONMENT}
     print(
         "VQ2A8_GS32_EP_STARTUP=" + json.dumps({"ep_size": ep_size, "execution": execution, "environment": startup}),
@@ -480,14 +449,17 @@ def run_variant(model, library, binary, execution, ep_size, output, fusion="none
     )
 
 
-def check_batch_graph_progress(execution, previous, current, layer_count, batch, *, mixed_lengths=False, fusion="none"):
+def check_batch_graph_progress(
+    execution, previous, current, layer_count, batch, *, mixed_lengths=False, fusion="full_ffn"
+):
     expected_bucket = str(next(size for size in BATCH_SMOKE_CAPTURE_SIZES if size >= batch))
     for before, after in zip(previous, current, strict=True):
         assert after["model_runner_version"] == 2, "The batch smoke test requires MRV2."
         assert before["rank"] == after["rank"] and before["layers"] == after["layers"]
         if execution == "fused":
             assert after["decode"] == before["decode"] == {"captures": 0, "replays": 0}
-            assert after["validity_owners"] == (layer_count if fusion == "full_ffn" else 0)
+            assert fusion == "full_ffn"
+            assert after["validity_owners"] == layer_count
             continue
         assert after["validity_owners"] == layer_count
         buckets_before, buckets_after = before["decode_buckets"], after["decode_buckets"]
@@ -508,7 +480,7 @@ def check_batch_graph_progress(execution, previous, current, layer_count, batch,
             assert after[phase]["replays"] == before[phase]["replays"] == 0
 
 
-def run_batch_variant(model, library, binary, execution, output, ep_size=BATCH_SMOKE_EP_SIZE, fusion="none"):
+def run_batch_variant(model, library, binary, execution, output, ep_size=BATCH_SMOKE_EP_SIZE, fusion="full_ffn"):
     """Load once per execution mode and exercise all decode buckets on EP2/EP4."""
     from vllm import SamplingParams
 
@@ -602,16 +574,16 @@ def check_full_ffn_evidence(states, execution):
 
 
 def test_gs32_ep4_full_ffn_decode_batch_smoke(request, tmp_path):
-    """Compare staged eager, full FFN eager and full FFN B1..B64 decode graphs."""
+    """Compare full FFN eager and full FFN B1..B64 decode graphs."""
     _check_decode_batch_smoke(
         request,
         tmp_path,
         ep_size=4,
-        variants=(("none", "fused"), ("full_ffn", "fused"), ("full_ffn", "full_graph")),
+        variants=(("full_ffn", "fused"), ("full_ffn", "full_graph")),
     )
 
 
-def _check_decode_batch_smoke(request, tmp_path, ep_size, variants=(("none", "fused"), ("none", "full_graph"))):
+def _check_decode_batch_smoke(request, tmp_path, ep_size, variants=(("full_ffn", "fused"), ("full_ffn", "full_graph"))):
     values = {
         name: request.config.getoption(flag, default=None)
         for name, flag in (
@@ -653,7 +625,7 @@ def _check_decode_batch_smoke(request, tmp_path, ep_size, variants=(("none", "fu
         assert returncode == 0, f"{label} failed; see {log}\n{log.read_text(encoding='utf-8')[-16000:]}"
         report = reports[fusion, execution] = json.loads(output.read_text(encoding="utf-8"))
         assert report["ep_size"] == ep_size and report["execution"] == execution
-        assert report.get("fusion", "none") == fusion
+        assert report.get("fusion") == fusion
         assert [wave["batch"] for wave in report["waves"]] == [
             *BATCH_SMOKE_SIZES,
             len(BATCH_SMOKE_MIXED_OUTPUT_TOKENS),
@@ -708,7 +680,7 @@ def test_gs32_ep_real_model_eager_and_graphs_match_single_card(request, tmp_path
         pytest.skip("Pass unified GS32 model and native artifacts; this opt-in test needs 2/4/8 visible NPUs.")
     assert all(values.values())
     paths = {name: Path(value).resolve(strict=True) for name, value in values.items()}
-    config = json.loads((paths["model"] / "config.json").read_text())
+    config = json.loads((paths["model"] / "config.json").read_text(encoding="utf-8"))
     assert config["quantization_config"]["format"] == "vq2_mixed_gs32_source"
     assert (paths["model"] / "model.safetensors.index.json").is_file()
     skip_single_card = request.config.getoption("--vq2a8-gs32-ep-skip-single-card", default=False)
@@ -744,8 +716,8 @@ def test_gs32_ep_real_model_eager_and_graphs_match_single_card(request, tmp_path
                 check=False,
                 timeout=CHILD_TIMEOUT_SECONDS,
             )
-        assert child.returncode == 0, f"{label} failed; see {log}\n{log.read_text()[-16000:]}"
-        reports[(size, execution)] = json.loads(output.read_text())
+        assert child.returncode == 0, f"{label} failed; see {log}\n{log.read_text(encoding='utf-8')[-16000:]}"
+        reports[(size, execution)] = json.loads(output.read_text(encoding="utf-8"))
     eager = reports[(ep_size, "fused")]
     if not skip_single_card:
         single = reports[(1, "fused")]
@@ -783,7 +755,7 @@ if __name__ == "__main__":
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--ep-size", type=int, choices=(1, *EP_SIZES), required=True)
     parser.add_argument("--execution", choices=EXECUTIONS, required=True)
-    parser.add_argument("--fusion", choices=("none", "full_ffn"), default="none")
+    parser.add_argument("--fusion", choices=("full_ffn",), default="full_ffn")
     parser.add_argument("--batch-smoke", action="store_true")
     args = parser.parse_args()
     if args.batch_smoke:

@@ -45,6 +45,30 @@ from ..registry import register_scheme
 SITU_MX_DST_TYPE_E4M3FN = 36
 
 
+def prepare_mxfp4_projection(
+    weight: torch.Tensor, scale: torch.Tensor, *, group_size: int = 32
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare a natural [N,K/2] FP4 projection (optionally expert-stacked).
+
+    E8M0 scales are reinterpreted as bytes, never numerically converted. Keep
+    the transposed scale view: the GMM ABI uses its strides to identify N-major
+    microscaling blocks. This is a load-time operation, before graph capture.
+    """
+    if weight.ndim not in (2, 3) or weight.dtype != torch.uint8:
+        raise ValueError("MXFP4 weights require uint8 [N,K/2] or [E,N,K/2].")
+    if scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+        raise ValueError("MXFP4 scales require E8M0 values or their uint8 storage.")
+    if group_size <= 0 or weight.shape[-1] % group_size:
+        raise ValueError("MXFP4 projection requires K divisible by two scale groups.")
+    if scale.shape != (*weight.shape[:-1], 2 * weight.shape[-1] // group_size):
+        raise ValueError("MXFP4 projection requires matching per-group scales.")
+    weight = torch_npu.npu_format_cast(
+        weight, ACL_FORMAT_FRACTAL_NZ, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
+    ).transpose(-1, -2)
+    scale = scale.view(torch.uint8).reshape(*scale.shape[:-1], scale.shape[-1] // 2, 2).transpose(-3, -2)
+    return weight, scale
+
+
 @register_scheme("W4A8_MXFP", "linear")
 class AscendW4A8MXFPDynamicLinearMethod(AscendLinearScheme):
     """Linear method for Ascend W4A8_MXFP (Microscaling) quantization."""

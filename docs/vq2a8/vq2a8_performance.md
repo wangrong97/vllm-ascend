@@ -14,16 +14,16 @@
 
 ### 1. 指定 NPU 卡并启动服务
 
-下面用 **物理卡 4、5，MRV2、EP2、B4、chunk8192、fusion=none** 启动一个 256K 服务，
+下面用 **物理卡 4、5，MRV2、EP2、B4、chunk8192、完整 FFN** 启动一个 256K 服务，
 可以依次完成整个 `standard`，包括里面的短输入和 64K 输入，无须按长度重启。
-`MODEL` 指向已准备好的模型目录；`BUILD` 指向已有 `.so` 和 `.o` 的实际目录，
+`MODEL` 指向已准备好的模型目录；`BUILD` 指向包含 `build-manifest.json`、`.so` 和 `.o` 的实际目录，
 这个变量本身不会创建或编译任何文件。
 
 在终端 A 执行；将示例绝对路径替换成实际路径：
 
 ```bash
 export MODEL=/path/to/DeepSeek-V4-Flash-vq2a8-mixed-gs32-repack
-export BUILD=/path/to/existing/gs32-artifacts
+export BUILD="$PWD/build/vq2a8-gs32-runtime-ffn"
 
 mkdir -p benchmark-results/performance
 set -o pipefail
@@ -31,21 +31,19 @@ set -o pipefail
 ASCEND_RT_VISIBLE_DEVICES=4,5 VLLM_USE_V2_MODEL_RUNNER=1 \
 bash tools/tests/serve_vq2a8_256k_1K.sh \
   --model "$MODEL" \
-  --gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
-  --gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o" \
-  --gs32-fusion none \
+  --gs32-runtime-dir "$BUILD" \
   --max-model-len 263168 \
   --max-num-seqs 4 \
   --max-num-batched-tokens 8192 \
   --kv-cache-mib 16384 \
-  2>&1 | tee benchmark-results/performance/serve-mrv2-ep2-chunk8192-none.log
+  2>&1 | tee benchmark-results/performance/serve-mrv2-ep2-chunk8192-full-ffn.log
 ```
 
 `ASCEND_RT_VISIBLE_DEVICES=4,5` 选择两张服务用卡；改成 `0,1` 即使用卡 0、1。
 VQ2A8 启动器默认使用 MRV2；显式设置 `VLLM_USE_V2_MODEL_RUNNER=0` 并重启可切换至 MRV1。
 脚本保留显式设备和 runner 选择。默认地址为 `http://127.0.0.1:8003`，服务模型名为 `vq2a8`。
 
-该启动脚本使用 `full_graph`，上面的 `--max-num-seqs 4` 启用 **B1/B2/B4 decode 图回放，prefill 仍为 eager**；
+该启动脚本默认使用完整 FFN 和 `full_graph`，上面的 `--max-num-seqs 4` 启用 **B1/B2/B4 decode 图回放，prefill 仍为 eager**；
 同时关闭 prefix caching，最多调度 4 个活动序列。不加该覆盖参数时，脚本仍默认 B1。
 `--max-num-batched-tokens 8192`
 是每个调度步的 token 预算，不要求小请求补成 8192 个真实输入 token。
@@ -138,14 +136,12 @@ python tools/tests/run_vq2a8_performance_suite.py \
 ASCEND_RT_VISIBLE_DEVICES=4,5 VLLM_USE_V2_MODEL_RUNNER=1 \
 bash tools/tests/serve_vq2a8_1M_1K.sh \
   --model "$MODEL" \
-  --gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
-  --gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o" \
-  --gs32-fusion none \
+  --gs32-runtime-dir "$BUILD" \
   --max-model-len 1049600 \
   --max-num-seqs 4 \
   --max-num-batched-tokens 8192 \
   --kv-cache-mib 16384 \
-  2>&1 | tee benchmark-results/performance/serve-mrv2-ep2-1m-chunk8192-none.log
+  2>&1 | tee benchmark-results/performance/serve-mrv2-ep2-1m-chunk8192-full-ffn.log
 ```
 
 1M 脚本默认 chunk 为 128，命令显式改为 8192，保持与上面的性能对照一致。

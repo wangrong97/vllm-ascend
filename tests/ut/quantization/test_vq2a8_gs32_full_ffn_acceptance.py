@@ -51,7 +51,7 @@ def test_full_ffn_evidence_requires_actual_launch_and_capture(execution, fault):
         ep_probe.check_full_ffn_evidence([state], execution)
 
 
-def test_ep4_full_ffn_runs_three_isolated_variants(monkeypatch, tmp_path):
+def test_ep4_full_ffn_runs_two_isolated_variants(monkeypatch, tmp_path):
     library, binary = tmp_path / "stage.so", tmp_path / "kernel.o"
     library.touch()
     binary.touch()
@@ -96,10 +96,10 @@ def test_ep4_full_ffn_runs_three_isolated_variants(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ep_probe, "execute", execute)
     ep_probe.test_gs32_ep4_full_ffn_decode_batch_smoke(request, tmp_path)
-    assert variants == [("none", "fused"), ("full_ffn", "fused"), ("full_ffn", "full_graph")]
+    assert variants == [("full_ffn", "fused"), ("full_ffn", "full_graph")]
     assert (
         ep_probe.batch_runner_options("fused", library, binary, 4)["additional_config"]["vq2a8"]["gs32_fusion"]
-        == "none"
+        == "full_ffn"
     )
     candidate = ep_probe.batch_runner_options("fused", library, binary, 4, "full_ffn")
     assert candidate["enforce_eager"] and candidate["max_num_seqs"] == 64

@@ -157,6 +157,7 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         num_expert_group = self.num_expert_group if self.num_expert_group is not None else 1
         renorm = int(self.renormalize)
         if self.scoring_func == "sqrtsoftplus":
+            router_logits = router_logits.float()
             if self.tid2eid is not None or self.bias_vl is not None:
                 if input_ids is None:
                     raise ValueError("DeepSeek V4 vision/hash MoE routing requires input_ids.")
@@ -212,7 +213,8 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 routed_scaling_factor=self.routed_scaling_factor,
                 eps=1e-20,
                 group_select_mode=1,
-                # The hash custom op currently accepts only renorm=0.
+                # The kernel normalizes sqrtsoftplus selections even with
+                # renorm=0; do not normalize or apply the routing scale twice.
                 renorm=0,
                 norm_type=2,
                 out_flag=False,
@@ -220,6 +222,11 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 image_sentinel_lo=self.image_sentinel_lo,
                 image_sentinel_count=DEEPSEEK_V4_IMAGE_SENTINEL_COUNT,
             )
+            if not self.renormalize:
+                # The hash kernel has no unnormalized sqrtsoftplus mode.
+                # Retain its expert selection, then recover unbiased scores.
+                scores = torch.nn.functional.softplus(router_logits).sqrt()
+                topk_weights = scores.gather(1, topk_ids.to(torch.int64)) * self.routed_scaling_factor
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32 if indices_type is None else indices_type)
         norm_type = 0 if self.scoring_func == "softmax" else 1
         if self.e_score_correction_bias is not None and self.e_score_correction_bias.dtype != router_logits.dtype:

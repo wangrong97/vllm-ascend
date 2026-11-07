@@ -21,7 +21,9 @@ def test_natural_gate_layout_preserves_every_pair_and_scale():
     payload, spec, source_indices = fixture()
     fields = repack_gs32_matrix(payload, spec, down_stage=True)
     assert not torch.equal(fields["packed_zn"], repack_gs32_matrix(payload, spec)["packed_zn"])
-    decoded = FakeDownOps.decode(fields["packed_zn"].unsqueeze(0), fields["pair_lut"].unsqueeze(0))
+    from tests.support.vq2a8_oracle import decode_gs32_fp8
+
+    decoded = decode_gs32_fp8(fields["packed_zn"], fields["pair_lut"]).float().T
     torch.testing.assert_close(decoded, literal_lookup(payload, spec, source_indices), rtol=0, atol=0)
     torch.testing.assert_close(fields["row_scale_bits"].to(torch.int32).view(torch.float32), payload["row_scale"])
 
@@ -87,40 +89,3 @@ def test_swiglu_clips_asymmetrically_and_rounds_once():
     for limit in (-1, float("nan"), float("inf")):
         with pytest.raises(ValueError):
             staged_swiglu(gate_up, limit)
-
-
-class FakeDownOps:
-    """Explicit CPU test transport decoding the ACTUAL native packed bytes."""
-
-    def __init__(self):
-        self.launches = 0
-        self.tilings = []
-
-    def check_eager(self):
-        pass
-
-    def make_tiling(self, k, n):
-        self.tilings.append((k, n))
-        return torch.zeros(1632, dtype=torch.uint8)
-
-    @staticmethod
-    def decode(packed, lut):
-        n, k = packed.shape[1] * 32, packed.shape[2] * 16
-        bytes_ = packed[0].numpy()
-        indices = np.stack((bytes_ & 15, bytes_ >> 4), -1).reshape(n // 32, k // 32, 32, 16)
-        weight = torch.empty(n, k)
-        for nt in range(n // 32):
-            for kt in range(k // 32):
-                books = lut[0, nt, kt].contiguous().view(torch.float8_e4m3fn).float().reshape(16, 2)
-                tile = books[torch.from_numpy(indices[nt, kt].astype(np.int64))].permute(1, 2, 0).reshape(32, 32)
-                weight[nt * 32 : (nt + 1) * 32, kt * 32 : (kt + 1) * 32] = tile
-        return weight
-
-    def project(self, data, scales, weight, lut, row_scale, group_list, mask, tiling, output):
-        assert group_list.device.type == mask.device.type == tiling.device.type == "cpu"
-        assert group_list.tolist() == [output.shape[0]] and mask.tolist() == [0]
-        assert row_scale.dtype == torch.int64
-        decoded = self.decode(weight, lut)
-        coefficient = row_scale[0].to(torch.int32).view(torch.float32)
-        output.copy_((dequantize_mxfp8_k32(data, scales) @ decoded.T) * coefficient)
-        self.launches += 1

@@ -9,6 +9,30 @@ import pytest
 
 from tests.ut.quantization.test_vq2a8_gs32_fixtures import modules, serving_config  # noqa: F401
 from tools import serve_vq2a8 as serve
+from tools.vq2a8_source_contract import source_contract
+
+
+def test_full_ffn_defaults_resolve_to_native_decode_graph():
+    assert source_contract()["resolve_gs32_options"]({}) == {
+        "gs32_backend": "native",
+        "gs32_fusion": "full_ffn",
+        "gs32_execution": "full_graph",
+    }
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("gs32_backend", "reference_mxfp8"),
+        ("gs32_fusion", "none"),
+        ("gs32_fusion", "swiglu_quant"),
+        ("gs32_execution", "serial"),
+        ("gs32_execution", "batched"),
+    ],
+)
+def test_retired_serving_modes_are_rejected_without_fallback(option, value):
+    with pytest.raises(ValueError, match="full_ffn"):
+        source_contract()["resolve_gs32_options"]({option: value})
 
 
 def runtime_config_from_command(command):
@@ -46,8 +70,8 @@ def runtime_config_from_command(command):
     return config
 
 
-@pytest.mark.parametrize("execution", [None, "serial", "batched", "fused", "full_graph"])
-@pytest.mark.parametrize("fusion", [None, "none", "swiglu_quant", "full_ffn"])
+@pytest.mark.parametrize("execution", [None, "fused", "full_graph"])
+@pytest.mark.parametrize("fusion", [None, "full_ffn"])
 def test_gs32_server_selects_native_stage_and_standard_loader(modules, tmp_path, execution, fusion):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -63,12 +87,8 @@ def test_gs32_server_selects_native_stage_and_standard_loader(modules, tmp_path,
         + ([] if execution is None else ["--gs32-execution", execution])
         + ([] if fusion is None else ["--gs32-fusion", fusion])
     )
-    if fusion in (None, "full_ffn") and execution in ("serial", "batched"):
-        with pytest.raises(ValueError, match="full_ffn requires"):
-            serve.build_command(args)
-        return
     command = serve.build_command(args)
-    graph = execution == "full_graph"
+    graph = execution in (None, "full_graph")
     assert ("--enforce-eager" in command) == (not graph)
     compilation = json.loads(command[command.index("--compilation-config") + 1])
     if graph:
@@ -92,7 +112,7 @@ def test_gs32_server_selects_native_stage_and_standard_loader(modules, tmp_path,
         "gs32_binary": str(binary),
         "gs32_backend": "native",
         "gs32_fusion": fusion or "full_ffn",
-        "gs32_execution": execution or ("fused" if fusion in (None, "full_ffn") else "serial"),
+        "gs32_execution": execution or "full_graph",
     }
     assert options == expected
     assert modules.config.validate_vq2a8_config(runtime_config_from_command(command)) == options
@@ -104,11 +124,11 @@ def test_gs32_server_selects_native_stage_and_standard_loader(modules, tmp_path,
 
 
 def test_gs32_server_rejects_unknown_fusion_before_loading():
-    with pytest.raises(SystemExit) as error:
-        serve.parse_args(
-            ["--model", "model", "--gs32-library", "stage.so", "--gs32-binary", "stage.o", "--gs32-fusion", "all"]
-        )
-    assert error.value.code == 2
+    args = serve.parse_args(
+        ["--model", "model", "--gs32-library", "stage.so", "--gs32-binary", "stage.o", "--gs32-fusion", "all"]
+    )
+    with pytest.raises(ValueError, match="full_ffn"):
+        serve.build_command(args)
 
 
 @pytest.mark.parametrize(
@@ -179,7 +199,7 @@ def test_launcher_default_token_budget_can_hold_batch_for_short_context(server_a
     assert command[command.index("--max-num-batched-tokens") + 1] == "64"
 
 
-@pytest.mark.parametrize("execution", ["serial", "batched", "fused", "full_graph"])
+@pytest.mark.parametrize("execution", ["fused", "full_graph"])
 def test_long_context_keeps_prefill_workspace_bounded(tmp_path, execution):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -205,7 +225,7 @@ def test_long_context_keeps_prefill_workspace_bounded(tmp_path, execution):
             "--max-model-len",
             "17408",
             "--gs32-fusion",
-            "none",
+            "full_ffn",
             "--dry-run",
         ]
     )

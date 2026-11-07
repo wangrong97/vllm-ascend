@@ -680,6 +680,11 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             topk_weights = torch.cat([topk_weights, shared_expert_weights], dim=1)
         if get_ascend_config().enable_force_eplb:
             topk_ids = get_force_eplb_topk(topk_ids, num_logical_experts)
+        elif enable_force_load_balance and self.quant_type == QuantType.VQ2A8:
+            # Profile only experts present in this checkpoint's sparse inventory.
+            stored_ids = torch.tensor(self.vq2a8_expert_ids, device=topk_ids.device, dtype=topk_ids.dtype)
+            slots = torch.randint(len(self.vq2a8_expert_ids), topk_ids.shape, device=topk_ids.device)
+            topk_ids = stored_ids[slots]
         elif enable_force_load_balance:
             random_matrix = torch.rand(
                 topk_ids.size(0),

@@ -114,6 +114,8 @@ def test_launchers_build_dual_card_decode_graph_command(tmp_path, assets, case, 
         "gs32_library": str(library),
         "gs32_binary": str(binary),
         "gs32_execution": "full_graph",
+        "gs32_backend": "native",
+        "gs32_fusion": "full_ffn",
     }
 
 
