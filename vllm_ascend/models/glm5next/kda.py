@@ -138,12 +138,28 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         prefix: str = "",
     ) -> None:
         # KDA projections remain BF16 because fp8 checkpoints omit their scales.
-        saved_quant_config = vllm_config.quant_config
-        try:
-            vllm_config.quant_config = None
+        # 但 ModelSlim 量化 checkpoint(如 w4a4-kda8)可能携带 KDA 投影的量化
+        # scale; 此时必须保留 quant_config, 否则打包投影按未量化创建、缺少
+        # weight_scale 参数, 加载时报 KeyError。
+        kda_quantized = False
+        _qc = vllm_config.quant_config
+        _desc = getattr(_qc, "quant_description", None) if _qc is not None else None
+        if _desc:
+            for _k, _v in _desc.items():
+                if isinstance(_v, str) and _v != "FLOAT" and (
+                    "in_proj_qkvbfg_a" in _k or _k.endswith("self_attn.q_proj.weight")
+                ):
+                    kda_quantized = True
+                    break
+        if kda_quantized:
             super().__init__(config, vllm_config, prefix)
-        finally:
-            vllm_config.quant_config = saved_quant_config
+        else:
+            saved_quant_config = vllm_config.quant_config
+            try:
+                vllm_config.quant_config = None
+                super().__init__(config, vllm_config, prefix)
+            finally:
+                vllm_config.quant_config = saved_quant_config
 
         if config.linear_head_dim != 128 or vllm_config.model_config.dtype != torch.bfloat16:
             raise ValueError("GLM AscendC KDA requires BF16 activations and head_dim=128.")

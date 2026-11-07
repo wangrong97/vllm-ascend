@@ -122,12 +122,16 @@ UPDATED_PACKED_MODULES_MAPPING: dict[str, dict[str, list[str]]] = {
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
         "fused_qkvbfg_a_proj": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
+        # vllm-ascend 运行时 KDA 模块名(kda.py 的打包投影); 无此映射时
+        # 打包模块查不到量化描述而缺少 weight_scale 参数, 加载 scale 时 KeyError
+        "in_proj_qkvbfg_a": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
     },
     "glm5_next_mtp": {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
         "fused_qkvbfg_a_proj": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
+        "in_proj_qkvbfg_a": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
     },
     "deepseek_mtp": {
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -700,6 +704,11 @@ class AscendModelSlimConfig(QuantizationConfig):
             )
 
         if isinstance(layer, LinearBase):
+            if "in_proj_qkvbfg_a" in prefix:  # TEMP-DEBUG: KDA 打包投影量化解析排查
+                logger.warning(
+                    "TEMP-DEBUG KDA packed: model_type=%s runtime_prefix=%s mapped=%s quant_type=%s packed_keys=%s",
+                    model_type, runtime_prefix, prefix, quant_type, list(self.packed_modules_mapping),
+                )
             if quant_type is None:
                 # Delayed import to avoid circular import
                 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
