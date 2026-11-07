@@ -211,7 +211,7 @@ def test_only_explicit_bfloat16_selects_bf16_kv_on_a5():
         assert is_a5_bf16_kv_enabled(_cache_config("bfloat16"))
         assert not is_a5_bf16_kv_enabled(_cache_config())
         assert not is_a5_bf16_kv_enabled(_cache_config("fp8"))
-        # The A5 spec path rewrites cache_dtype once FP8 KV is chosen.
+        # The native FP8 dtype alias must also retain the FP8 plan.
         assert not is_a5_bf16_kv_enabled(_cache_config("float8_e4m3fn"))
 
 
@@ -235,12 +235,12 @@ def test_a5_collapses_non_bfloat16_requests_to_auto():
         assert resolve_dsv4_cache_dtype("fp8", "bfloat16") == "auto"
 
 
-def test_a5_mode_survives_the_spec_path_rewrite():
+def test_a5_mode_accepts_the_native_fp8_dtype_alias():
     with _on(AscendDeviceType.A5):
         for launch in ("auto", "fp8"):
             pinned = resolve_dsv4_cache_dtype(launch, "bfloat16")
             assert not is_a5_bf16_kv_enabled(_cache_config(pinned))
-            # layer.get_kv_cache_spec pins FP8 once it has picked the mode.
+            # Accept the native dtype alias without requiring a config rewrite.
             assert not is_a5_bf16_kv_enabled(_cache_config("float8_e4m3fn"))
 
         pinned = resolve_dsv4_cache_dtype("bfloat16", "bfloat16")

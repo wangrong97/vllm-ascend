@@ -46,9 +46,9 @@ class TestCaMem(PytestBase):
         ],
     )
     def test_create_and_map_calls_python_create_and_map(self, handle):
-        with patch("vllm_ascend.device_allocator.camem.python_create_and_map") as mock_create:
+        with patch("vllm_ascend.device_allocator.camem._get_camem_extension") as mock_extension:
             create_and_map(handle)
-            mock_create.assert_called_once_with(*handle)
+            mock_extension.return_value.python_create_and_map.assert_called_once_with(*handle)
 
     @pytest.mark.parametrize(
         "handle",
@@ -58,13 +58,14 @@ class TestCaMem(PytestBase):
         ],
     )
     def test_unmap_and_release_calls_python_unmap_and_release(self, handle):
-        with patch("vllm_ascend.device_allocator.camem.python_unmap_and_release") as mock_release:
+        with patch("vllm_ascend.device_allocator.camem._get_camem_extension") as mock_extension:
             unmap_and_release(handle)
-            mock_release.assert_called_once_with(*handle)
+            mock_extension.return_value.python_unmap_and_release.assert_called_once_with(*handle)
 
-    @patch("vllm_ascend.device_allocator.camem.init_module")
+    @patch("vllm_ascend.device_allocator.camem.find_loaded_library", return_value="/loaded/vllm_ascend_C.so")
+    @patch("vllm_ascend.device_allocator.camem._get_camem_extension")
     @patch("vllm_ascend.device_allocator.camem.torch.npu.memory.NPUPluggableAllocator")
-    def test_get_pluggable_allocator(self, mock_allocator_class, mock_init_module):
+    def test_get_pluggable_allocator(self, mock_allocator_class, mock_extension, mock_find_library):
         mock_allocator_instance = MagicMock()
         mock_allocator_class.return_value = mock_allocator_instance
 
@@ -72,10 +73,12 @@ class TestCaMem(PytestBase):
             malloc_fn((1, 2, 3))
             free_fn(123)
 
-        mock_init_module.side_effect = side_effect_malloc_and_free
+        mock_extension.return_value.init_module.side_effect = side_effect_malloc_and_free
 
         allocator = get_pluggable_allocator(dummy_malloc, dummy_free)
-        mock_init_module.assert_called_once_with(dummy_malloc, dummy_free)
+        mock_extension.return_value.init_module.assert_called_once_with(dummy_malloc, dummy_free)
+        mock_find_library.assert_called_once_with("vllm_ascend_C")
+        mock_allocator_class.assert_called_once_with("/loaded/vllm_ascend_C.so", "my_malloc", "my_free")
         assert allocator == mock_allocator_instance
 
     def test_singleton_behavior(self):

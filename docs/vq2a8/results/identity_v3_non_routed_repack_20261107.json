@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "status": "finished",
+  "created_utc": "2026-11-07T08:40:12.950330+00:00",
+  "source": "D:\\models\\DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3",
+  "output": "D:\\models\\DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3-export-20261103",
+  "contract": "export-20261103",
+  "source_tensors": 63807,
+  "target_tensors": 64172,
+  "actions": {
+    "routed_copy": 62608,
+    "copy": 599,
+    "norm_cast": 235,
+    "quantize_fp8": 365
+  },
+  "source_config_sha256": "d164072b0683f4e813e20582c82d7f7d74242bb3f919a7aa82c9ed2300b12105",
+  "source_index_sha256": "b17e041a5fdc04506a6e64d1f2be838bba36d6e759f38fbefd698ca21172c0db",
+  "routed_payload_bytes": 87179132928,
+  "quantization": {
+    "block_size": [
+      128,
+      128
+    ],
+    "weight_dtype": "F8_E4M3",
+    "scale_dtype": "F8_E8M0",
+    "scale_formula": "2**ceil(log2(amax/448)); zero block uses 1",
+    "rounding": "FP32 division then E4M3FN round-to-nearest-even; no BF16 intermediate",
+    "norm_conversion": "F32 to BF16 only if exactly representable"
+  },
+  "storage": {
+    "payload": {
+      "source_bytes": 101882972508,
+      "target_bytes": 96025092316,
+      "saved_bytes": 5857880192,
+      "saved_percent": 5.749616494100652
+    },
+    "files": {
+      "source_bytes": 101905160754,
+      "target_bytes": 96070105908,
+      "saved_bytes": 5835054846,
+      "saved_percent": 5.725965989186629
+    }
+  },
+  "model_executed": false,
+  "limitations": [
+    "FP8 conversion is lossy; inference accuracy is not certified.",
+    "No NPU, HCCL or graph-capture validation."
+  ],
+  "verification": {
+    "all_output_tensors_reread_sha256": true,
+    "source_snapshot_unchanged": true,
+    "routed_payload_byte_identical": true,
+    "directory_file_bytes_recounted": true,
+    "non_routed_original_layouts": {
+      "matched": true,
+      "families": 50,
+      "tensors": 1564,
+      "reference": "docs/vq2a8/deepseek_v4_flash_0731_reference.json"
+    },
+    "inspector_findings": {
+      "NATURAL_INPUT_COLUMNS": {
+        "severity": "info",
+        "count": 18576,
+        "examples": [
+          "layers.0.ffn.experts.0.w13: requires natural input-column order",
+          "layers.0.ffn.experts.0.w2: requires natural input-column order"
+        ]
+      }
+    }
+  },
+  "output_index_sha256": "21fd7aebc6ed7c80747790beb1badec3fc9fdb82f25a2919f5acc9c76eca4266",
+  "export_spec_sha256": "8609157ca102f8dfff2e2f7ee7ffc4426f10fa15e13a672d2bae6b73606a805a",
+  "torch_version": "2.15.0+cpu",
+  "threads": 4,
+  "report_kind": "non_routed_repack_local_result",
+  "detailed_report": "D:\\models\\DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3-export-20261103\\repack_report.json",
+  "quantization_error": {
+    "scope": "365 converted matrices; reconstructed FP8 versus source BF16, not model accuracy",
+    "elements": 5857345536,
+    "aggregate_rmse": 0.0003497510901440591,
+    "aggregate_relative_l2": 0.011999005363635554,
+    "max_abs_error": 0.03125,
+    "per_matrix_relative_l2_min": 0.0,
+    "per_matrix_relative_l2_max": 0.02669174785564514,
+    "max_relative_l2_matrix": "layers.31.attn.wkv.weight"
+  }
+}
