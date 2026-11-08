@@ -7,7 +7,8 @@
 Linux 路径按内网实际存放位置调整，服务端和客户端使用同一份模型；本地已检查的目录为 `D:\models\DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3-export-20261103`。
 本分支只接受自然输入列顺序，旧 `.perm` 张量（包括恒等排列）会被拒绝。
 在内网 Linux 仓库根目录执行，沿用当前环境及与本分支匹配的 GS32 构建产物。
-只测 TP4/EP4、DP1，不测 baseline 或其他卡数。
+第 1、2 节测试 TP4/EP4、DP1；第 5 节提供 TP1/DP4/EP4 的启动和压测命令。不测 baseline 或其他卡数。
+原始权重的对照命令见 [baseline TP4 / DP4 吞吐测评](baseline_batch_throughput.md)。
 生产入口固定使用 native 完整 FFN；默认 decode 图回放，prefill 以 eager 执行同一完整融合。
 
 默认测的是 [repack 输出](repack_non_routed.md)：非 routed 主矩阵采用 FP8 权重及动态 MXFP8 激活，routed 字节不变。
@@ -41,7 +42,7 @@ python tools/build_vq2a8_gs32_stage.py \
 比较优化前后性能时使用同一服务器、同一四卡、模型、CANN、图桶、KV 与调度预算，先预热后重复测量。
 同时记录服务加载后的图捕获时间、峰值显存、吞吐及 TTFT/TPOT；历史两卡和四卡结果不能作为本轮改动的收益证据。
 
-## 1. 终端 A：启动服务
+## 1. 终端 A：启动 TP4 服务
 
 如果已按本节命令启动服务且符合下表，保持运行并直接执行第 2 节。重启前先停止原服务。设备选择及显存占用由使用者确认，
 下面的 `4,5,6,7` 可换成实际空闲四卡。启动日志中的 `world_size` 应为 `4`。
@@ -96,7 +97,7 @@ python -u tools/serve_vq2a8.py \
 若出现 `Free memory ... less than desired GPU memory utilization`，是在权重加载前的设备检查失败；
 应先处理所选卡的占用。仅修改客户端 `--ep-size` 不会改变服务的实际卡数。
 
-## 2. 终端 B：扫描并发 1～64
+## 2. 终端 B：TP4 扫描并发 1～64
 
 使用与服务相同的 Python/vLLM 环境。暂停其他请求，保持服务配置不变。
 目标输入 1024、输出 128 tokens；每档正式请求数为 `4×并发`，显式预热 1 次，正式测量 1 次。
@@ -185,3 +186,125 @@ CLI 的初始校验请求和显式预热不计入正式指标。
 独立数值参考仅存在于测试中：`tests/support/vq2a8_oracle.py` 定义量化和裁剪语义，
 NPU 测试以解码后的权重及官方 GMM 对照完整 FFN。按 [NPU 验收指南](vq2a8_npu_ci.md)
 检查真实混精专家、动态路由、图桶和整模型 eager/graph 一致性；这些检查不由吞吐压测代替。
+
+## 5. DP4：TP1/DP4/EP4 四卡吞吐测试
+
+服务端和客户端均使用 `--parallel-mode dp-ep --ep-size 4`，启动器配置 TP1、DP4、EP4，
+由单个 API 服务向四个本地 engine 分配请求。Attention、共享专家等普通层按 DP 复制，routed experts 按 EP4 分片，
+并非每张卡加载一份完整模型。切换拓扑前先停止占用同一组卡的 TP4 服务，等待显存释放。
+
+以下命令采用现有 [DP 整模型验收](vq2a8_npu_ci.md#dp-ep-整模型验收)的每 engine B16 配置，
+全局活动序列上限为 64，先与第 1、2 节使用相同请求负载对照。目标服务器上的数值、通信和图回放仍需实际验收。
+
+| 参数 | DP4 设置 |
+| --- | --- |
+| 模型执行 | native、MRV2、full_graph decode、eager chunked prefill、fusion=full_ffn |
+| 拓扑 | TP1、DP4、EP4，共四卡 |
+| 活动序列上限 | 每 engine `max-num-seqs=16`，全局最多 64 |
+| token 预算 | 每 engine `max-num-batched-tokens=2048`，四个 engine 合计上限 8192 |
+| 上下文与 KV | max-model-len=8192；每个 worker 16384 MiB KV |
+| decode 图桶 | 每 engine `[1,2,4,8,16]` |
+| HTTP 端口与记录入口 | `8005`、`current-native-dp4-8005` |
+
+DP4 的非 routed 权重、工作区和图内存占用与 TP4 不同；相同 KV 字节预算也不保证相同有效 token 容量。
+这里的全局上限是配置容量，客户端并发不保证均匀分到四个 engine，也不等于每步实际 batch。
+
+### 5.1 终端 A：启动 DP4 服务
+
+在仓库根目录执行，复用第 0 节构建的 ABI v4 产物。服务目录仍以时间标签结尾，使用独立的 DP4 记录链接。
+
+```bash
+set -o pipefail
+export MODEL=/mnt/share/g00872988/DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3-export-20261103
+export BUILD="$PWD/build/vq2a8-gs32-runtime-ffn"
+RESULT_ROOT="$PWD/benchmark-results/batch-throughput"
+SERVE_DIR="$RESULT_ROOT/serve-noperm-mixed-nonrouted-fp8-native-dp4-ep4-b16-$(date +%Y%m%d_%H%M%S)"
+SERVE_LINK="$RESULT_ROOT/current-native-dp4-8005"
+mkdir -p "$RESULT_ROOT" &&
+mkdir "$SERVE_DIR" &&
+git rev-parse HEAD > "$SERVE_DIR/commit.txt" &&
+git status --short > "$SERVE_DIR/worktree.txt" &&
+sha256sum "$MODEL/config.json" "$MODEL/model.safetensors.index.json" > "$SERVE_DIR/model-files.sha256" &&
+sha256sum "$BUILD/libvq2a8_gs32_stage.so" "$BUILD/mixed_w2w4_moe_ffn.o" > "$SERVE_DIR/gs32-files.sha256" &&
+echo "服务日志：$SERVE_DIR/serve.log" &&
+ln -sfnT "$SERVE_DIR" "$SERVE_LINK" &&
+
+TMPDIR=/tmp VLLM_RPC_BASE_PATH=/tmp \
+ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 \
+VLLM_USE_V2_MODEL_RUNNER=1 VLLM_USE_BREAKABLE_CUDAGRAPH=0 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+python -u tools/serve_vq2a8.py \
+  --model "$MODEL" --no-dspark \
+  --gs32-runtime-dir "$BUILD" \
+  --parallel-mode dp-ep --ep-size 4 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 2048 --max-num-seqs 16 \
+  --kv-cache-mib 16384 --reserve-gib 16 \
+  --tokenizer-mode deepseek_v4 --reasoning-parser deepseek_v4 \
+  --runtime-record "$SERVE_DIR/service-runtime.json" \
+  --host 127.0.0.1 --port 8005 \
+  2>&1 | tee "$SERVE_DIR/serve.log"
+```
+
+### 5.2 终端 B：DP4 扫描全局并发 1～64
+
+等待服务就绪后，在同一容器、同一仓库根目录执行。自动读取 DP4 启动记录，无需手工填写服务目录。
+输入输出长度、预热和重复次数沿用第 2 节；结果格式及启动记录的证据范围见第 3 节。
+
+```bash
+(
+set -euo pipefail
+MODEL=/mnt/share/g00872988/DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3-export-20261103
+BASE_URL=http://127.0.0.1:8005
+RESULT_ROOT="$PWD/benchmark-results/batch-throughput"
+if ! SERVE_DIR=$(readlink -e "$RESULT_ROOT/current-native-dp4-8005") || \
+   [ ! -s "$SERVE_DIR/service-runtime.json" ]; then
+  echo "未找到本轮 DP4 启动记录，请先按第 5.1 节启动服务并等待就绪。" >&2
+  exit 1
+fi
+RUN_DIR="$RESULT_ROOT/$(date +%Y%m%d_%H%M%S)-bench-noperm-mixed-nonrouted-fp8-native-dp4-ep4-b16"
+mkdir "$RUN_DIR"
+echo "服务记录：$SERVE_DIR/service-runtime.json"
+echo "结果目录：$RUN_DIR"
+git rev-parse HEAD > "$RUN_DIR/commit.txt"
+git status --short > "$RUN_DIR/worktree.txt"
+
+curl -fsS --max-time 30 "$BASE_URL/health"
+curl -fsS --max-time 30 -D "$RUN_DIR/models.headers" \
+  "$BASE_URL/v1/models" > "$RUN_DIR/models.json"
+
+python -u tools/tests/run_vq2a8_throughput.py \
+  --base-url "$BASE_URL" --model vq2a8 --tokenizer "$MODEL" \
+  --tokenizer-mode deepseek_v4 \
+  --parallel-mode dp-ep --ep-size 4 --max-num-seqs 16 \
+  --concurrency 1 2 4 8 16 32 64 \
+  --input-len 1024 --output-len 128 \
+  --num-warmups 1 --repeats 1 --seed 0 \
+  --result-dir "$RUN_DIR" \
+  --runtime-record "$SERVE_DIR/service-runtime.json" \
+  --note 'nonrouted-fp8; backend=native; devices=4,5,6,7; TP1/DP4/EP4; local_B=16; MRV2; full_graph; fusion=full_ffn; no DSpark; batched_tokens=2048/engine; KV=16GiB/worker' \
+  2>&1 | tee "$RUN_DIR/benchmark.log"
+
+)
+```
+
+### 5.3 扩大 DP4 容量
+
+上述 B16/C64 是起始对照配置，不代表 DP4 的最佳吞吐。若要利用显存探索更高容量，按下表同时修改服务端和客户端，
+每次重启服务并生成新的启动记录；同步修改 `SERVE_DIR`、`RUN_DIR` 和 `--note` 中的 batch 标签。
+
+| 每 engine B | 两端 `--max-num-seqs` | 全局活动序列上限 | 客户端 `--concurrency` |
+| --- | --- | --- | --- |
+| 16 | `16` | 64 | `1 2 4 8 16 32 64` |
+| 32 | `32` | 128 | `1 2 4 8 16 32 64 96 128` |
+| 64 | `64` | 256 | `1 2 4 8 16 32 64 96 128 192 256` |
+
+每 engine B32/B64 可通过当前启动参数校验，但现有 DP 整模型验收用例的边界是每 engine B16；
+更大容量的通信、路由、图回放及显存需要在目标机验证，不能视为已验收配置。
+启动器按本地 B 自动扩大图桶，专家路由容量还会乘以 DP 数；这些配置不是 TP4 的 B128/B256。
+仅提高客户端 `--concurrency`、不改变服务端 B16 时，全局活动序列上限仍是 64，额外请求会排队。
+
+可先保持每 engine token 预算 2048、KV 16 GiB，再按实测压力分别调优。
+两端 `--max-num-seqs` 必须一致；客户端参数只记录服务配置，不会修改或验证正在运行的服务容量。
+候选峰值建议增加请求数和 `--repeats` 复测，同时报告平均及 P99 TTFT/TPOT；如有延迟要求，
+通过 `--max-p99-ttft-ms`、`--max-p99-tpot-ms` 筛选满足相同 SLO 的吞吐结果。
