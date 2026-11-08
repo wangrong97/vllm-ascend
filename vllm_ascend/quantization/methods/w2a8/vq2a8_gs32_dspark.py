@@ -150,7 +150,12 @@ def prepare_vq2a8_dspark_config(config: VllmConfig) -> VllmConfig:
     """
     if config.model_config.quantization != "vq2a8":
         return config
-    validate_vq2a8_dspark_config(config)
+    quant_config = getattr(config, "quant_config", None)
+    validate_runtime = getattr(quant_config, "validate_runtime_config", None)
+    if getattr(quant_config, "is_gs32", False) and callable(validate_runtime):
+        validate_runtime(config)
+    else:
+        validate_vq2a8_dspark_config(config)
     # Lazy worker-side import: this module is also used by the CPU preflight.
     from vllm.config import VllmConfig
 

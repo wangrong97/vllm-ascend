@@ -17,10 +17,16 @@ constexpr uint64_t kMixedDownW4TilingBytes = 640;
 // ABI v3 appends post-processing options without moving the component payloads.
 constexpr uint64_t kMixedPostOptionsOffset = 1600;
 constexpr uint64_t kMixedPostOptionsBytes = 32;
-constexpr uint64_t kMixedTilingBytes = kMixedPostOptionsOffset + kMixedPostOptionsBytes;
+// ABI v4 appends static packed-weight byte offsets, prepared once on Host.
+// The four component payloads and the post options keep their existing layout.
+constexpr uint64_t kMixedMaxExperts = 256;
+constexpr uint64_t kMixedWeightOffsetsBytes = kMixedMaxExperts * sizeof(uint64_t);
+constexpr uint64_t kMixedGateWeightOffsetsOffset = kMixedPostOptionsOffset + kMixedPostOptionsBytes;
+constexpr uint64_t kMixedDownWeightOffsetsOffset = kMixedGateWeightOffsetsOffset + kMixedWeightOffsetsBytes;
+constexpr uint64_t kMixedTilingBytes = kMixedDownWeightOffsetsOffset + kMixedWeightOffsetsBytes;
 
 constexpr uint64_t kMixedTilingMagic = 0x4D4F455732573441ULL; // "MOEW2W4A"
-constexpr uint64_t kMixedTilingVersion = 3;
+constexpr uint64_t kMixedTilingVersion = 4;
 
 constexpr uint64_t kMixedStageGateW2 = 1ULL << 0;
 constexpr uint64_t kMixedStageGateW4 = 1ULL << 1;
@@ -52,6 +58,8 @@ struct MixedPostOptions {
 static_assert(sizeof(MixedTilingHeader) == 64, "unexpected mixed tiling header layout");
 static_assert(sizeof(MixedPostOptions) == kMixedPostOptionsBytes, "unexpected post options layout");
 static_assert(kMixedPostOptionsOffset % kMixedTilingAlignment == 0, "unaligned post options");
+static_assert(kMixedGateWeightOffsetsOffset % kMixedTilingAlignment == 0, "unaligned gate weight offsets");
+static_assert(kMixedDownWeightOffsetsOffset % kMixedTilingAlignment == 0, "unaligned down weight offsets");
 static_assert(kMixedGateW2TilingOffset % kMixedTilingAlignment == 0, "unaligned gate W2 tiling");
 static_assert(kMixedGateW4TilingOffset % kMixedTilingAlignment == 0, "unaligned gate W4 tiling");
 static_assert(kMixedDownW2TilingOffset % kMixedTilingAlignment == 0, "unaligned down W2 tiling");

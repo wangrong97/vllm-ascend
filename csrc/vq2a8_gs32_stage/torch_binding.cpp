@@ -40,11 +40,12 @@
 
 #include "../mixed_w2w4_moe_ffn/tiling_builders.h"
 #include "../mixed_w2w4_moe_ffn/mixed_tiling.h"
+#include "../mixed_w2w4_moe_ffn/weight_offsets.h"
 
 namespace vq2a8_gs32_stage {
 namespace {
 
-constexpr char kKernelName[] = "mixed_w2w4_moe_ffn_v3";
+constexpr char kKernelName[] = "mixed_w2w4_moe_ffn_v4";
 constexpr uint32_t kKernelCoreCount = 32;
 constexpr uintptr_t kRequiredAlignment = 32;
 // Match the imported standalone Host's validated group-count range.
@@ -74,7 +75,7 @@ struct MatFP4Args {
 };
 
 static_assert(sizeof(MatFP4Args) == 19 * sizeof(uint64_t), "unexpected mixed kernel argument ABI");
-static_assert(kMixedTilingVersion == 3 && kMixedTilingBytes == 1632, "unexpected mixed tiling ABI");
+static_assert(kMixedTilingVersion == 4 && kMixedTilingBytes == 5728, "unexpected mixed tiling ABI");
 
 struct RegisteredKernel {
   std::vector<uint8_t> binary;
@@ -122,10 +123,10 @@ std::vector<uint8_t> ReadElfBinary(const std::string& path) {
   TORCH_CHECK(stream.good(), "failed to read mixed kernel binary: ", path);
   TORCH_CHECK(bytes[0] == 0x7f && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F',
               "mixed kernel binary must be an ELF object: ", path);
-  // ABI v3 has a different exported entry symbol, so an older ELF cannot be
+  // ABI v4 has a different exported entry symbol, so an older ELF cannot be
   // launched with the new post-processing options even outside the launcher.
   TORCH_CHECK(std::search(bytes.begin(), bytes.end(), kKernelName, kKernelName + sizeof(kKernelName) - 1) != bytes.end(),
-              "mixed kernel binary lacks ABI v3; rebuild both the kernel .o and Torch bridge .so: ", path);
+              "mixed kernel binary lacks ABI v4; rebuild both the kernel .o and Torch bridge .so: ", path);
   return bytes;
 }
 
@@ -226,6 +227,62 @@ void CheckNoAlias(const std::vector<std::pair<const char*, at::Tensor>>& tensors
     }
   }
 }
+
+// Hold private Tensor metadata without copying the resident weight bytes. The
+// caller can release its Parameters; the plan and queued callback own storage.
+// Cached ranges are valid only while the backing allocations remain in place.
+class ResidentWeights {
+ public:
+  ResidentWeights(const at::Tensor& anchor, int64_t groups, int64_t n, int64_t d,
+                  const std::array<int64_t, 4>& bytes,
+                  const std::array<at::Tensor, 6>& tensors) {
+    const std::array<const char*, 6> names{
+        "gate_weight", "gate_table", "gate_row_scale", "down_weight", "down_table", "down_row_scale"};
+    std::vector<std::pair<const char*, at::Tensor>> named;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+      const bool scale = i == 2 || i == 5;
+      CheckNpuTensor(tensors[i], anchor, scale ? at::kLong : at::kByte, scale ? 2 : 1, names[i]);
+      tensors_[i] = tensors[i].detach();
+      ranges_[i] = TensorRange(names[i], tensors_[i]);
+      named.emplace_back(names[i], tensors_[i]);
+    }
+    TORCH_CHECK(tensors_[0].numel() == bytes[0] && tensors_[1].numel() == bytes[1] &&
+                    tensors_[3].numel() == bytes[2] && tensors_[4].numel() == bytes[3],
+                "full FFN mixed weight/table blob sizes do not match resident precision masks");
+    TORCH_CHECK(tensors_[2].size(0) == groups && tensors_[2].size(1) == n,
+                "full FFN Gate row scales must be [G,N]");
+    TORCH_CHECK(tensors_[5].size(0) == groups && tensors_[5].size(1) == d,
+                "full FFN Down row scales must be [G,D]");
+    CheckNoAlias(named);
+  }
+
+  const at::Tensor& operator[](size_t index) const { return tensors_[index]; }
+
+  void CheckDynamicRanges(const std::vector<std::pair<const char*, at::Tensor>>& tensors) const {
+    // No repeated weight shape/dtype/precision validation or weight/weight
+    // pairwise scan. Still reject relocated/shrunk storage and dynamic aliases.
+    for (size_t i = 0; i < tensors_.size(); ++i) {
+      const auto& tensor = tensors_[i];
+      const uint64_t offset = static_cast<uint64_t>(tensor.storage_offset()) * tensor.element_size();
+      const uint64_t capacity = tensor.storage().nbytes();
+      TORCH_CHECK(offset <= capacity && tensor.nbytes() <= capacity - offset &&
+                      reinterpret_cast<uintptr_t>(tensor.data_ptr()) == ranges_[i].begin,
+                  "full FFN resident weight storage changed after plan preparation");
+    }
+    CheckNoAlias(tensors);
+    for (const auto& named : tensors) {
+      const auto range = TensorRange(named.first, named.second);
+      for (const auto& resident : ranges_) {
+        TORCH_CHECK(range.end <= resident.begin || resident.end <= range.begin,
+                    range.name, " and ", resident.name, " must not alias or overlap storage");
+      }
+    }
+  }
+
+ private:
+  std::array<at::Tensor, 6> tensors_;
+  std::array<NamedRange, 6> ranges_;
+};
 
 void RecordStream(const std::vector<at::Tensor>& tensors, c10_npu::NPUStream stream) {
   for (const auto& tensor : tensors) {
@@ -338,7 +395,8 @@ int64_t CheckedElements(std::initializer_list<int64_t> dimensions) {
   return result;
 }
 
-at::Tensor MakeFullFFNTiling(int64_t k, int64_t n, int64_t d, uint64_t stages, double limit) {
+at::Tensor MakeFullFFNTiling(int64_t k, int64_t n, int64_t d, uint64_t stages, double limit,
+                           const MixedWeightOffsets& offsets) {
   auto result = at::zeros({static_cast<int64_t>(kMixedTilingBytes)},
                           at::TensorOptions().device(at::kCPU).dtype(at::kByte));
   const MixedTilingHeader header{
@@ -356,6 +414,8 @@ at::Tensor MakeFullFFNTiling(int64_t k, int64_t n, int64_t d, uint64_t stages, d
   copy(kMixedDownW4TilingOffset, kMixedDownW4TilingBytes, BuildDownW4TilingBlob(n / 2, d));
   const MixedPostOptions post{static_cast<float>(limit), {}};
   std::memcpy(bytes + kMixedPostOptionsOffset, &post, sizeof(post));
+  std::memcpy(bytes + kMixedGateWeightOffsetsOffset, offsets.gate.data(), kMixedWeightOffsetsBytes);
+  std::memcpy(bytes + kMixedDownWeightOffsetsOffset, offsets.down.data(), kMixedWeightOffsetsBytes);
   return result;
 }
 
@@ -364,9 +424,9 @@ at::Tensor MakeFullFFNTiling(int64_t k, int64_t n, int64_t d, uint64_t stages, d
 class FullFFNPlan : public torch::CustomClassHolder {
  public:
   FullFFNPlan(int64_t groups, int64_t k, int64_t n, int64_t d, c10::Device device,
-              std::array<int64_t, 4> blob_bytes, at::Tensor gate_mask, at::Tensor down_mask,
+              ResidentWeights weights, at::Tensor gate_mask, at::Tensor down_mask,
               at::Tensor tiling, std::shared_ptr<const RegisteredKernel> registered)
-      : groups_(groups), k_(k), n_(n), d_(d), device_(device), blob_bytes_(blob_bytes),
+      : groups_(groups), k_(k), n_(n), d_(d), device_(device), weights_(std::move(weights)),
         gate_mask_(std::move(gate_mask)), down_mask_(std::move(down_mask)),
         tiling_(std::move(tiling)), registered_(std::move(registered)) {}
 
@@ -378,7 +438,7 @@ class FullFFNPlan : public torch::CustomClassHolder {
   int64_t K() const { return k_; }
   int64_t N() const { return n_; }
   int64_t D() const { return d_; }
-  const std::array<int64_t, 4>& BlobBytes() const { return blob_bytes_; }
+  const ResidentWeights& Weights() const { return weights_; }
   const at::Tensor& GateMask() const { return gate_mask_; }
   const at::Tensor& DownMask() const { return down_mask_; }
   const at::Tensor& Tiling() const { return tiling_; }
@@ -390,7 +450,7 @@ class FullFFNPlan : public torch::CustomClassHolder {
   const int64_t n_;
   const int64_t d_;
   const c10::Device device_;
-  const std::array<int64_t, 4> blob_bytes_;
+  const ResidentWeights weights_;
   const at::Tensor gate_mask_;
   const at::Tensor down_mask_;
   const at::Tensor tiling_;
@@ -399,7 +459,10 @@ class FullFFNPlan : public torch::CustomClassHolder {
 
 c10::intrusive_ptr<FullFFNPlan> PrepareFullFFN(const at::Tensor& anchor, int64_t n, int64_t d,
                                               const at::Tensor& gate_w4, const at::Tensor& down_w4,
-                                              double swiglu_limit) {
+                                              double swiglu_limit,
+                                              const at::Tensor& gate_weight, const at::Tensor& gate_table,
+                                              const at::Tensor& gate_row_scale, const at::Tensor& down_weight,
+                                              const at::Tensor& down_table, const at::Tensor& down_row_scale) {
   TORCH_CHECK(anchor.defined() && anchor.device().type() == c10::DeviceType::PrivateUse1,
               "full FFN preparation requires an NPU anchor");
   const c10_npu::OptionalNPUGuard guard(anchor.device());
@@ -442,18 +505,22 @@ c10::intrusive_ptr<FullFFNPlan> PrepareFullFFN(const at::Tensor& anchor, int64_t
     stages |= gate_is_w4 ? kMixedStageGateW4 : kMixedStageGateW2;
     stages |= down_is_w4 ? kMixedStageDownW4 : kMixedStageDownW2;
   }
-  const auto tiling = MakeFullFFNTiling(k, n, d, stages, swiglu_limit);
+  ResidentWeights weights(anchor, groups, n, d, blob_bytes,
+                          {gate_weight, gate_table, gate_row_scale, down_weight, down_table, down_row_scale});
+  const auto offsets = BuildMixedWeightOffsets(groups, k, n, d, gate_words, down_words);
+  TORCH_CHECK(offsets.gate_bytes == static_cast<uint64_t>(blob_bytes[0]) &&
+                  offsets.down_bytes == static_cast<uint64_t>(blob_bytes[2]),
+              "full FFN static weight offsets disagree with resident blob sizes");
+  const auto tiling = MakeFullFFNTiling(k, n, d, stages, swiglu_limit, offsets);
   const auto registered = RegisteredKernelSnapshot();
   return c10::make_intrusive<FullFFNPlan>(
-      groups, k, n, d, anchor.device(), blob_bytes,
+      groups, k, n, d, anchor.device(), std::move(weights),
       gate_mask.to(anchor.device(), at::kInt, false, true),
       down_mask.to(anchor.device(), at::kInt, false, true),
       tiling.to(anchor.device(), at::kByte, false, true), registered);
 }
 
 void FullFFNDevice(const at::Tensor& input_bytes, const at::Tensor& input_scale,
-                   const at::Tensor& gate_weight, const at::Tensor& gate_table, const at::Tensor& gate_row_scale,
-                   const at::Tensor& down_weight, const at::Tensor& down_table, const at::Tensor& down_row_scale,
                    const c10::intrusive_ptr<DeviceRoutes>& routes, const c10::intrusive_ptr<FullFFNPlan>& plan,
                    at::Tensor& hidden, at::Tensor& hidden_scale, at::Tensor& output) {
   TORCH_CHECK(routes != nullptr && plan != nullptr, "full FFN requires prepared routes and resident plan");
@@ -463,12 +530,6 @@ void FullFFNDevice(const at::Tensor& input_bytes, const at::Tensor& input_scale,
   CheckCaptureAllowed("vq2a8_gs32_stage.full_ffn_device");
   CheckNpuTensor(input_bytes, input_bytes, at::kByte, 2, "input_bytes");
   CheckNpuTensor(input_scale, input_bytes, at::kByte, 2, "input_scale");
-  CheckNpuTensor(gate_weight, input_bytes, at::kByte, 1, "gate_weight");
-  CheckNpuTensor(gate_table, input_bytes, at::kByte, 1, "gate_table");
-  CheckNpuTensor(down_weight, input_bytes, at::kByte, 1, "down_weight");
-  CheckNpuTensor(down_table, input_bytes, at::kByte, 1, "down_table");
-  CheckNpuTensor(gate_row_scale, input_bytes, at::kLong, 2, "gate_row_scale");
-  CheckNpuTensor(down_row_scale, input_bytes, at::kLong, 2, "down_row_scale");
   CheckNpuTensor(hidden, input_bytes, at::kByte, 2, "hidden");
   CheckNpuTensor(hidden_scale, input_bytes, at::kByte, 2, "hidden_scale");
   CheckNpuTensor(output, input_bytes, at::kBFloat16, 2, "output");
@@ -480,37 +541,30 @@ void FullFFNDevice(const at::Tensor& input_bytes, const at::Tensor& input_scale,
     return tensor.size(0) == first && tensor.size(1) == second;
   };
   TORCH_CHECK(shape_is(input_scale, rows, plan->K() / 32), "full FFN input_scale must be [R,K/32]");
-  TORCH_CHECK(shape_is(gate_row_scale, plan->Groups(), plan->N()), "full FFN Gate row scales must be [G,N]");
-  TORCH_CHECK(shape_is(down_row_scale, plan->Groups(), plan->D()), "full FFN Down row scales must be [G,D]");
   TORCH_CHECK(shape_is(hidden, rows, plan->N() / 2), "full FFN hidden workspace must be [R,N/2]");
   TORCH_CHECK(shape_is(hidden_scale, rows, plan->N() / 64), "full FFN hidden scale must be [R,N/64]");
   TORCH_CHECK(shape_is(output, rows, plan->D()), "full FFN output must be [R,D]");
-  const auto& bytes = plan->BlobBytes();
-  TORCH_CHECK(gate_weight.numel() == bytes[0] && gate_table.numel() == bytes[1] &&
-                  down_weight.numel() == bytes[2] && down_table.numel() == bytes[3],
-              "full FFN mixed weight/table blob sizes do not match resident precision masks");
-  CheckNoAlias({{"input_bytes", input_bytes}, {"input_scale", input_scale},
-                {"gate_weight", gate_weight}, {"gate_table", gate_table}, {"gate_row_scale", gate_row_scale},
-                {"down_weight", down_weight}, {"down_table", down_table}, {"down_row_scale", down_row_scale},
-                {"hidden", hidden}, {"hidden_scale", hidden_scale}, {"output", output}});
+  const auto& weights = plan->Weights();
+  weights.CheckDynamicRanges({{"input_bytes", input_bytes}, {"input_scale", input_scale},
+                             {"hidden", hidden}, {"hidden_scale", hidden_scale}, {"output", output}});
   // Invalid counts are sanitized to zero before reaching the kernel. Define
   // output and scale padding on every replay, including a wholly empty rank.
   output.zero_();
   hidden_scale.fill_(127);
   const auto stream = c10_npu::getCurrentNPUStream();
-  RecordStream({input_bytes, input_scale, gate_weight, gate_table, gate_row_scale,
-                down_weight, down_table, down_row_scale, hidden, hidden_scale, output,
+  RecordStream({input_bytes, input_scale, weights[0], weights[1], weights[2],
+                weights[3], weights[4], weights[5], hidden, hidden_scale, output,
                 routes->GroupList(), routes->Status(), plan->GateMask(), plan->DownMask(), plan->Tiling()}, stream);
   const auto launch_stream = stream.stream(false);
   at_npu::native::OpCommand::RunOpApi(
       "Vq2a8Gs32FullFFN",
-      [routes, plan, launch_stream, input_bytes, input_scale, gate_weight, gate_table, gate_row_scale,
-       down_weight, down_table, down_row_scale, hidden, hidden_scale, output]() -> int {
+      [routes, plan, launch_stream, input_bytes, input_scale, hidden, hidden_scale, output]() -> int {
+        const auto& weights = plan->Weights();
         MatFP4Args arguments{
             static_cast<uint64_t>(plan->Groups()), static_cast<uint64_t>(plan->K()),
             static_cast<uint64_t>(plan->N()), static_cast<uint64_t>(plan->D()), routes->GroupList().data_ptr(),
-            input_bytes.data_ptr(), input_scale.data_ptr(), gate_weight.data_ptr(), gate_table.data_ptr(),
-            down_weight.data_ptr(), down_table.data_ptr(), gate_row_scale.data_ptr(), down_row_scale.data_ptr(),
+            input_bytes.data_ptr(), input_scale.data_ptr(), weights[0].data_ptr(), weights[1].data_ptr(),
+            weights[3].data_ptr(), weights[4].data_ptr(), weights[2].data_ptr(), weights[5].data_ptr(),
             plan->GateMask().data_ptr(), plan->DownMask().data_ptr(), hidden.data_ptr(), hidden_scale.data_ptr(),
             output.data_ptr(), plan->Tiling().data_ptr()};
         return static_cast<int>(rtKernelLaunch(plan->Kernel().stub, kKernelCoreCount, &arguments,
@@ -528,10 +582,11 @@ TORCH_LIBRARY(vq2a8_gs32_stage, m) {
   m.def("initialize(str binary) -> ()", &vq2a8_gs32_stage::Initialize);
   m.def("_sanitize_device_counts(Tensor counts, int rows, bool allow_padding) -> (Tensor, Tensor)");
   m.def("full_ffn_abi_version() -> int", &vq2a8_gs32_stage::FullFFNAbiVersion);
-  m.def("prepare_full_ffn(Tensor anchor, int n, int d, Tensor gate_w4, Tensor down_w4, float swiglu_limit) -> "
+  m.def("prepare_full_ffn(Tensor anchor, int n, int d, Tensor gate_w4, Tensor down_w4, float swiglu_limit, "
+        "Tensor gate_weight, Tensor gate_table, Tensor gate_row_scale, Tensor down_weight, "
+        "Tensor down_table, Tensor down_row_scale) -> "
         "__torch__.torch.classes.vq2a8_gs32_stage.FullFFNPlan");
-  m.def("full_ffn_device(Tensor input_bytes, Tensor input_scale, Tensor gate_weight, Tensor gate_table, "
-        "Tensor gate_row_scale, Tensor down_weight, Tensor down_table, Tensor down_row_scale, "
+  m.def("full_ffn_device(Tensor input_bytes, Tensor input_scale, "
         "__torch__.torch.classes.vq2a8_gs32_stage.DeviceRoutes routes, "
         "__torch__.torch.classes.vq2a8_gs32_stage.FullFFNPlan plan, Tensor(a!) hidden, "
         "Tensor(b!) hidden_scale, Tensor(c!) output) -> ()");

@@ -44,7 +44,7 @@ __aicore__ inline void MixedComponentBarrierAiv()
 
 } // namespace
 
-extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v3_mix_aiv(
+extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v4_mix_aiv(
     uint64_t g, uint64_t k, uint64_t n, uint64_t d,
     __gm__ void *group_list, __gm__ void *a, __gm__ void *a_scale,
     __gm__ void *gateup_w, __gm__ void *gateup_table,
@@ -65,7 +65,7 @@ extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v3_mix_aiv(
         GateW2Aiv::MatFP4 gate_w2;
         gate_w2.Init(g, k, n, group_list, a, a_scale, gateup_w, gateup_table,
                      scale_upgate, h, h_scale, tiling_base + kMixedGateW2TilingOffset,
-                     is_expert_w4, swiglu_limit);
+                     is_expert_w4, tiling_base + kMixedGateWeightOffsetsOffset, swiglu_limit);
         gate_w2.process();
     }
 
@@ -76,7 +76,7 @@ extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v3_mix_aiv(
         GateW4Aiv::MatFP4 gate_w4;
         gate_w4.Init(g, k, n, group_list, a, a_scale, gateup_w, gateup_table,
                      h, h_scale, tiling_base + kMixedGateW4TilingOffset,
-                     is_expert_w4, swiglu_limit);
+                     is_expert_w4, tiling_base + kMixedGateWeightOffsetsOffset, swiglu_limit);
         gate_w4.process();
     }
 
@@ -89,7 +89,8 @@ extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v3_mix_aiv(
     if ((stage_mask & kMixedStageDownW2) != 0) {
         DownW2Aiv::MatFP4 down_w2;
         down_w2.Init(g, n / 2, d, group_list, h, h_scale, down_w, down_table,
-                     scale_down, c, tiling_base + kMixedDownW2TilingOffset, is_down_w4);
+                     scale_down, c, tiling_base + kMixedDownW2TilingOffset, is_down_w4,
+                     tiling_base + kMixedDownWeightOffsetsOffset);
         down_w2.process();
     }
 
@@ -99,7 +100,8 @@ extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v3_mix_aiv(
     if ((stage_mask & kMixedStageDownW4) != 0) {
         DownW4Aiv::MatFP4 down_w4;
         down_w4.Init(g, n / 2, d, group_list, h, h_scale, down_w, down_table,
-                     c, tiling_base + kMixedDownW4TilingOffset, is_down_w4);
+                     c, tiling_base + kMixedDownW4TilingOffset, is_down_w4,
+                     tiling_base + kMixedDownWeightOffsetsOffset);
         down_w4.process();
     }
 }

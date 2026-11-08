@@ -88,6 +88,29 @@ class ImportContractTests(unittest.TestCase):
                 self.assertTrue(data, "Imported files must not be empty")
                 self.assertEqual(hashlib.sha256(data).hexdigest(), entry["sha256"])
 
+    def test_repository_derivatives_have_separate_provenance_and_current_hashes(self):
+        imported = {entry["path"].casefold() for entry in self.manifest_entries()}
+        derivatives = self.manifest.get("derived_files")
+        self.assertIsInstance(derivatives, list)
+        self.assertEqual(
+            {entry["path"] for entry in derivatives},
+            {"weight_offsets.h", "tests/weight_offsets_host_test.cpp", "tests/test_weight_offsets.py"},
+        )
+        seen = set(imported)
+        for entry in derivatives:
+            with self.subTest(path=entry["path"]):
+                self.assert_safe_relative_path(entry["path"])
+                self.assertNotIn(entry["path"].casefold(), seen)
+                seen.add(entry["path"].casefold())
+                self.assertEqual(entry.get("origin"), "repository implementation for ABI v4 static offsets")
+                self.assertNotIn("source_sha256", entry, "New repository code has no imported source hash")
+                path = (IMPORT_ROOT / entry["path"]).resolve()
+                self.assertTrue(path.is_relative_to(IMPORT_ROOT))
+                self.assertTrue(path.is_file())
+                data = path.read_bytes()
+                self.assertTrue(data)
+                self.assertEqual(hashlib.sha256(data).hexdigest(), entry.get("sha256"))
+
     def test_all_six_python_sources_parse_without_importing(self):
         entries = [entry for entry in self.manifest_entries() if PurePosixPath(entry["path"]).suffix == ".py"]
         self.assertEqual(len(entries), EXPECTED_PYTHON_COUNT)
@@ -134,7 +157,7 @@ class ImportContractTests(unittest.TestCase):
         host = (IMPORT_ROOT / f"{operator_name}_host.cc").read_text(encoding="utf-8")
         build = (IMPORT_ROOT / f"run_{operator_name}_esl.sh").read_text(encoding="utf-8")
         runner = (IMPORT_ROOT / f"run_{operator_name}_case.sh").read_text(encoding="utf-8")
-        self.assertIn(f'kKernelName = "{operator_name}_v3";', host)
+        self.assertIn(f'kKernelName = "{operator_name}_v4";', host)
         self.assertIn(f'kKernelBinary = "{operator_name}.o";', host)
         self.assertIn(f"-o {operator_name}.o", build)
         self.assertIn(f"{operator_name}_host.cc", build)
@@ -142,7 +165,7 @@ class ImportContractTests(unittest.TestCase):
         self.assertIn(f'--application="./{operator_name}_host $*"', runner)
         for core in ("aic", "aiv"):
             with self.subTest(core=core):
-                entry_point = f"{operator_name}_v3_mix_{core}"
+                entry_point = f"{operator_name}_v4_mix_{core}"
                 source = IMPORT_ROOT / f"{operator_name}_{core}.cce"
                 self.assertIn(f"void {entry_point}(", source.read_text(encoding="utf-8"))
                 self.assertIn(f"{source.name} {entry_point}.o", build)

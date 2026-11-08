@@ -50,7 +50,7 @@ __aicore__ inline void MixedComponentBarrierAic()
 
 } // namespace
 
-extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v3_mix_aic(
+extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v4_mix_aic(
     uint64_t g, uint64_t k, uint64_t n, uint64_t d,
     __gm__ void *group_list, __gm__ void *a, __gm__ void *a_scale,
     __gm__ void *gateup_w, __gm__ void *gateup_table,

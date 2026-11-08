@@ -238,7 +238,7 @@ private:
 public:
     __aicore__ inline void Init(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list, __gm__ void *a,
                                __gm__ void *a_scale, __gm__ void *b, __gm__ void *table, __gm__ void *quant_scale, __gm__ void *c,
-                               __gm__ void *tiling, __gm__ void *route_mask)
+                               __gm__ void *tiling, __gm__ void *route_mask, __gm__ void *weight_offsets)
     {
         G = g;
         K = k;
@@ -251,6 +251,7 @@ public:
         (void)quant_scale;
         c_gm = c;
         route_mask_gm = route_mask;
+        weight_offsets_gm = weight_offsets;
         __gm__ MatFP4TilingData *tiling_data = (__gm__ MatFP4TilingData *)tiling;
         narrow_nbs = tiling_data->narrow_nbs;
         wide_nbs = tiling_data->wide_nbs;
@@ -271,9 +272,6 @@ public:
     __aicore__ inline void process()
     {
         // AIC/AIV 使用同一组 M/N 映射，subid 选择相邻 K 半区。
-        const uint64_t codebook_k = 32;
-        const uint64_t codebook_n = 32;
-        const uint64_t n_group_count = N / codebook_n;
 
         set_flag(PIPE_V, PIPE_MTE2, 0);
         set_flag(PIPE_V, PIPE_MTE2, 1);
@@ -285,28 +283,23 @@ public:
         __gm__ uint8_t *b_base = (__gm__ uint8_t *)b_gm;
         __gm__ uint8_t *table_base = (__gm__ uint8_t *)table_gm;
         __gm__ int64_t *group_list = (__gm__ int64_t *)group_list_gm;
-        const uint64_t w2_b_group_bytes = N * K / 4;
-        const uint64_t w4_b_group_bytes = N * K / 2;
-        const uint64_t w2_table_group_bytes = (K / codebook_k) * n_group_count * 32;
-        const uint64_t w4_table_group_bytes = N * K / 32;
-        uint64_t b_offset = 0;
-        uint64_t table_offset = 0;
+        // Both GS32 W2 codebooks and MXFP4 scales occupy N*K/32 bytes.
+        const uint64_t table_group_bytes = N * K / 32;
 
         // AIC/AIV 同步跳过空组，event 保护跨组复用的共享 L1B。
         for (uint64_t group_id = 0; group_id < G; ++group_id) {
-            const bool route_w4 = ::MixedRouteBit((__gm__ uint32_t *)route_mask_gm, group_id);
-            __gm__ uint8_t *group_b = b_base + b_offset;
-            __gm__ uint8_t *group_table = table_base + table_offset;
-            b_offset += route_w4 ? w4_b_group_bytes : w2_b_group_bytes;
-            table_offset += route_w4 ? w4_table_group_bytes : w2_table_group_bytes;
             const int64_t signed_group_m = group_list[group_id];
             if (signed_group_m <= 0) {
                 continue;
             }
             const uint64_t group_m = static_cast<uint64_t>(signed_group_m);
+            const bool route_w4 = ::MixedRouteBit((__gm__ uint32_t *)route_mask_gm, group_id);
             if (route_w4) {
                 continue;
             }
+            // Static offsets include all resident experts, including empty/opposite-precision ones.
+            __gm__ uint8_t *group_b = b_base + ((__gm__ uint64_t *)weight_offsets_gm)[group_id];
+            __gm__ uint8_t *group_table = table_base + group_id * table_group_bytes;
             const bool wide_group = MatFP4IsWideGroup(group_m, n_only_mode, wide_m_start);
             uint64_t cnt_k = 0;
             if (n_only_mode != 0) {
@@ -380,6 +373,7 @@ public:
     __gm__ void *table_gm = nullptr;
     __gm__ void *c_gm = nullptr;
     __gm__ void *route_mask_gm = nullptr;
+    __gm__ void *weight_offsets_gm = nullptr;
     __ubuf__ void *a[kInputBufferCount] {};
     __ubuf__ void *b[kOutputBufferCount] {};
     __ubuf__ void *table[kInputBufferCount] {};
@@ -387,13 +381,13 @@ public:
 };
 
 #ifndef MAT_FP4_COMPONENT_ONLY
-extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v3_mix_aiv(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list,
+extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v4_mix_aiv(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list,
                                                        __gm__ void *a, __gm__ void *a_scale, __gm__ void *b,
                                                        __gm__ void *table, __gm__ void *quant_scale, __gm__ void *c, __gm__ void *tiling,
-                                                       __gm__ void *route_mask)
+                                                       __gm__ void *route_mask, __gm__ void *weight_offsets)
 {
     MatFP4 mat;
-    mat.Init(g, k, n, group_list, a, a_scale, b, table, quant_scale, c, tiling, route_mask);
+    mat.Init(g, k, n, group_list, a, a_scale, b, table, quant_scale, c, tiling, route_mask, weight_offsets);
     mat.process();
 }
 #endif

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Validate throughput reporting without a vLLM installation or network access."""
 
+import builtins
 import csv
 import importlib.util
 import io
@@ -88,7 +89,20 @@ def startup_record():
         "gs32_backend": "native",
         "gs32_fusion": "full_ffn",
         "gs32_execution": "full_graph",
-        "native_artifacts": {"tiling_abi_version": 3},
+        "native_artifacts": {
+            "abi_version": 4,
+            "library": "/server-only/runtime/libvq2a8_gs32_stage.so",
+            "library_sha256": "1" * 64,
+            "build_manifest": "/server-only/runtime/build-manifest.json",
+            "kernel": {
+                "path": "/server-only/runtime/mixed_w2w4_moe_ffn.o",
+                "present": True,
+                "bytes": 1024,
+                "sha256": "2" * 64,
+                "abi_version": 4,
+                "entry": "mixed_w2w4_moe_ffn_v4",
+            },
+        },
         "device_execution_verified": False,
     }
 
@@ -134,6 +148,73 @@ def test_runtime_record_invalid_configuration_rejected_before_network(benchmark,
     with pytest.raises(ValueError):
         benchmark.runtime_context(small_args(benchmark, "--runtime-record", str(path)))
     fetch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("native_artifacts", None),
+        ("native_artifacts", {}),
+        ("native_artifacts", {"tiling_abi_version": 3}),
+        ("abi_version", None),
+        ("abi_version", 3),
+        ("abi_version", "4"),
+        ("kernel", None),
+        ("kernel", {}),
+        ("kernel.abi_version", None),
+        ("kernel.abi_version", 3),
+        ("kernel.abi_version", "4"),
+        ("kernel.entry", None),
+        ("kernel.entry", "mixed_w2w4_moe_ffn_v3"),
+        ("kernel.entry", "unrelated_kernel_v4"),
+        ("kernel.present", False),
+        ("kernel.bytes", 0),
+        ("kernel.bytes", True),
+        ("library", None),
+        ("build_manifest", ""),
+        ("kernel.path", " "),
+        ("library_sha256", "bad"),
+        ("kernel.sha256", "x" * 64),
+    ],
+)
+def test_runtime_record_invalid_artifact_identity_rejected_before_network(
+    benchmark, tmp_path, monkeypatch, field, value
+):
+    record = startup_record()
+    if field == "native_artifacts":
+        if value is None:
+            del record[field]
+        else:
+            record[field] = value
+    elif field.startswith("kernel."):
+        record["native_artifacts"]["kernel"][field.split(".", 1)[1]] = value
+    else:
+        record["native_artifacts"][field] = value
+    path = tmp_path / "runtime.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    fetch = Mock(side_effect=AssertionError("invalid artifact identities must fail before HTTP"))
+    monkeypatch.setattr(benchmark, "urlopen", fetch)
+    with pytest.raises(ValueError, match="runtime-record requires"):
+        benchmark.runtime_context(small_args(benchmark, "--runtime-record", str(path)))
+    fetch.assert_not_called()
+
+
+def test_artifact_record_uses_packaged_contract_without_importing_engine(benchmark, monkeypatch):
+    original_import = builtins.__import__
+
+    def without_engine_imports(name, *args, **kwargs):
+        if name.split(".")[0] in ("torch", "torch_npu", "vllm", "vllm_ascend"):
+            raise AssertionError(f"Benchmark artifact checks must not import {name}")
+        return original_import(name, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "__import__", without_engine_imports)
+        abi_version, kernel_entry = benchmark.runtime_contract()
+    record = startup_record()["native_artifacts"]
+    assert (abi_version, kernel_entry) == (record["abi_version"], record["kernel"]["entry"])
+    monkeypatch.setattr(benchmark, "runtime_contract", lambda: (abi_version + 1, "future_ffn_entry"))
+    with pytest.raises(ValueError, match=f"ABI {abi_version + 1}.*future_ffn_entry"):
+        benchmark.validate_artifact_record(record)
 
 
 @pytest.mark.parametrize(

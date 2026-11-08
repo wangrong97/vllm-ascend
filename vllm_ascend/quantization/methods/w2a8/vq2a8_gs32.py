@@ -42,12 +42,14 @@ class AscendGS32FusedMoEScheme(AscendMoEScheme):
         moe_config=None,
         graph_row_capacity=DEFAULT_GRAPH_ROW_CAPACITY,
         swiglu_limit=0.0,
+        startup_state=None,
     ):
         self.layer_spec = layer_spec
         self.native_options = resolve_gs32_options(native_options or {})
         self.moe_config = moe_config
         self.graph_row_capacity = graph_row_capacity
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
+        self.startup_state = startup_state
         self.placement = None
 
     def get_weight(self, num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype):
@@ -162,7 +164,11 @@ class AscendGS32FusedMoEScheme(AscendMoEScheme):
         for name in self.parameter_experts:
             delattr(layer, name)
         layer.vq2a8_weights = GS32ExpertWeights(
-            layer, local_spec, self.native_options, graph_row_capacity=self.graph_row_capacity
+            layer,
+            local_spec,
+            self.native_options,
+            graph_row_capacity=self.graph_row_capacity,
+            startup_state=self.startup_state,
         )
 
     def get_dynamic_quant_param(self, num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype):

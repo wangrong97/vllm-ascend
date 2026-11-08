@@ -7,7 +7,7 @@
 Attention、共享专家和其他模型组件保留 checkpoint 中的数据类型，使用常规模型实现。
 
 本集成面向 Ascend950 上的 DeepSeek-V4，默认使用 Model Runner V2，并保留 V1 的既有边界。
-生产运行时只保留 native 完整 FFN，设备入口为 ABI v3 的 `mixed_w2w4_moe_ffn_v3`。
+生产运行时只保留 native 完整 FFN，设备入口为 ABI v4 的 `mixed_w2w4_moe_ffn_v4`。
 支持同一专家的 GateUp/Down 组合为 VQ2/VQ2、VQ2/MXFP4、MXFP4/MXFP4；MXFP4/VQ2 明确拒绝。
 本次精简不改变设备内核、裁剪或舍入顺序；更新后的 Torch 桥接库和构建清单仍需重建。
 本地 CPU 合同测试不能替代目标软件栈上的数值、图回放和服务验收。

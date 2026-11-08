@@ -17,6 +17,7 @@
 #include "hacl_rt.h"
 #include "mixed_tiling.h"
 #include "tiling_builders.h"
+#include "weight_offsets.h"
 
 namespace {
 
@@ -28,7 +29,7 @@ constexpr uint32_t kKernelCoreCount = 32;
 using OutputStorage = uint16_t;
 static_assert(sizeof(OutputStorage) == 2, "BF16 output storage must occupy 2 bytes");
 
-constexpr const char *kKernelName = "mixed_w2w4_moe_ffn_v3";
+constexpr const char *kKernelName = "mixed_w2w4_moe_ffn_v4";
 constexpr const char *kKernelBinary = "mixed_w2w4_moe_ffn.o";
 
 struct MatFP4Args {
@@ -291,7 +292,8 @@ void CopyTilingBlob(std::vector<uint8_t> &destination, uint64_t offset,
 }
 
 std::vector<uint8_t> BuildMixedTiling(uint64_t k, uint64_t n, uint64_t d,
-                                      uint64_t stage_mask, float swiglu_limit)
+                                      uint64_t stage_mask, float swiglu_limit,
+                                      const MixedWeightOffsets &weight_offsets)
 {
     std::vector<uint8_t> result(ToHostSize(kMixedTilingBytes), 0);
     const MixedTilingHeader header {
@@ -307,6 +309,10 @@ std::vector<uint8_t> BuildMixedTiling(uint64_t k, uint64_t n, uint64_t d,
     std::memcpy(result.data(), &header, sizeof(header));
     const MixedPostOptions post_options {swiglu_limit, {}};
     std::memcpy(result.data() + kMixedPostOptionsOffset, &post_options, sizeof(post_options));
+    std::memcpy(result.data() + kMixedGateWeightOffsetsOffset,
+                weight_offsets.gate.data(), kMixedWeightOffsetsBytes);
+    std::memcpy(result.data() + kMixedDownWeightOffsetsOffset,
+                weight_offsets.down.data(), kMixedWeightOffsetsBytes);
     CopyTilingBlob(result, kMixedGateW2TilingOffset, kMixedGateW2TilingBytes,
                    BuildGateW2TilingBlob(k, n), "Gate W2");
     CopyTilingBlob(result, kMixedGateW4TilingOffset, kMixedGateW4TilingBytes,
@@ -436,7 +442,12 @@ void RunTest(uint64_t group_count, uint64_t k, uint64_t n, uint64_t d,
     if (!std::isfinite(swiglu_limit) || swiglu_limit < 0.0F) {
         throw std::invalid_argument("SwiGLU limit must be finite and non-negative");
     }
-    const std::vector<uint8_t> host_tiling = BuildMixedTiling(k, n, d, stage_mask, swiglu_limit);
+    const auto weight_offsets = BuildMixedWeightOffsets(group_count, k, n, d,
+        host_is_expert_w4.data(), host_is_down_w4.data());
+    if (weight_offsets.gate_bytes != gateup_w_bytes || weight_offsets.down_bytes != down_w_bytes) {
+        throw std::logic_error("precomputed mixed weight offsets disagree with validated blob sizes");
+    }
+    const std::vector<uint8_t> host_tiling = BuildMixedTiling(k, n, d, stage_mask, swiglu_limit, weight_offsets);
 
     std::vector<uint8_t> host_a(ToHostSize(a_bytes));
     std::vector<uint8_t> host_a_scale(ToHostSize(a_scale_bytes));

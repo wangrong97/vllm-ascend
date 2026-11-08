@@ -42,6 +42,7 @@ from ..methods.w2a8.vq2a8_gs32_format import (
     source_projection_fields,
     validate_gs32_options,
 )
+from ..methods.w2a8.vq2a8_gs32_startup import GS32StartupState
 
 VQ2A8_MAX_EXPERTS = 256
 GS32_SHORT_CONTEXT_TOKENS = 128
@@ -236,6 +237,12 @@ class AscendVQ2A8Config(QuantizationConfig):
         self.root_by_name = {}
         self.weight_map = {}
         self.mtp_tensors = frozenset()
+        self._startup_state = None
+
+    def __getstate__(self):
+        # Native registrations belong to the constructing worker/model, not a
+        # serialized config or a copied model instance. Revalidate on reuse.
+        return {**self.__dict__, "_startup_state": None}
 
     def bind_checkpoint(self, model_config):
         """Build typed inventories before model construction allocates banks."""
@@ -476,8 +483,7 @@ class AscendVQ2A8Config(QuantizationConfig):
         if match is None:
             raise ValueError(f"VQ2A8 only supports routed expert layers, got {prefix!r}.")
         config = get_current_vllm_config()
-        options = validate_vq2a8_config(config)
-        self.validate_model_config(config.model_config.hf_config)
+        options = self.validate_runtime_config(config)
         from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
 
         scheme_cls = get_scheme_class("VQ2A8_GS32", "moe")
@@ -497,8 +503,20 @@ class AscendVQ2A8Config(QuantizationConfig):
         scheme = scheme_cls(
             self.layer_spec(int(match.group(1))),
             native_options=options,
+            startup_state=self._startup_state,
             moe_config=layer.moe_config,
             swiglu_limit=getattr(config.model_config.hf_config, "swiglu_limit", None),
             **graph_options,
         )
         return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid=tid2eid)
+
+    def validate_runtime_config(self, config):
+        """Validate once per model/worker, rejecting construction-time changes."""
+        state = self._startup_state
+        if state is not None and state.matches_process():
+            state.require_unchanged(config)
+            return dict(state.options)
+        options = validate_vq2a8_config(config)
+        self.validate_model_config(config.model_config.hf_config)
+        self._startup_state = GS32StartupState(config, options)
+        return dict(options)

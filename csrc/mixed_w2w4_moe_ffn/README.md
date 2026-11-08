@@ -5,7 +5,7 @@
 | 项目 | 说明 |
 | --- | --- |
 | 算子名称 | `MixedW2W4MoE` |
-| 工程 Kernel 名称 | `mixed_w2w4_moe_ffn_v3` |
+| 工程 Kernel 名称 | `mixed_w2w4_moe_ffn_v4` |
 | 功能简称 | 混合 W2A8/W4A8 MoE FFN 融合算子 |
 | 文档版本 | 3.0 |
 
@@ -218,13 +218,16 @@ Gate/Up 设备权重及其 table 按 N32 粒度采用 `Gate32, Up32, Gate32, Up3
 当前工程提供基于 Runtime 的 Kernel 直调样例和命令行 Host 程序，尚未封装为 ACLNN 接口。Host 程序负责准备算子运行所需的内部 workspace 和辅助数据；调用者只需按本文准备公开输入及输出空间。
 
 框架通过 `csrc/vq2a8_gs32_stage/torch_binding.cpp` 接入同一内核。
-ABI v3 保留原有 64 字节头和四个 component tiling 的偏移，
-在偏移 1600 追加 32 字节 `MixedPostOptions`，总长为 1632 字节。
+ABI v4 保留原有 64 字节头、四个 component tiling 的偏移，
+以及偏移 1600 处的 32 字节 `MixedPostOptions`。
 其中首字段是 FP32 `swiglu_limit`，其余字段保留为 0。
-Kernel 注册名为 `mixed_w2w4_moe_ffn_v3`，产物文件名仍为 `mixed_w2w4_moe_ffn.o`；
+偏移 1632 和 3680 分别存储 Gate/Down 的 256 项 uint64 权重字节偏移，总长为 5728 字节。
+Host 按常驻专家精度一次性预计算，包含空专家的压缩权重；AIV 仅为活跃且精度匹配的专家读取偏移。
+table/scale 按每专家 `N*K/32` 固定步长直接索引，动态行前缀、tile 调度、数值和同步逻辑保持原样。
+Kernel 注册名为 `mixed_w2w4_moe_ffn_v4`，产物文件名仍为 `mixed_w2w4_moe_ffn.o`；
 更新时必须一起重新构建 bridge `.so` 和设备 `.o`。
 完整 FFN 的 stage mask 按常驻权重精度确定，包含当次 token 数为 0 的专家，
-以支持图重放时路由变化。单投影诊断路径仍只启用对应 Down stage。
+以支持图重放时路由变化。框架只提供完整 FFN 路径，Gate 和 Down stage 必须同时存在。
 
 ### 环境依赖
 

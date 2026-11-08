@@ -68,8 +68,8 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 ```
 
-按[完整 FFN 构建说明](packed_weight_batch_throughput.md#0-首次升级完整-ffn重建-abi-v3)更新桥接 `.so` 及清单。
-本次保留设备 ABI v3 和数学逻辑；设备对象必须与当前目标和 CANN 兼容，预检核对 v3 符号及 SHA256。
+按[完整 FFN 构建说明](packed_weight_batch_throughput.md#0-首次升级完整-ffn重建-abi-v4)重建 `.o`、`.so` 及清单。
+本次升级设备 ABI v4，数学逻辑不变；旧 v3 设备对象不能复用，预检核对 v4 符号及 SHA256。
 先校验主模型扩展和 native GS32 bridge 的注册接口。此命令不加载权重、不启动服务，也不执行设备算子：
 
 ```bash
@@ -82,6 +82,8 @@ python tools/serve_vq2a8.py \
 ```
 
 正常 native 服务启动也会执行此前置检查；`--dry-run` 仍只检查配置，不加载扩展。
+下方一键 NPU CI 同样在运行 pytest 前校验 ABI v4、构建清单、产物 SHA256 和注册接口，
+把环境与接口证据保存为 `native-preflight.json`；不需要为一键套件额外手工执行上述检查。
 接口检查不证明 `.o` 已成功执行或图捕获已通过；若提示重建，按[构建说明](vq2a8_gs32.md#构建与-checkpoint-准备)更新对应产物。
 
 先执行 B1 的同权重 eager/decode graph 对照，覆盖 127/128/129-token 输入边界及恢复请求：
@@ -101,6 +103,7 @@ python -m pytest -vv -s -x -o addopts= \
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=4 python -m pytest -vv -s -x -o addopts= \
   tests/e2e/nightly/test_vq2a8_gs32_full_ffn.py \
+  tests/e2e/nightly/test_vq2a8_gs32_resident_plan.py \
   --vq2a8-model "$MODEL" \
   --vq2a8-gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
   --vq2a8-gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o"
@@ -128,7 +131,7 @@ repack 前后的非 routed 量化不同，不能要求两份权重逐 token 一�
 
 ## 一键执行
 
-日常 PR 回归使用空闲卡 4、5，默认运行五个组件阶段和 MRV2 的 `ep2-v2` 整模型阶段，共六个阶段。
+日常 PR 回归使用空闲卡 4、5，默认运行六个组件阶段和 MRV2 的 `ep2-v2` 整模型阶段，共七个阶段。
 一键 CI 默认选择 Model Runner V2；`ep2-v1` 已从自动计划移除，MRV1 的整模型 eager/decode graph 对照仍可手动运行。
 缺少支持的真实专家组合默认使验收失败；显式接受覆盖缺口的规则见[缺失组合处理](#checkpoint-缺少真实专家组合时)。
 
@@ -193,17 +196,18 @@ python tools/tests/run_vq2a8_npu_ci.py \
 
 | 套件 | 设备要求 | 默认覆盖 |
 | --- | --- | --- |
-| `kernels` | 恰好一张，例如 `--devices 4` | 五个组件测试文件，共五个阶段 |
-| `pr`，默认 | 恰好两张，例如 `--devices 4,5` | 五个组件阶段，再运行 MRV2 的真实 EP2 eager/decode graph 对照 `ep2-v2`，默认共六个阶段 |
-| `nightly` | 恰好两张 | PR 覆盖加 `recovery-v2` 短/16K/短恢复测试，默认共七个阶段 |
+| `kernels` | 恰好一张，例如 `--devices 4` | 六个组件测试文件，共六个阶段 |
+| `pr`，默认 | 恰好两张，例如 `--devices 4,5` | 六个组件阶段，再运行 MRV2 的真实 EP2 eager/decode graph 对照 `ep2-v2`，默认共七个阶段 |
+| `nightly` | 恰好两张 | PR 覆盖加 `recovery-v2` 短/16K/短恢复测试，默认共八个阶段 |
 
-五个组件文件均位于 `tests/e2e/nightly/`：
+六个组件文件均位于 `tests/e2e/nightly/`：
 
 | 文件 | 主要验证内容 |
 | --- | --- |
 | `test_vq2a8_gs32_activation.py` | 完整 FFN 初始激活量化及有效性边界 |
 | `test_vq2a8_gs32_device_routes.py` | 设备 metadata、counts/prefixes、padding、无效路由与恢复 |
-| `test_vq2a8_gs32_full_ffn.py` | 三种真实专家与独立官方 GMM oracle 对照、中间 FP8/E8M0、混精动态路由、图捕获及恢复 |
+| `test_vq2a8_gs32_full_ffn.py` | 三种真实专家与独立官方 GMM oracle 对照、中间 FP8/E8M0、混精动态路由、完整 EP 本地库存 profile、图捕获及恢复 |
+| `test_vq2a8_gs32_resident_plan.py` | 计划持有权重、静态 shape/dtype/alias 拒绝、动态工作区别名及释放外部引用后的执行 |
 | `test_vq2a8_gs32_ep_routes.py` | EP 专家归属及路由布局 |
 | `test_vq2a8_gs32_ep_attention.py` | attention 相关回归 |
 
@@ -214,13 +218,13 @@ python tools/tests/run_vq2a8_npu_ci.py \
 
 `--model-runners` 默认是 `v2`，仍可显式选择 `v1` 或 `v1 v2`；
 首个值决定组件阶段使用的 runner，全部所选值决定 `pr`、`nightly` 的整模型阶段；不会重新启用 `ep2-v1`。
-五个组件阶段验证各自的算子或组件，不能代替整模型执行验证。
+六个组件阶段验证各自的算子或组件，不能代替整模型执行验证。
 
 | runner 选择 | `pr` 阶段 | `nightly` 阶段 |
 | --- | --- | --- |
-| 默认，或 `--model-runners v2` | 五个组件 + `ep2-v2`，共六个 | 五个组件 + `ep2-v2` + `recovery-v2`，共七个 |
-| `--model-runners v1` | 仅五个组件，共五个 | 五个组件 + `recovery-v1`，共六个 |
-| `--model-runners v1 v2` | 五个组件 + `ep2-v2`，共六个 | 五个组件 + `ep2-v2` + `recovery-v1` + `recovery-v2`，共八个 |
+| 默认，或 `--model-runners v2` | 六个组件 + `ep2-v2`，共七个 | 六个组件 + `ep2-v2` + `recovery-v2`，共八个 |
+| `--model-runners v1` | 仅六个组件，共六个 | 六个组件 + `recovery-v1`，共七个 |
+| `--model-runners v1 v2` | 六个组件 + `ep2-v2`，共七个 | 六个组件 + `ep2-v2` + `recovery-v1` + `recovery-v2`，共九个 |
 
 **一键 CI 通过不代表 MRV1 的整模型 EP2 eager/decode graph 对照已通过。**
 该检查已移出计划，组件阶段和 `recovery-v1` 不能代替它；需要该项验收时，使用下文的手动 EP2 命令。
@@ -300,7 +304,7 @@ DP eager 还须与 TP/EP B1 参考逐请求匹配 greedy token，并按已有 EP
 默认不会额外执行独立的 EP1 整模型测试。
 
 `--timeout` 默认是 **7200 秒，每个 pytest 阶段独立计时**，并非整套测试的总时限。
-环境预检另有 120 秒超时；现有整模型探针的子进程仍保留 **1800 秒**内部超时。
+环境及原生产物预检另有 120 秒超时；现有整模型探针的子进程仍保留 **1800 秒**内部超时。
 因此仅增大一键入口的 `--timeout`，不会延长探针自己的内部上限。
 
 退出码及汇总规则：
@@ -308,8 +312,9 @@ DP eager 还须与 TP/EP B1 参考逐请求匹配 greedy token，并按已有 EP
 - 返回 `0`：所有选定阶段均至少有一个实际通过用例，并且无 failure、error、xfail 或不支持的 skip。
   驱动同时启用 `xfail_strict=True`，不能用意外通过的预期失败用例掩盖结果。
   若仅存在显式接受的支持组合缺失，汇总为 `passed_with_coverage_gaps`；无 skip 时为 `passed`。
-- 返回 `1`：环境预检失败、测试失败、超时、零测试，或 JUnit 缺失、格式错误、计数不一致。
+- 返回 `1`：环境或产物预检失败、测试失败、超时、零测试，或 JUnit 缺失、格式错误、计数不一致。
   其他未接受的 skip、xfail 或整阶段全 skip，也属于未完成验收。
+  完整 FFN profile 缺失、无效或与本轮模型/产物不符也会失败，不能仅凭 pytest 返回 `0` 判定完整验收通过。
 - Ctrl+C 或 SIGTERM：保存已完成部分及中断状态，返回 `130`。
 
 出现失败即停止后续阶段，尚未运行的阶段保留为 `not_run`。
@@ -323,9 +328,11 @@ DP eager 还须与 TP/EP B1 参考逐请求匹配 greedy token，并按已有 EP
 benchmark-results/npu-ci/vq2a8-npu-ci-<时间戳>-<随机后缀>/
   summary.json
   environment.log
+  native-preflight.json
   full_ffn.log
   full_ffn.xml
   full_ffn-tmp/
+  full-ep-ffn-profile.json
   ep2-v2.log
   ep2-v2.xml
   ep2-v2-tmp/
@@ -342,6 +349,8 @@ EP 整模型测试的内层子进程输出单独写入 `ep2-v2-tmp/` 下的 `ep2
 不会透传到外层终端；查看加载、预热或图捕获进度时，应对当前内层日志执行 `tail -f`。
 `PROBE_WAIT` 仅表示外层仍在等待，不代表内层模型正在推进。
 `summary.json` 记录 checkout commit、实际命令、所选环境覆盖、测试计数、耗时和状态，并在阶段更新时保存。
+其中 `preflight` 链接环境及 ABI 预检证据，`full_ep_profile` 链接独立的完整专家 profile，均记录文件 SHA256。
+profile 同时记录在 `full_ffn` 阶段；报告异常写入该阶段的 `profile_error`，原始测试日志保留。
 汇总和 dry-run 的 `model_runners` 只列实际安排整模型阶段的 runner：默认 `pr`、`nightly` 为 `["v2"]`，
 `kernels` 和 `pr --model-runners v1` 为 `[]`，`nightly --model-runners v1 v2` 为 `["v1", "v2"]`。
 `single_card_reference` 仅在实际包含 EP 对照阶段且指定该开关时为 `true`。
@@ -363,6 +372,10 @@ tail -n 80 "$RESULT/full_ffn.log"
 如果通过 `tee` 保存终端输出，应先执行 `set -o pipefail`，避免管道把失败退出码覆盖掉。
 
 组件测试中的局部计时保留在日志中，但**没有自动性能回归阈值**。
+`full_ffn.log` 中的 `VQ2A8_GS32_FULL_EP_PROFILE=` 包含完整 EP4 本地专家库存的 JSON 报告：
+6/384 行图捕获时间、4096 行 eager prefill、Host/设备计时、显存与 100 次交替回放稳定性。
+驱动将本轮报告另存到结果目录的 `full-ep-ffn-profile.json`，可直接复制该文件比较，无需寻找 pytest 临时目录。
+该 profile 在单张卡上运行；它的 EP4 库存选择不等于四卡通信验收，详见[运行时验收说明](vq2a8_gs32_runtime.md#验证)。
 这些数据不能替代 HTTP 服务的 TTFT/TPOT，也不包含所有 attention、通信、调度和请求处理成本。
 服务性能对比应固定硬件、checkpoint、原生产物、runner、chunk 和融合设置。
 

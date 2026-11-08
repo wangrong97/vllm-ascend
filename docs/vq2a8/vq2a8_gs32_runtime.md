@@ -9,7 +9,7 @@
 完整 FFN 在设备内执行 GateUp、裁剪后的 SwiGLU、中间激活量化和 Down；框架优化不改变这个序列的数学逻辑。
 
 - `csrc/vq2a8_gs32_stage/torch_binding.cpp` 注册 `torch.ops.vq2a8_gs32_stage` 的完整 FFN 计划、执行及设备路由接口。
-  `prepare_full_ffn` 在捕获前创建计划；`full_ffn_device` 使用同一 ABI v3 设备入口，保留张量生命周期、流和别名校验。
+  `prepare_full_ffn` 在捕获前校验并持有六个权重张量；`full_ffn_device` 使用 ABI v4 设备入口，保留张量生命周期、流和动态别名校验。
 - `prepare_device_routes` 接收设备计数，`device_routes_status` 提供有效性状态；调用方在接受结果前完成检查。
   桥接层使用独立的 Triton sanitizer，将计数范围、精确总和及安全副本生成合为一次设备调用。
   内部计数仍由 opaque route handle 持有，公开状态仍返回副本；没有跳过校验的 trusted-counts 开关。
@@ -43,9 +43,26 @@ padding 输出清零，再用固定大小寄存器块归约并覆盖已有的每
 不建立跨 layer、跨 stream 或跨图桶共享的可变 workspace：每次 capture 持有自己的张量及 route handle，
 eager 返回值也不会被后续调用覆盖。图回放本来不会重复执行 Python 分配，优先减少实际缓冲及设备操作。
 
-设备端完整 FFN 源码和 ABI v3 不变，但桥接新增 `_sanitize_device_counts` schema，升级后必须重建 `.so` 和清单。
-Python runtime 在加载 `.so` 后注册对应实现；旧桥接缺少该 schema 时启动预检直接失败。
+设备端升级为 ABI v4：tiling 由 1632 字节扩展为 5728 字节，追加 Gate/Down 各 256 个 uint64 权重字节偏移。
+原有四个组件 tiling 和 SwiGLU 参数偏移不变；权重偏移在加载时按混合精度计算，设备只读取当前专家对应项。
+不调整 tile、动态 token 路由、同步屏障、裁剪与舍入逻辑。每层计划增加 4096 字节设备元数据，替代设备执行中的权重偏移累计。
+升级后必须重建 `.o`、`.so` 和清单；旧符号、旧计划 schema 或哈希不匹配在预检时失败。
+Python runtime 仍在加载 `.so` 后注册 `_sanitize_device_counts` 实现。
 目前 CPU 测试只能验证约定和边界，实际 Triton 编译、图回放、显存占用及吞吐收益均需目标 NPU 验收。
+
+### 启动和提交开销
+
+同一模型实例、同一 worker 的配置和 DSpark 检查只在首次成功时发布结果，后续层复用；改变关键执行配置需重新构造模型。
+原生 `.so/.o` 校验、schema 注册及初始化按该实例和 NPU 设备复用。失败不缓存，新进程或新实例重新验证，
+每层仍独立持有权重与计划，不建立全局 Python 缓存。
+
+原生计划在初始化时验证六个权重张量的 dtype、形状、尺寸与相互别名，并持有独立张量元数据及共享底层存储。
+执行接口只接收动态输入、路由、计划与工作区，不再重复传入六个权重参数。
+每次提交仍检查动态 shape、device、stream、输入/工作区重叠及与权重的重叠，并拒绝底层权重存储被移动或缩小。
+计划和提交回调共同保持权重存活；这不能替代权重加载后禁止修改、图存活期间禁止重分配的约定。
+
+继续保留每次执行的 output 清零和 middle scale 初始化，以及每次 eager 独立输出、每图独立工作区。
+跨调用 eager 缓冲复用、跨图共享、减少初始化和 tile 调参需根据真实 profile 选择，不能仅凭减少代码量认定提速。
 
 ## DP-EP 通信与容量
 
@@ -99,7 +116,7 @@ Linux `aarch64` 和 `x86_64` 宿主共用这套构建流程与算子源码。设
 不要复制 ARM 的 `.so`、宿主可执行文件或 CMake 缓存；`pip install -e .` 的主构建也需要在目标机器重新执行。
 主构建日志中的 AICPU ARM 交叉编译器用于 NPU 设备侧，仍需保留。
 以下命令在目标机生成完整运行目录；`ASCEND_TOOLKIT_HOME` 指向该机器已加载的 CANN，例如 `/usr/local/Ascend/cann-9.2.0`。
-本次设备 ABI v3 及数学逻辑不变，桥接新增计数 sanitizer 后须重新构建 `.so` 与清单；确认兼容的已有 `.o` 可作为构建输入。
+本次设备 ABI 升级为 v4，数学逻辑不变；必须从当前源码重建 `.o`、`.so` 与清单。
 
 ```bash
 # Run from the repository root. ASCEND_TOOLKIT_HOME names the loaded toolkit.
@@ -210,6 +227,7 @@ ASCEND_RT_VISIBLE_DEVICES=4 python -m pytest -vv -s -x \
   tests/e2e/nightly/test_vq2a8_gs32_activation.py \
   tests/e2e/nightly/test_vq2a8_gs32_device_routes.py \
   tests/e2e/nightly/test_vq2a8_gs32_full_ffn.py \
+  tests/e2e/nightly/test_vq2a8_gs32_resident_plan.py \
   --vq2a8-model "$MODEL" \
   --vq2a8-gs32-library "$BUILD/libvq2a8_gs32_stage.so" \
   --vq2a8-gs32-binary "$BUILD/mixed_w2w4_moe_ffn.o"
@@ -219,5 +237,14 @@ ASCEND_RT_VISIBLE_DEVICES=4 python -m pytest -vv -s -x \
 图验收还会输出 `VQ2A8_GS32_FULL_FFN_TIMING`：6/384 行各预热 3 次、测量 5 次，记录 eager 与 graph 的
 NPUEvent 原始耗时和中位数，排除输入拷贝及 owner 状态读回。该数据用于同环境版本对比，不设固定时延阈值，
 也不能替代整模型吞吐或端到端延迟。
+完整 FFN 文件新增 `test_gs32_full_ffn_full_ep_inventory_profile`，在真实 checkpoint 中选择一个 EP4 rank 的完整本地专家库存，
+测量 6/384 routed rows 的 eager/graph，以及 4096 rows 的 eager prefill。覆盖空路由、均匀路由、各精度组合热点与倾斜路由；
+记录捕获耗时、已分配/保留/峰值显存、capture owner 存储、Host 提交与设备事件耗时，并交替回放两个图桶 100 次检查地址、所有权与活跃显存稳定。
+输出 `full-ep-ffn-profile.json`，同一 JSON 以 `VQ2A8_GS32_FULL_EP_PROFILE=` 打印到测试日志。
+一键 CI 校验报告与本轮模型、产物的关联后，将报告另存到结果目录，并在汇总中记录路径和 SHA256。
+这是单卡上真实 EP 本地库存的测量，不包含 HCCL 和整模型延迟；独立数值 oracle 仍由三种真实精度组合用例承担。
+比较优化前后时，固定服务器、卡、checkpoint、路由、图桶和 CANN，分别重建各版本产物并保留哈希；
+随后按吞吐文档用相同配置重复测试 TTFT、TPOT 和吞吐，不能把减少 Host 检查直接等同于图回放提速。
+
 整模型多卡、B64、答题精度和服务性能分别按 [NPU CI](vq2a8_npu_ci.md)、[精度](vq2a8_accuracy.md)
 和[吞吐](packed_weight_batch_throughput.md)指南验证。CPU 测试和历史结果不能代替本次目标环境验收。

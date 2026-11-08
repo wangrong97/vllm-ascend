@@ -73,7 +73,7 @@ python -m pip install --only-binary=:all: --no-deps "pyarrow==25.0.1"
 ## 指定 NPU 卡并启动精度评测服务
 
 在终端 A 使用 **物理卡 4、5、6、7，native、MRV2、TP4/EP4、DP1、B64 decode 图、fusion=full_ffn** 启动服务。
-更新后按[完整 FFN 构建说明](packed_weight_batch_throughput.md#0-首次升级完整-ffn重建-abi-v3)重建桥接库及清单，使用兼容 ABI v3 的设备对象。
+更新后按[完整 FFN 构建说明](packed_weight_batch_throughput.md#0-首次升级完整-ffn重建-abi-v4)重建设备对象、桥接库及清单，旧 ABI v3 产物不能复用。
 卡号按实际空闲四卡调整；`BUILD` 指向含 `build-manifest.json`、`.so` 和 `.o` 的匹配产物目录。
 下面为精度评测配置 **262144（256K）总上下文、8192 prefill chunk**，为每题最多 128K 输出保留输入空间：
 

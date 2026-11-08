@@ -103,11 +103,11 @@ compile_kernel()
 }
 
 echo ">>> [1/3] 编译单算子 AIV"
-rm -f mixed_w2w4_moe_ffn_v3_mix_aiv.o mixed_w2w4_moe_ffn_v3_mix_aic.o mixed_w2w4_moe_ffn.o mixed_w2w4_moe_ffn_host tiling_*.o
-compile_kernel dav-c310-vec __DAV_C310_VEC__ mixed_w2w4_moe_ffn_aiv.cce mixed_w2w4_moe_ffn_v3_mix_aiv.o
+rm -f mixed_w2w4_moe_ffn_v4_mix_aiv.o mixed_w2w4_moe_ffn_v4_mix_aic.o mixed_w2w4_moe_ffn.o mixed_w2w4_moe_ffn_host tiling_*.o
+compile_kernel dav-c310-vec __DAV_C310_VEC__ mixed_w2w4_moe_ffn_aiv.cce mixed_w2w4_moe_ffn_v4_mix_aiv.o
 
 echo ">>> [2/3] 编译单算子 AIC 并链接 Kernel"
-compile_kernel dav-c310-cube __DAV_C310_CUBE__ mixed_w2w4_moe_ffn_aic.cce mixed_w2w4_moe_ffn_v3_mix_aic.o
+compile_kernel dav-c310-cube __DAV_C310_CUBE__ mixed_w2w4_moe_ffn_aic.cce mixed_w2w4_moe_ffn_v4_mix_aic.o
 
 LINKER_DRIVER_FLAGS=()
 if [[ "$(basename "${CCE_LINKER}")" == "lld" ]]; then
@@ -121,8 +121,8 @@ fi
     -Ttext=0 \
     --threads=1 \
     --allow-multiple-definition \
-    mixed_w2w4_moe_ffn_v3_mix_aic.o \
-    mixed_w2w4_moe_ffn_v3_mix_aiv.o \
+    mixed_w2w4_moe_ffn_v4_mix_aic.o \
+    mixed_w2w4_moe_ffn_v4_mix_aiv.o \
     -static \
     -o mixed_w2w4_moe_ffn.o
 

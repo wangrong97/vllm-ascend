@@ -283,7 +283,7 @@ def generate(
         "c_dtype": "bfloat16",
         "seed": seed,
         "swiglu_limit": swiglu_limit,
-        "tiling_abi_version": 3,
+        "tiling_abi_version": 4,
     }
     (input_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 

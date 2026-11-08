@@ -395,27 +395,25 @@ public:
         __gm__ uint8_t *a_base = (__gm__ uint8_t *)a_gm;
         __gm__ uint8_t *a_scale_base = (__gm__ uint8_t *)a_scale_gm;
         __gm__ uint8_t *b_scale_base = (__gm__ uint8_t *)b_scale_gm;
-        const uint64_t w2_scale_group_bytes = N * K / kMxScaleGroupSize;
-        const uint64_t w4_scale_group_bytes = N * K / kMxScaleGroupSize;
+        // W2 codebooks and W4 scales have the same fixed expert stride.
+        const uint64_t scale_group_bytes = N * K / kMxScaleGroupSize;
         uint64_t row_begin = 0;
-        uint64_t scale_offset = 0;
         bool has_previous_mode = false;
         bool previous_single_l0c = false;
 
         // group_list保存非累计M_i；A_i/H_i起点为之前各组M_i之和。
         for (uint64_t group_id = 0; group_id < G; ++group_id) {
-            const bool route_w4 = ::MixedRouteBit((__gm__ uint32_t *)route_mask_gm, group_id);
-            __gm__ uint8_t *group_b_scale = b_scale_base + scale_offset;
-            scale_offset += route_w4 ? w4_scale_group_bytes : w2_scale_group_bytes;
             const int64_t signed_group_m = group_list[group_id];
             if (signed_group_m <= 0) {
                 continue;
             }
             const uint64_t group_m = static_cast<uint64_t>(signed_group_m);
+            const bool route_w4 = ::MixedRouteBit((__gm__ uint32_t *)route_mask_gm, group_id);
             if (!route_w4) {
                 row_begin += group_m;
                 continue;
             }
+            __gm__ uint8_t *group_b_scale = b_scale_base + group_id * scale_group_bytes;
             const bool wide_group = MatFP4IsWideGroup(group_m, n_only_mode, wide_m_start);
             const bool single_l0c_group = wide_group || (n_only_mode != 0 && group_m > small_m_limit);
             if (has_previous_mode && previous_single_l0c != single_l0c_group) {
@@ -512,7 +510,7 @@ public:
 };
 
 #ifndef MAT_FP4_COMPONENT_ONLY
-extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v3_mix_aic(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list,
+extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v4_mix_aic(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list,
                                                        __gm__ void *a, __gm__ void *a_scale, __gm__ void *b,
                                                        __gm__ void *b_scale, __gm__ void *h,
                                                        __gm__ void *h_scale, __gm__ void *tiling,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Build the GS32 full-FFN Torch adapter around a matching ABI v3 mixed ELF."""
+"""Build the GS32 full-FFN Torch adapter around a matching ABI v4 mixed ELF."""
 
 from __future__ import annotations
 
@@ -135,6 +135,7 @@ def source_hashes():
         COUNTS_WRAPPER,
         COUNTS_KERNEL,
         MIXED_SOURCE / "mixed_tiling.h",
+        MIXED_SOURCE / "weight_offsets.h",
         MIXED_SOURCE / "tiling_builders.h",
         *sorted((MIXED_SOURCE / "components").rglob("*tiling*.h")),
     )

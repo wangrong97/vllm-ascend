@@ -49,7 +49,7 @@ def test_binding_exposes_only_complete_ffn_and_device_routes():
     assert '#include "../mixed_w2w4_moe_ffn/tiling_builders.h"' in source
     assert '#include "../mixed_w2w4_moe_ffn/mixed_tiling.h"' in source
     assert "constexpr uint32_t kKernelCoreCount = 32;" in source
-    assert "static_assert(kMixedTilingVersion == 3 && kMixedTilingBytes == 1632" in source
+    assert "static_assert(kMixedTilingVersion == 4 && kMixedTilingBytes == 5728" in source
     registrations = source[source.index("TORCH_LIBRARY(vq2a8_gs32_stage,") :]
     expected = {
         "initialize",
@@ -82,7 +82,7 @@ def test_full_ffn_tiling_preserves_all_component_offsets_and_post_options():
     mixed = (MIXED / "mixed_tiling.h").read_text(encoding="utf-8")
     assert "constexpr uint64_t kMixedPostOptionsOffset = 1600;" in mixed
     assert "constexpr uint64_t kMixedPostOptionsBytes = 32;" in mixed
-    assert "constexpr uint64_t kMixedTilingVersion = 3;" in mixed
+    assert "constexpr uint64_t kMixedTilingVersion = 4;" in mixed
     assert "constexpr uint64_t kMixedDownW2TilingOffset = 832;" in mixed
 
 
@@ -98,19 +98,20 @@ def test_resident_expert_views_are_aligned_and_storage_bounded():
 def test_full_ffn_is_fail_closed_on_geometry_dtype_layout_alias_and_metadata():
     source = source_text()
     body = function(source, "FullFFNDevice")
-    for dtype in ("at::kByte", "at::kLong", "at::kBFloat16"):
+    resident = function(source, "ResidentWeights")
+    for dtype in ("at::kByte", "at::kBFloat16"):
         assert dtype in body
+    assert "at::kLong" in resident
     for shape in (
         "input_scale must be [R,K/32]",
-        "Gate row scales must be [G,N]",
-        "Down row scales must be [G,D]",
         "hidden workspace must be [R,N/2]",
         "hidden scale must be [R,N/64]",
         "output must be [R,D]",
     ):
         assert shape in body
-    assert "full FFN mixed weight/table blob sizes do not match resident precision masks" in body
-    assert "CheckNoAlias(" in body
+    assert "full FFN mixed weight/table blob sizes do not match resident precision masks" in resident
+    assert "Gate row scales must be [G,N]" in resident and "Down row scales must be [G,D]" in resident
+    assert "CheckNoAlias(" in resident and "CheckDynamicRanges(" in body
     checks = function(source, "CheckNpuTensor") + function(source, "CheckCpuMetadata")
     assert "is_contiguous()" in checks
     assert "storage_offset() == 0" in checks
@@ -120,6 +121,23 @@ def test_full_ffn_is_fail_closed_on_geometry_dtype_layout_alias_and_metadata():
     assert "std::isfinite(swiglu_limit)" in prepare and "swiglu_limit >= 0" in prepare
     assert "CheckCpuMetadata(gate_w4, at::kBool" in prepare
     assert "CheckCpuMetadata(down_w4, at::kBool" in prepare
+
+
+def test_prepared_plan_owns_weight_storage_and_preserves_dynamic_alias_guards():
+    source = source_text()
+    resident = function(source, "ResidentWeights")
+    checks = function(source, "CheckDynamicRanges")
+    launch = function(source, "FullFFNDevice")
+    assert "tensors[i].detach()" in resident
+    assert "tensor.storage().nbytes()" in checks
+    assert "tensor.data_ptr()) == ranges_[i].begin" in checks
+    assert "capacity - offset" in checks and "must not alias or overlap storage" in checks
+    assert "const ResidentWeights weights_;" in source
+    assert "BlobBytes()" not in launch
+    assert "const auto& weights = plan->Weights()" in launch
+    # All six static tensors are kept alive by the captured plan, and recorded
+    # on the submission stream alongside the dynamic buffers.
+    assert all(f"weights[{index}]" in launch for index in range(6))
 
 
 def test_resident_metadata_is_prepared_before_capture_and_owned_for_the_launch():
@@ -505,10 +523,10 @@ def test_preflight_rejects_removed_modes_before_loading_torch(execution, fusion)
         build.verify_registered_device_schemas(None, execution, fusion)
 
 
-def test_default_preflight_requires_abi_v3_kernel_and_manifest_before_loading(tmp_path, monkeypatch):
+def test_default_preflight_requires_abi_v4_kernel_and_manifest_before_loading(tmp_path, monkeypatch):
     library = write_elf(tmp_path / build.LIBRARY_NAME)
     binary = tmp_path / build.KERNEL_NAME
-    binary.write_bytes(b"\x7fELFold-kernel")
+    binary.write_bytes(b"\x7fELFmixed_w2w4_moe_ffn_v3\x00")
 
     def reject_load(_):
         pytest.fail("an invalid artifact pair must never be loaded")

@@ -147,7 +147,20 @@ def test_runtime_record_is_written_only_after_preflight_with_resolved_defaults(
     server_assets, monkeypatch, tmp_path, valid
 ):
     record_path = tmp_path / "service-runtime.json"
-    artifacts = {"library_sha256": "1" * 64, "kernel": {"sha256": "2" * 64, "abi_version": 3}}
+    artifacts = {
+        "abi_version": 4,
+        "library": str(tmp_path / "libvq2a8_gs32_stage.so"),
+        "library_sha256": "1" * 64,
+        "build_manifest": str(tmp_path / "build-manifest.json"),
+        "kernel": {
+            "path": str(tmp_path / "mixed_w2w4_moe_ffn.o"),
+            "present": True,
+            "bytes": 1024,
+            "sha256": "2" * 64,
+            "abi_version": 4,
+            "entry": "mixed_w2w4_moe_ffn_v4",
+        },
+    }
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setattr(serve, "check_native_dependencies", lambda: "model.so")
 

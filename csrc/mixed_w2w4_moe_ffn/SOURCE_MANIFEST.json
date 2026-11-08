@@ -14,7 +14,9 @@
     "version full-FFN tiling ABI to v3, append runtime SwiGLU limit and version device entry symbols",
     "clip Gate upper bound and Up both bounds for W2/W4 while preserving BF16/FP32/MXFP8 rounding and pre-clamp invalid markers",
     "enable resident precision stages even for empty experts; pair standalone golden and runtime limit",
-    "document complete routed-FFN bridge integration and update CPU numerical checks"
+    "document complete routed-FFN bridge integration and update CPU numerical checks",
+    "version full-FFN tiling ABI to v4; precompute resident packed-weight byte offsets on Host and use equivalent fixed codebook/scale strides; preserve numerical kernels, tiling and synchronization",
+    "document full-FFN-only framework contract and separately record new repository offset helper and host tests"
   ],
   "model_dispatch_enabled": true,
   "files": [
@@ -22,7 +24,7 @@
       "source_path": "README.md",
       "path": "README.md",
       "source_sha256": "0dba45421f053ccd784487f3549912ad94c52bf2bdf41b03609d8956be539d14",
-      "sha256": "e26b719859c63ac5b111b4238c2dbc68f9868a342427de35bbed5e54f5dc0f08"
+      "sha256": "05e00637f9ff4c0337655d6c83313607767ff4fd1846100f574adffa80c57b06"
     },
     {
       "source_path": "cmp.py",
@@ -34,13 +36,13 @@
       "source_path": "components/down_w2/down_w2_aic_impl.h",
       "path": "components/down_w2/down_w2_aic_impl.h",
       "source_sha256": "ebd78904b9804f78d9d2ed8d2b51bd442963e4cec52f824fdcaacc27bf7a73d3",
-      "sha256": "d35321f53be31f09750628a02a1482eaa2cb70f4ced85af9395b6776ccd920a6"
+      "sha256": "251303f52454c6d26417b845c0654a19a5e91e6f7d7437bd4c86785e01c804f4"
     },
     {
       "source_path": "components/down_w2/down_w2_aiv_impl.h",
       "path": "components/down_w2/down_w2_aiv_impl.h",
       "source_sha256": "07d9d230dafd57450312151910f30c23dfef3906eac5ecd99b3fda86d43cdf13",
-      "sha256": "808ed449a14ae0e4a057ff800b642dacb4e1b065e559627b658c63305142c49d"
+      "sha256": "59ba326a9e3790414e19c4184da34600a074155301b39d2dea781c543103e042"
     },
     {
       "source_path": "components/down_w2/down_w2_tiling.h",
@@ -58,13 +60,13 @@
       "source_path": "components/down_w4/down_w4_aic_impl.h",
       "path": "components/down_w4/down_w4_aic_impl.h",
       "source_sha256": "5616e10c07e2b51222e09e312a2bc0f68c429511fc3f905be6c2725df1aeb143",
-      "sha256": "aa78a9a4f714c239d915d7570545bea43031f47a481f34472f5e6a10c0ac7c9e"
+      "sha256": "2a92e20fe9150be55ac9163cb26164335b09978901a68c2b8088e88a637d5e57"
     },
     {
       "source_path": "components/down_w4/down_w4_aiv_impl.h",
       "path": "components/down_w4/down_w4_aiv_impl.h",
       "source_sha256": "016761cddc00a858409d6ea8066bacdd408dcaffe0f458bb99170ba2544a967d",
-      "sha256": "b43e0e7061252a2483da754c5f7d321b099dba1c3e8f08d4b8f561513bc037c5"
+      "sha256": "442ae8184ad6a9d058666bd4d9c226aa95ef7f20031232b441a8e8af5d43f866"
     },
     {
       "source_path": "components/down_w4/down_w4_tiling.h",
@@ -82,13 +84,13 @@
       "source_path": "components/gate_w2/gate_w2_aic_impl.h",
       "path": "components/gate_w2/gate_w2_aic_impl.h",
       "source_sha256": "2e59f134787eb19df72b0e3f39f4bb4357d6043839af3644703d1b974632305b",
-      "sha256": "400f64f337d114a1ea1fb8e11972d8d0fd66888bac6cbaa620ca3a67379aecea"
+      "sha256": "7d5fbca3dd0963972ee19bc206070b61ae66f096a6d0af554c628d99ddadb84d"
     },
     {
       "source_path": "components/gate_w2/gate_w2_aiv_impl.h",
       "path": "components/gate_w2/gate_w2_aiv_impl.h",
       "source_sha256": "029f66a1de4b35c470cd948c50df3d3c57b3961bec1e7c2ddffc728195fad98d",
-      "sha256": "2b60a00266a9d31c0b9cfe919ade1ca140212c0560cdd879fb6f6805c7f4159e"
+      "sha256": "cb98e5aae6958d824e287f1ea4fa591ee353b30f9cf18a2558f8e26f54a86fca"
     },
     {
       "source_path": "components/gate_w2/gate_w2_post_tiling.h",
@@ -118,13 +120,13 @@
       "source_path": "components/gate_w4/gate_w4_aic_impl.h",
       "path": "components/gate_w4/gate_w4_aic_impl.h",
       "source_sha256": "dcd2014e266904e999875c33cdd947a0d7c0a2f161ea8f51d46b8442037d1dbc",
-      "sha256": "f45b8a227a11af967d50b1a90acbab0b5475a43c5b16b2deff2b48bc2c7d65c8"
+      "sha256": "9c74b6a94406f33a14550c45d9e3e7559168a8ccaa9c82e3074754b8614841c1"
     },
     {
       "source_path": "components/gate_w4/gate_w4_aiv_impl.h",
       "path": "components/gate_w4/gate_w4_aiv_impl.h",
       "source_sha256": "7ca9141e398e8b9692abdfe4830c3422dc04a516d5ce3fcec87466dd2173e982",
-      "sha256": "0ce6157ce0c3f469c8a1673e9cde586847ad560b3b6d5f9c4af3f39a4014df4c"
+      "sha256": "f74129b7b681e835c65571c89f815b96dead24a1474e140977f5e517ed8b472d"
     },
     {
       "source_path": "components/gate_w4/gate_w4_post_tiling.h",
@@ -166,13 +168,13 @@
       "source_path": "mat_fp4_aic.cce",
       "path": "mixed_w2w4_moe_ffn_aic.cce",
       "source_sha256": "54b4074b01576757599a126eb7658accf7040ecaaafae032d9f3b253cbd28c39",
-      "sha256": "12e99a470b535a2869869da0c7f7afa09d67e337e7317567e7df11c21b88d523"
+      "sha256": "b7b01a847aa0dd08769a0c78ccf861c868a7c2569331754ab432e50b23bb41f5"
     },
     {
       "source_path": "mat_fp4_aiv.cce",
       "path": "mixed_w2w4_moe_ffn_aiv.cce",
       "source_sha256": "29c86d6feb14d3a0138cee097906d5fef690d8249c6a031a5ff513d323a30b4b",
-      "sha256": "7606077d956c353e9c3d67f0978a1f5fd874ebe203c4d48f56bb084089c0a6fe"
+      "sha256": "61f0306144d196740e31adb493e92170a7141d04bbc31190308e8d5cf6df5ba8"
     },
     {
       "source_path": "mat_fp4_cases.ini",
@@ -184,7 +186,7 @@
       "source_path": "mat_fp4_host.cc",
       "path": "mixed_w2w4_moe_ffn_host.cc",
       "source_sha256": "1112b26c7c9ab8e92b8863f7541222ac7fc4007af554f93a309de537cebed275",
-      "sha256": "227835c02b1d2ed0cc82214893094085c991178d4ee1a3cae53160a3b4ed81b0"
+      "sha256": "6b32a68d4f49082363f2b4fe1a2a3f0ce3dddd71eb0f5bc587a8ba8dc0b53d7e"
     },
     {
       "source_path": "mixed_route.h",
@@ -196,7 +198,7 @@
       "source_path": "mixed_tiling.h",
       "path": "mixed_tiling.h",
       "source_sha256": "fcfa20094b1f2078b1bcafd219592b0b7913b9c7a8723b292ce49be003959a25",
-      "sha256": "83c93c37c39db6807e41f959731d3b7c6427a8d69bf7d2c9dc4b16040fc709c2"
+      "sha256": "1c8d8410a9d24485a15be26c9710063d89b88e6df980cb2aa4dbf88ae60d2d87"
     },
     {
       "source_path": "run_mat_fp4_case.sh",
@@ -220,13 +222,13 @@
       "source_path": "run_mat_fp4_esl.sh",
       "path": "run_mixed_w2w4_moe_ffn_esl.sh",
       "source_sha256": "19f979d8de904a88ca2857c5b4e678eb5dba734cddfb65e94bcd7b3899933103",
-      "sha256": "804a4ca7ea26930333de1600328b2583fa98a5654941dd6a36b1747955205d11"
+      "sha256": "8bf916340ef8505bb0927de99883a3c510eb346c558963557f3f78cd5a19eb9f"
     },
     {
       "source_path": "scripts/gen_data.py",
       "path": "scripts/gen_data.py",
       "source_sha256": "f728e3d53e1b20fbdc85203a2e1fea0d18b6e3f2654d924aa61a5d04c6115849",
-      "sha256": "45466d22210406017044459e4092f439bc2589a94c1a0db6c4025715cc147485"
+      "sha256": "9db1eaec92622d8e9be62ff5d829c0c7130e2d29c07afbaa16a4809ccd8fd63b"
     },
     {
       "source_path": "scripts/swiglu_reference.py",
@@ -259,5 +261,22 @@
     "target_branch": "feat/vq2a8_v0.1",
     "upstream_tag": "v0.27.1rc1",
     "upstream_commit": "3b31886237ed65c435e0965b10e8002ff5769766"
-  }
+  },
+  "derived_files": [
+    {
+      "path": "weight_offsets.h",
+      "origin": "repository implementation for ABI v4 static offsets",
+      "sha256": "cda527c81b9650d6ece45e8d6ab3625de03f0a22f7ee22bf0fd7160835f85d14"
+    },
+    {
+      "path": "tests/weight_offsets_host_test.cpp",
+      "origin": "repository implementation for ABI v4 static offsets",
+      "sha256": "7d46fabf6b42d7ee74f71c77a1ff992c1f431a71ffaab343346a737cf9c12258"
+    },
+    {
+      "path": "tests/test_weight_offsets.py",
+      "origin": "repository implementation for ABI v4 static offsets",
+      "sha256": "70e37a570e4e7c3d4743df06a2fb986643f2e7af8c3c80015afd5f3ce7423b4e"
+    }
+  ]
 }

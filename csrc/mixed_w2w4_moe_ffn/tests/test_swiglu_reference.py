@@ -99,7 +99,7 @@ class SwiGLUReferenceTests(unittest.TestCase):
             metadata = json.loads((root / "input/metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(metadata["swiglu_limit"], 1.25)
             self.assertEqual(metadata["resident_stage_mask"], 15)
-            self.assertEqual(metadata["tiling_abi_version"], 3)
+            self.assertEqual(metadata["tiling_abi_version"], 4)
             np.testing.assert_array_equal(np.fromfile(root / "input/input_swiglu_limit.bin", dtype=np.float32), [1.25])
             self.assertEqual((root / "output/golden_c.bin").stat().st_size, 64)
 

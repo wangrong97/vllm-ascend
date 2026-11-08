@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -28,6 +29,7 @@ COMPONENTS = (
     "activation",
     "device_routes",
     "full_ffn",
+    "resident_plan",
     "ep_routes",
     "ep_attention",
 )
@@ -39,6 +41,8 @@ LOG_TAIL_BYTES = 16384
 LOG_TAIL_LINES = 64
 CHECKPOINT_PAIRS = ("vq2_to_vq2", "vq2_to_mxfp4", "mxfp4_to_mxfp4")
 ACCEPTED_STAGE_STATUSES = ("passed", "passed_with_coverage_gaps")
+FULL_EP_PROFILE_MARKER = "VQ2A8_GS32_FULL_EP_PROFILE="
+FULL_EP_PROFILE_FILE = "full-ep-ffn-profile.json"
 
 
 def parse_args(argv=None):
@@ -196,6 +200,7 @@ def preflight(args, result_dir):
         raise ValueError("This suite requires a DeepSeek-V4 source-v3 mixed GS32 checkpoint")
     if not (args.model / "model.safetensors.index.json").is_file():
         raise ValueError("Missing model.safetensors.index.json")
+    evidence_path = result_dir / "native-preflight.json"
     command = [
         sys.executable,
         "-u",
@@ -209,11 +214,23 @@ def preflight(args, result_dir):
                 "assert all('950' in name for name in names), f'GS32 acceptance requires Ascend950: {names}'",
                 "source = pathlib.Path(vllm_ascend.__file__).resolve()",
                 "assert source.is_relative_to(pathlib.Path.cwd()), 'Wrong Ascend checkout'",
-                "print(json.dumps({'python': sys.version, 'torch': torch.__version__,",
+                "from tools.build_vq2a8_gs32_stage import verify_loaded_library, verify_runtime_artifacts",
+                "schemas = verify_loaded_library(sys.argv[1], execution='full_graph',",
+                "    fusion='full_ffn', binary=sys.argv[2])",
+                "evidence = {'environment': {'python': sys.version, 'torch': torch.__version__,",
                 "'torch_npu': torch_npu.__version__, 'triton': triton.__version__, 'vllm': vllm.__version__,",
-                "'ascend_path': str(source), 'devices': names}))",
+                "'ascend_path': str(source), 'devices': names}, 'schemas': schemas,",
+                "'native_artifacts': verify_runtime_artifacts(sys.argv[1], sys.argv[2]),",
+                "'scope': 'Environment, ABI and artifact identity only; '",
+                "    'no weights loaded or kernel execution verified'}",
+                "pathlib.Path(sys.argv[3]).write_text(json.dumps(evidence, indent=2, allow_nan=False) + '\\n',",
+                "    encoding='utf-8')",
+                "print(json.dumps(evidence, allow_nan=False))",
             )
         ),
+        str(args.gs32_library),
+        str(args.gs32_binary),
+        str(evidence_path),
     ]
     result = execute(
         command,
@@ -225,7 +242,84 @@ def preflight(args, result_dir):
         PREFLIGHT_SECONDS,
     )
     if result:
-        raise RuntimeError(f"NPU environment preflight failed ({result}); see environment.log")
+        raise RuntimeError(f"NPU environment/native ABI preflight failed ({result}); see environment.log")
+    return {"file": str(evidence_path), "sha256": file_sha256(evidence_path)}
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def preserve_full_ep_profile(stage, args, result_dir):
+    """Archive the actual child report, never synthesize absent measurements."""
+    payloads = []
+    with Path(stage["log"]).open(encoding="utf-8") as stream:
+        for line in stream:
+            prefix, marker, payload = line.partition(FULL_EP_PROFILE_MARKER)
+            prefix = prefix.strip()
+            # -vv can print the nodeid before captured test output. A failure
+            # traceback also prints the literal marker inside quoted source;
+            # that source is not a second measured report.
+            node_prefix = (
+                len(prefix.split()) == 1 and ".py::" in prefix and not any(quote in prefix for quote in ("'", '"'))
+            )
+            if marker and (not prefix or node_prefix):
+                payloads.append(payload.strip())
+    if len(payloads) != 1:
+        raise ValueError(f"Full FFN requires exactly one profile marker; found {len(payloads)}")
+
+    def reject_nonfinite(value):
+        raise ValueError(f"Full FFN profile contains non-finite JSON value: {value}")
+
+    profile = json.loads(payloads[0], parse_constant=reject_nonfinite)
+    if (
+        not isinstance(profile, dict)
+        or type(profile.get("schema_version")) is not int
+        or profile["schema_version"] != 1
+    ):
+        raise ValueError("Full FFN profile must be a schema_version=1 JSON object")
+    if profile.get("status") not in ("PASS", "ALLOCATION_GROWTH"):
+        raise ValueError("Full FFN profile has an unknown or missing status")
+    sections = (
+        "environment",
+        "placement",
+        "dimensions",
+        "captures",
+        "resident_weights",
+        "retained_capture_storage",
+        "replay_stability",
+    )
+    if any(not isinstance(profile.get(key), dict) or not profile[key] for key in sections):
+        raise ValueError("Full FFN profile is missing capture, inventory or memory measurements")
+    if not isinstance(profile.get("timings"), list) or not profile["timings"]:
+        raise ValueError("Full FFN profile has no recorded timings")
+    stability = profile["replay_stability"]
+    if (
+        type(stability.get("steps")) is not int
+        or stability["steps"] < 1
+        or type(stability.get("allocated_stable")) is not bool
+        or stability["allocated_stable"] != (profile["status"] == "PASS")
+    ):
+        raise ValueError("Full FFN profile status disagrees with replay stability measurements")
+    model_path = profile.get("model_path")
+    if not isinstance(model_path, str) or Path(model_path).resolve() != args.model:
+        raise ValueError("Full FFN profile model does not match this run")
+    for key, path in (
+        ("config_sha256", args.model / "config.json"),
+        ("index_sha256", args.model / "model.safetensors.index.json"),
+        ("library_sha256", args.gs32_library),
+        ("kernel_sha256", args.gs32_binary),
+        ("build_manifest_sha256", args.gs32_library.parent / "build-manifest.json"),
+    ):
+        if profile.get(key) != file_sha256(path):
+            raise ValueError(f"Full FFN profile {key} does not match this run")
+    destination = result_dir / FULL_EP_PROFILE_FILE
+    write_json(destination, profile)
+    return {"file": str(destination), "sha256": file_sha256(destination), "status": profile["status"]}
 
 
 def junit_counts(root):
@@ -353,6 +447,15 @@ def run_stage(stage, args, result_dir, on_update):
     except (OSError, ValueError, ET.ParseError) as error:
         stage.update(status="failed", error=str(error))
     finally:
+        if name == "full_ffn":
+            try:
+                stage["full_ep_profile"] = preserve_full_ep_profile(stage, args, result_dir)
+                if stage["full_ep_profile"]["status"] != "PASS":
+                    raise ValueError("Full FFN profile reports allocation growth after warmup")
+            except (OSError, ValueError) as error:
+                stage["profile_error"] = str(error)
+                if stage["status"] in ACCEPTED_STAGE_STATUSES:
+                    stage.update(status="failed", error=f"Full FFN profile acceptance failed: {error}")
         stage["elapsed_seconds"] = time.monotonic() - start
         if stage["status"] not in ACCEPTED_STAGE_STATUSES:
             capture_failure_log(stage)
@@ -422,6 +525,9 @@ def main(argv=None):
     summary = result_dir / "summary.json"
 
     def save():
+        report["full_ep_profile"] = next(
+            (stage["full_ep_profile"] for stage in stages if "full_ep_profile" in stage), None
+        )
         report["coverage_gaps"] = [
             {"stage": stage["name"], "model": str(args.model), **gap}
             for stage in stages
@@ -439,7 +545,7 @@ def main(argv=None):
     if os.name == "posix":
         old_sigterm = signal.signal(signal.SIGTERM, interrupt_handler)
     try:
-        preflight(args, result_dir)
+        report["preflight"] = preflight(args, result_dir)
         report["status"] = "running"
         for stage in stages:
             run_stage(stage, args, result_dir, save)

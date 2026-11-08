@@ -46,6 +46,8 @@ CHECK_IMPORTS = {
             # Backport the upstream MessageQueue pickle protocol and test its wire format.
             "vllm_ascend/patch/platform/patch_shm_broadcast.py",
             "tests/ut/patch/platform/test_patch_shm_broadcast.py",
+            # Round-trip only a locally constructed config to verify worker-native state is omitted.
+            "tests/ut/quantization/test_vq2a8_gs32_startup.py",
         },
     ),
     "re": ForbiddenImport(

@@ -36,14 +36,14 @@ class FullNative(CpuNative):
         self.invalid_scale = False
         self.outputs = []
 
-    def prepare_full_ffn_plan(self, anchor, n, d, gate_w4, down_w4, limit):
+    def prepare_full_ffn_plan(self, anchor, n, d, gate_w4, down_w4, limit, fields):
+        assert len(fields) == 6
         plan = (anchor.shape[1], n, d, tuple(gate_w4.tolist()), tuple(down_w4.tolist()), limit)
         self.plans.append(plan)
         return plan
 
-    def full_ffn_device(self, data, scales, fields, routes, plan, middle, middle_scales, output):
+    def full_ffn_device(self, data, scales, routes, plan, middle, middle_scales, output):
         assert plan is self.plans[0]
-        assert len(fields) == 6
         # An intentionally simple output labels each active physical expert.
         # This tests routing/order/padding independently of kernel arithmetic.
         output.zero_()

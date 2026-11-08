@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in real W2/W4 full FFN equivalence and dynamic NPU graph acceptance."""
 
+import hashlib
 import json
+import platform
 import statistics
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,11 +14,17 @@ import pytest
 from tests.e2e.nightly.vq2a8_gs32_full_ffn_helpers import (
     FUSION_FP8_MISMATCH_LIMIT,
     CapturedBank,
+    full_inventory_route_patterns,
     fusion_byte_metrics,
     fusion_error_metrics,
     fusion_metrics_accepted,
+    localize_profile_layer,
+    measure_npu_submissions,
+    npu_memory_snapshot,
     route_counts,
+    select_full_ep_inventory,
     select_fusion_expert,
+    tensor_storage_summary,
 )
 from tests.e2e.nightly.vq2a8_gs32_helpers import checkpoint_inventory, load_selected_layer, native_paths
 from tests.support.vq2a8_oracle import OfficialFFNOracle
@@ -24,6 +33,11 @@ FULL_FFN_PAIRS = (("vq2", "vq2"), ("vq2", "mxfp4"), ("mxfp4", "mxfp4"))
 GRAPH_CAPACITIES = (6, 128, 129, 384)
 TIMING_WARMUPS = 3
 TIMING_REPEATS = 5
+PROFILE_EP_SIZE = 4
+PROFILE_GRAPH_ROWS = (6, 384)
+PROFILE_PREFILL_ROWS = 4096
+PROFILE_REPLAY_STEPS = 100
+PROFILE_MEMORY_INTERVAL = 20
 
 
 def selected_paths(request):
@@ -60,16 +74,16 @@ class FullFFNLaunchCapture:
     def __getattr__(self, name):
         return getattr(self.ops, name)
 
-    def full_ffn_device(self, data, scales, fields, routes, plan, middle, middle_scales, output):
-        result = self.ops.full_ffn_device(data, scales, fields, routes, plan, middle, middle_scales, output)
+    def full_ffn_device(self, data, scales, routes, plan, middle, middle_scales, output):
+        result = self.ops.full_ffn_device(data, scales, routes, plan, middle, middle_scales, output)
         self.calls += 1
         self.middle, self.scales = middle, middle_scales
         return result
 
 
-def load_runtime(paths, layer_index, positions, *, execution="fused"):
+def load_runtime(paths, layer_index, positions, *, execution="fused", placement=None, with_oracle=True):
     import torch
-    import torch_npu  # noqa: F401
+    import torch_npu
 
     from vllm_ascend.ops.fused_moe.vq2a8_gs32 import GS32ExpertWeights
     from vllm_ascend.quantization.methods.w2a8.vq2a8_gs32_full_ffn_layout import build_full_ffn_bank
@@ -78,7 +92,9 @@ def load_runtime(paths, layer_index, positions, *, execution="fused"):
     device = torch.device("npu", 0)
     torch.npu.set_device(device)
     raw, spec, config = load_selected_layer(paths["model"], layer_index=layer_index, expert_positions=positions)
-    oracle = OfficialFFNOracle(raw, spec, device)
+    if placement is not None:
+        spec = localize_profile_layer(raw, spec, placement)
+    oracle = OfficialFFNOracle(raw, spec, device) if with_oracle else None
     for name, value in vars(raw).copy().items():
         if isinstance(value, torch.Tensor):
             setattr(raw, name, value.to(device))
@@ -87,7 +103,8 @@ def load_runtime(paths, layer_index, positions, *, execution="fused"):
     for name in tuple(vars(raw)):
         if name.startswith(("w13_", "w2_")):
             delattr(raw, name)
-    raw.vq2a8_ep_size = 2  # Permit zero-route EP ranks and padded tails.
+    if placement is None:
+        raw.vq2a8_ep_size = 2  # Permit zero-route EP ranks and padded tails.
     options = {key: value for key, value in paths.items() if key != "model"}
     bank = GS32ExpertWeights(
         raw,
@@ -98,7 +115,15 @@ def load_runtime(paths, layer_index, positions, *, execution="fused"):
     launch = FullFFNLaunchCapture(bank.ops)
     bank.ops = launch
     return SimpleNamespace(
-        torch=torch, device=device, layer=raw, spec=spec, limit=limit, bank=bank, oracle=oracle, launch=launch
+        torch=torch,
+        torch_npu_version=torch_npu.__version__,
+        device=device,
+        layer=raw,
+        spec=spec,
+        limit=limit,
+        bank=bank,
+        oracle=oracle,
+        launch=launch,
     )
 
 
@@ -267,3 +292,209 @@ def test_gs32_full_ffn_mixed_graph_routes_and_buckets(request, group_type):
         ),
         flush=True,
     )
+
+
+def profile_file_hash(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def test_gs32_full_ffn_full_ep_inventory_profile(request, tmp_path):
+    """Single-NPU full EP-local inventory; excludes communication and attention."""
+    paths = selected_paths(request)
+    config, _, entries = checkpoint_inventory(paths["model"])
+    placement = select_full_ep_inventory(entries, config["n_routed_experts"], ep_size=PROFILE_EP_SIZE)
+    assert placement is not None, "The requested checkpoint must contain a nonempty EP-local inventory."
+    runtime = load_runtime(
+        paths,
+        placement["layer"],
+        placement["positions"],
+        execution="full_graph",
+        placement=placement,
+        with_oracle=False,
+    )
+    torch, bank, spec = runtime.torch, runtime.bank, runtime.spec
+    assert spec.expert_ids == placement["local_ids"]
+    assert len(bank.full_ffn_expert_ids) == len(placement["global_ids"])
+    assert bank.num_experts == placement["num_local_experts"]
+    bank.defer_validity = True
+    generator = torch.Generator(device="cpu").manual_seed(950640)
+    hidden_by_rows, captures, routes_by_rows, expected_by_case = {}, {}, {}, {}
+    group_type = 1
+    for rows in PROFILE_GRAPH_ROWS:
+        hidden_by_rows[rows] = (
+            (torch.randn(rows, spec.specs["gate_up"].columns, generator=generator) * 0.1).bfloat16().to(runtime.device)
+        )
+        patterns = full_inventory_route_patterns(spec, rows)
+        routes_by_rows[rows] = [
+            (name, counts, route_counts(torch, runtime.layer, spec, counts, runtime.device, group_type))
+            for name, counts in patterns
+        ]
+        empty = routes_by_rows[rows][0][2]
+        captures[rows] = CapturedBank(
+            runtime, bank, hidden_by_rows[rows], empty, group_type, validity=bank.validity_buffer, measure_capture=True
+        )
+    torch.npu.synchronize()
+    report = {
+        "schema_version": 1,
+        "scope": (
+            "Single NPU, complete real EP-local FFN inventory; excludes dispatch/collectives, "
+            "attention, sampling and end-to-end service latency"
+        ),
+        "numerical_scope": (
+            "Full inventory eager/graph equality; independent official-GMM and intermediate-byte "
+            "validation remains in the separate real precision-pair tests"
+        ),
+        "timing_scope": (
+            "NPU events include validity reset and full FFN submission/replay; host intervals include submission "
+            "only. Warmup, synchronization, status reads and input copies are outside those intervals. "
+            "Capture wall time includes capture finalization and device synchronization."
+        ),
+        "environment": {
+            "python": platform.python_version(),
+            "host_arch": platform.machine(),
+            "torch": torch.__version__,
+            "torch_npu": runtime.torch_npu_version,
+            "device": str(runtime.device),
+            "device_name": torch.npu.get_device_name(runtime.device),
+        },
+        "model_path": paths["model"],
+        "config_sha256": profile_file_hash(Path(paths["model"]) / "config.json"),
+        "index_sha256": profile_file_hash(Path(paths["model"]) / "model.safetensors.index.json"),
+        "library_sha256": profile_file_hash(paths["gs32_library"]),
+        "kernel_sha256": profile_file_hash(paths["gs32_binary"]),
+        "build_manifest_sha256": profile_file_hash(Path(paths["gs32_library"]).parent / "build-manifest.json"),
+        "placement": placement,
+        "dimensions": {
+            "input": spec.specs["gate_up"].columns,
+            "middle": spec.specs["down"].columns,
+            "output": spec.specs["down"].rows,
+        },
+        "captures": {str(rows): capture.capture_metrics for rows, capture in captures.items()},
+        "resident_weights": tensor_storage_summary(torch, bank.full_ffn_bank["fields"]),
+        "retained_capture_storage": tensor_storage_summary(torch, bank.capture_owners),
+        "timings": [],
+    }
+
+    def check_validity():
+        assert bool(bank.validity_buffer.cpu()), "The measured full FFN must pass its external owner validity check."
+
+    for rows in PROFILE_GRAPH_ROWS:
+        for name, counts, groups in routes_by_rows[rows]:
+            bank.validity_buffer.zero_()
+            eager = bank.apply(hidden_by_rows[rows], groups, group_type, runtime.limit)[0]
+            torch.npu.synchronize()
+            check_validity()
+            expected = eager.cpu().clone()
+            expected_by_case[rows, name] = expected
+            graph_output = captures[rows].replay_checked(hidden_by_rows[rows], groups)
+            torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
+            assert bool(torch.isfinite(expected).all())
+            assert not expected[sum(counts) :].count_nonzero()
+
+            def eager_submit(hidden=hidden_by_rows[rows], current_groups=groups):
+                bank.validity_buffer.zero_()
+                return bank.apply(hidden, current_groups, group_type, runtime.limit)[0]
+
+            def graph_submit(capture=captures[rows]):
+                capture.validity.zero_()
+                capture.graph.replay()
+
+            report["timings"].append(
+                {
+                    "phase": "decode",
+                    "rows": rows,
+                    "pattern": name,
+                    "counts": counts,
+                    "eager": measure_npu_submissions(
+                        runtime, eager_submit, check_validity, warmups=TIMING_WARMUPS, repeats=TIMING_REPEATS
+                    ),
+                    "graph": measure_npu_submissions(
+                        runtime, graph_submit, check_validity, warmups=TIMING_WARMUPS, repeats=TIMING_REPEATS
+                    ),
+                }
+            )
+    # Prefill stays eager, as in serving. It is deliberately not captured into
+    # an artificial 4096-row graph that the production configuration never uses.
+    prefill = (
+        (torch.randn(PROFILE_PREFILL_ROWS, spec.specs["gate_up"].columns, generator=generator) * 0.1)
+        .bfloat16()
+        .to(runtime.device)
+    )
+    for name, counts in full_inventory_route_patterns(spec, PROFILE_PREFILL_ROWS):
+        if name not in ("balanced", "skewed"):
+            continue
+        groups = route_counts(torch, runtime.layer, spec, counts, runtime.device, group_type)
+
+        def prefill_submit(current_groups=groups):
+            bank.validity_buffer.zero_()
+            return bank.apply(prefill, current_groups, group_type, runtime.limit)[0]
+
+        report["timings"].append(
+            {
+                "phase": "prefill_eager",
+                "rows": PROFILE_PREFILL_ROWS,
+                "pattern": name,
+                "counts": counts,
+                "eager": measure_npu_submissions(
+                    runtime, prefill_submit, check_validity, warmups=TIMING_WARMUPS, repeats=TIMING_REPEATS
+                ),
+            }
+        )
+    # No per-replay CPU result copy or event allocation in this stress loop.
+    # Every replay's status is retained on device, so a later success cannot
+    # hide an earlier failure. Changing routes alternates both graph buckets.
+    history = torch.empty(PROFILE_REPLAY_STEPS, dtype=torch.bool, device=runtime.device)
+    owner_count = len(bank.capture_owners)
+    storage_before = tensor_storage_summary(torch, bank.capture_owners)
+    submissions = runtime.launch.calls
+    pointers = {rows: capture.addresses for rows, capture in captures.items()}
+    torch.npu.synchronize()
+    torch.npu.reset_peak_memory_stats(runtime.device)
+    samples = [{"step": 0, **npu_memory_snapshot(torch, runtime.device)}]
+    last_cases = {}
+    for step in range(PROFILE_REPLAY_STEPS):
+        rows = PROFILE_GRAPH_ROWS[step % len(PROFILE_GRAPH_ROWS)]
+        patterns = routes_by_rows[rows]
+        name, _, groups = patterns[(step // len(PROFILE_GRAPH_ROWS)) % len(patterns)]
+        capture = captures[rows]
+        capture.groups.copy_(groups)
+        capture.validity.zero_()
+        capture.graph.replay()
+        history[step].copy_(capture.validity)
+        last_cases[rows] = name
+        if (step + 1) % PROFILE_MEMORY_INTERVAL == 0:
+            torch.npu.synchronize()
+            samples.append({"step": step + 1, **npu_memory_snapshot(torch, runtime.device)})
+    torch.npu.synchronize()
+    assert bool(history.cpu().all())
+    assert runtime.launch.calls == submissions, "Graph replay must not submit through the Python FFN wrapper."
+    assert len(bank.capture_owners) == owner_count
+    assert tensor_storage_summary(torch, bank.capture_owners) == storage_before
+    for rows, name in last_cases.items():
+        capture = captures[rows]
+        assert pointers[rows] == (
+            capture.hidden.data_ptr(),
+            capture.groups.data_ptr(),
+            capture.output.data_ptr(),
+            capture.validity.data_ptr(),
+        )
+        torch.testing.assert_close(capture.output.cpu(), expected_by_case[rows, name], rtol=0, atol=0)
+    # Reserved memory is allocator cache and is reported, not equated to live
+    # tensor ownership. Live allocations should plateau after full warmup.
+    allocated_stable = all(sample["allocated_bytes"] == samples[0]["allocated_bytes"] for sample in samples)
+    report["replay_stability"] = {
+        "steps": PROFILE_REPLAY_STEPS,
+        "samples": samples,
+        "allocated_stable": allocated_stable,
+        "capture_owner_count": owner_count,
+        "storage": storage_before,
+    }
+    report["status"] = "PASS" if allocated_stable else "ALLOCATION_GROWTH"
+    destination = tmp_path / "full-ep-ffn-profile.json"
+    destination.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print("VQ2A8_GS32_FULL_EP_PROFILE=" + json.dumps({"report_file": str(destination), **report}), flush=True)
+    assert allocated_stable, f"Repeated graph replay changed live allocation bytes after warmup; inspect {destination}."

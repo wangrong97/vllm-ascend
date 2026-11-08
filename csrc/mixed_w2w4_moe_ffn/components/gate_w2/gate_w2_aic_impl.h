@@ -584,7 +584,7 @@ public:
 };
 
 #ifndef MAT_FP4_COMPONENT_ONLY
-extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v3_mix_aic(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list,
+extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v4_mix_aic(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list,
                                                        __gm__ void *a, __gm__ void *a_scale, __gm__ void *b,
                                                        __gm__ void *table, __gm__ void *quant_scale, __gm__ void *h, __gm__ void *h_scale,
                                                        __gm__ void *tiling, __gm__ void *route_mask)

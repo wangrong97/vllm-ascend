@@ -86,20 +86,27 @@ class _NativeFullFFNOps:
             self.ops = torch.ops.vq2a8_gs32_stage
             self.ops.initialize(str(Path(binary).resolve()))
 
-    def prepare_full_ffn_plan(self, anchor, gate_n, output_d, gate_w4, down_w4, limit):
+    def prepare_full_ffn_plan(self, anchor, gate_n, output_d, gate_w4, down_w4, limit, fields):
         self.check_eager()
-        return self.ops.prepare_full_ffn(anchor, gate_n, output_d, gate_w4, down_w4, limit)
-
-    def full_ffn_device(self, data, scales, fields, routes, plan, middle, middle_scales, output):
-        self.ops.full_ffn_device(
-            data,
-            scales,
+        return self.ops.prepare_full_ffn(
+            anchor,
+            gate_n,
+            output_d,
+            gate_w4,
+            down_w4,
+            limit,
             fields["gate_weight"],
             fields["gate_table"],
             fields["gate_row_scale"],
             fields["down_weight"],
             fields["down_table"],
             fields["down_row_scale"],
+        )
+
+    def full_ffn_device(self, data, scales, routes, plan, middle, middle_scales, output):
+        self.ops.full_ffn_device(
+            data,
+            scales,
             routes,
             plan,
             middle,
@@ -136,6 +143,7 @@ class GS32ExpertWeights:
         options,
         *,
         graph_row_capacity=DEFAULT_GRAPH_ROW_CAPACITY,
+        startup_state=None,
         _test_ops=None,
         _test_activation=None,
     ):
@@ -157,9 +165,9 @@ class GS32ExpertWeights:
         self.expert_slots = {expert: slot for slot, expert in enumerate(layer_spec.expert_ids)}
         self.num_experts = layer.vq2a8_num_experts
         self.allow_padding = getattr(layer, "vq2a8_ep_size", 1) > 1
-        self._initialize_full_ffn(layer, options, _test_ops)
+        self._initialize_full_ffn(layer, options, _test_ops, startup_state)
 
-    def _initialize_full_ffn(self, layer, options, test_ops):
+    def _initialize_full_ffn(self, layer, options, test_ops, startup_state):
         from vllm_ascend.ops.fused_moe import vq2a8_gs32_routes
 
         self.full_ffn_bank = layer.vq2a8_full_ffn_bank
@@ -175,16 +183,20 @@ class GS32ExpertWeights:
             raise ValueError("Full FFN identity routes require sorted unique resident expert IDs in logical range.")
         self.device = layer.vq2a8_anchor.device
         self.device_router = vq2a8_gs32_routes
-        self.ops = (
-            test_ops
-            if test_ops is not None
-            else _NativeFullFFNOps(
+        if test_ops is not None:
+            self.ops = test_ops
+        elif startup_state is not None:
+            self.ops = startup_state.native_ops(
                 options["gs32_library"],
                 options["gs32_binary"],
                 self.device,
                 execution=self.execution,
+                factory=_NativeFullFFNOps,
             )
-        )
+        else:
+            self.ops = _NativeFullFFNOps(
+                options["gs32_library"], options["gs32_binary"], self.device, execution=self.execution
+            )
         self.ops.require_padding_support()
         self.defer_validity = False
         self.validity_buffer = torch.zeros((), dtype=torch.bool, device=self.device)
@@ -206,6 +218,7 @@ class GS32ExpertWeights:
                 bank["gate_w4"],
                 bank["down_w4"],
                 self.full_ffn_limit,
+                bank["fields"],
             )
 
     def _apply_full_ffn(self, hidden, group_list, group_type, limit, capturing):
@@ -246,7 +259,6 @@ class GS32ExpertWeights:
         self.ops.full_ffn_device(
             data,
             scales,
-            self.full_ffn_bank["fields"],
             routes,
             self.full_ffn_plan,
             middle,

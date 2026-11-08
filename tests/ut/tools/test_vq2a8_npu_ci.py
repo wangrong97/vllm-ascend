@@ -3,6 +3,7 @@
 """Validate NPU CI orchestration using CPU child processes and real JUnit files."""
 
 import ast
+import hashlib
 import importlib.util
 import io
 import json
@@ -45,6 +46,7 @@ def assets(tmp_path):
     library, binary = tmp_path / "stage library.so", tmp_path / "mixed kernel.o"
     library.write_bytes(b"fixture")
     binary.write_bytes(b"fixture")
+    (library.parent / "build-manifest.json").write_text("{}", encoding="utf-8")
     results = tmp_path / "results with spaces"
     return NS(
         model=model,
@@ -72,6 +74,34 @@ def driver():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture
+def full_ep_profile(assets):
+    """Explicit CPU fixture data; never used by the actual NPU test runner."""
+    profile = {
+        "schema_version": 1,
+        "status": "PASS",
+        "report_file": "/pytest-temporary/profile.json",
+        "model_path": str(assets.model),
+        "environment": {"device": "npu:0"},
+        "placement": {"ep_size": 4, "local_ids": [0, 2]},
+        "dimensions": {"input": 4096},
+        "captures": {"6": {"wall_ms": 10}},
+        "resident_weights": {"storage_bytes": 64},
+        "retained_capture_storage": {"storage_bytes": 128},
+        "timings": [{"phase": "decode", "rows": 6, "graph": {"device": {"samples_ms": [1.0]}}}],
+        "replay_stability": {"steps": 100, "allocated_stable": True},
+    }
+    for key, path in (
+        ("config_sha256", assets.model / "config.json"),
+        ("index_sha256", assets.model / "model.safetensors.index.json"),
+        ("library_sha256", assets.library),
+        ("kernel_sha256", assets.binary),
+        ("build_manifest_sha256", assets.library.parent / "build-manifest.json"),
+    ):
+        profile[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return profile
 
 
 def run_cli(assets, *arguments):
@@ -153,7 +183,9 @@ def test_closed_terminal_does_not_lose_child_log_or_returncode(driver, tmp_path,
 
 
 @pytest.mark.parametrize("stage_name", ["full_ffn", "ep2-v2", "recovery-v2"])
-def test_real_plan_discovers_e2e_conftest_and_passes_custom_options(assets, driver, tmp_path, monkeypatch, stage_name):
+def test_real_plan_discovers_e2e_conftest_and_passes_custom_options(
+    assets, driver, tmp_path, monkeypatch, stage_name, full_ep_profile
+):
     repository = tmp_path / "isolated repository"
     nightly = repository / driver.TEST_ROOT
     nightly.mkdir(parents=True)
@@ -188,7 +220,12 @@ def test_real_plan_discovers_e2e_conftest_and_passes_custom_options(assets, driv
         + f"    assert request.config.getoption('--vq2a8-gs32-binary') == {str(assets.binary)!r}\n"
         + f"    assert request.config.getoption('--vq2a8-gs32-ep-skip-single-card') is {stage_name == 'ep2-v2'}\n"
         + f"    assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == {'4' if stage_name == 'full_ffn' else '4,5'!r}\n"
-        + "    assert os.environ['VLLM_USE_V2_MODEL_RUNNER'] == '1'\n",
+        + "    assert os.environ['VLLM_USE_V2_MODEL_RUNNER'] == '1'\n"
+        + (
+            f"    print({driver.FULL_EP_PROFILE_MARKER + json.dumps(full_ep_profile)!r})\n"
+            if stage_name == "full_ffn"
+            else ""
+        ),
         encoding="utf-8",
     )
     assets.results.mkdir()
@@ -203,7 +240,7 @@ def test_real_plan_discovers_e2e_conftest_and_passes_custom_options(assets, driv
     assert Path(stage["junit"]).is_file()
 
 
-@pytest.mark.parametrize("suite, stage_count", [("kernels", 5), ("pr", 6), ("nightly", 7)])
+@pytest.mark.parametrize("suite, stage_count", [("kernels", 6), ("pr", 7), ("nightly", 8)])
 def test_dry_run_is_offline_and_plans_isolated_stages_with_explicit_devices(assets, suite, stage_count):
     result = run_cli(assets, "--suite", suite, "--devices", "4" if suite == "kernels" else "4,5", "--dry-run")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -212,6 +249,7 @@ def test_dry_run_is_offline_and_plans_isolated_stages_with_explicit_devices(asse
     assert len(stages) == stage_count
     assert len({stage["name"] for stage in stages}) == stage_count
     assert "ep2-v1" not in {stage["name"] for stage in stages}
+    assert "resident_plan" in {stage["name"] for stage in stages}
     assert plan["model_runners"] == ([] if suite == "kernels" else ["v2"])
     assert not assets.results.exists()
     for index, stage in enumerate(stages):
@@ -223,10 +261,10 @@ def test_dry_run_is_offline_and_plans_isolated_stages_with_explicit_devices(asse
             ("--vq2a8-gs32-binary", assets.binary),
         ):
             assert command[command.index(flag) + 1] == str(value)
-        assert environment["ASCEND_RT_VISIBLE_DEVICES"] == ("4" if index < 5 else "4,5")
+        assert environment["ASCEND_RT_VISIBLE_DEVICES"] == ("4" if index < 6 else "4,5")
         assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "1"
-    files = [next(item for item in stage["command"] if "tests/e2e/nightly/" in item) for stage in stages[:5]]
-    assert len(set(files)) == 5
+    files = [next(item for item in stage["command"] if "tests/e2e/nightly/" in item) for stage in stages[:6]]
+    assert len(set(files)) == 6
     if suite != "kernels":
         ep_stages = [stage for stage in stages if any("test_vq2a8_gs32_ep.py::" in item for item in stage["command"])]
         assert [stage["name"] for stage in ep_stages] == ["ep2-v2"]
@@ -251,11 +289,11 @@ def test_v1_selection_does_not_restore_removed_ep2_acceptance(assets, suite):
     assert not plan["single_card_reference"]
     assert all(stage["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "0" for stage in stages)
     if suite == "nightly":
-        assert len(stages) == 6
+        assert len(stages) == 7
         assert stages[-1]["name"] == "recovery-v1"
         assert plan["model_runners"] == ["v1"]
     else:
-        assert len(stages) == 5
+        assert len(stages) == 6
         assert plan["model_runners"] == []
     assert not assets.results.exists()
 
@@ -266,13 +304,13 @@ def test_nightly_explicit_runner_matrix_keeps_both_recovery_variants(assets, run
     assert result.returncode == 0, result.stdout + result.stderr
     plan = json.loads(result.stdout)
     stages = plan["stages"]
-    assert len(stages) == 8
+    assert len(stages) == 9
     assert plan["model_runners"] == list(runners)
     assert all(
-        stage["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == ("1" if runners[0] == "v2" else "0") for stage in stages[:5]
+        stage["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == ("1" if runners[0] == "v2" else "0") for stage in stages[:6]
     )
-    assert {stage["name"] for stage in stages[5:]} == {"ep2-v2", "recovery-v1", "recovery-v2"}
-    for stage in stages[5:]:
+    assert {stage["name"] for stage in stages[6:]} == {"ep2-v2", "recovery-v1", "recovery-v2"}
+    for stage in stages[6:]:
         assert stage["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == ("0" if stage["name"] == "recovery-v1" else "1")
     assert not assets.results.exists()
 
@@ -281,7 +319,7 @@ def test_default_pr_can_select_only_v2_and_enable_ep1_reference(assets):
     result = run_cli(assets, "--model-runners", "v2", "--single-card-reference", "--dry-run")
     assert result.returncode == 0, result.stdout + result.stderr
     stages = json.loads(result.stdout)["stages"]
-    assert len(stages) == 6
+    assert len(stages) == 7
     assert stages[-1]["environment"]["VLLM_USE_V2_MODEL_RUNNER"] == "1"
     assert "--vq2a8-gs32-ep-skip-single-card" not in stages[-1]["command"]
     assert not assets.results.exists()
@@ -382,7 +420,7 @@ def child_plan(tmp_path, driver, monkeypatch):
 
 
 @pytest.fixture
-def checkpoint_gap_plan(tmp_path, driver, monkeypatch):
+def checkpoint_gap_plan(tmp_path, driver, monkeypatch, full_ep_profile):
     """Produce real pytest JUnit records for checkpoint gaps without loading an NPU."""
     repository = tmp_path / "checkpoint coverage repository"
     nightly = repository / "tests/e2e/nightly"
@@ -413,7 +451,10 @@ def checkpoint_gap_plan(tmp_path, driver, monkeypatch):
         else:
             source += f"    pytest.skip({reason!r})\n"
         if mode != "all_skip":
-            source += "\ndef test_executed_witness():\n    assert True\n"
+            source += (
+                "\ndef test_executed_witness():\n    assert True\n"
+                f"    print({driver.FULL_EP_PROFILE_MARKER + json.dumps(full_ep_profile)!r})\n"
+            )
         if mode == "other_skip":
             source += "\ndef test_other_skip():\n    pytest.skip('no NPU available')\n"
         (nightly / filename).write_text(source, encoding="utf-8")
@@ -433,7 +474,8 @@ def checkpoint_gap_plan(tmp_path, driver, monkeypatch):
                     "-u",
                     "-m",
                     "pytest",
-                    "-q",
+                    "-vv",
+                    "-s",
                     "-c",
                     str(config),
                     "-o",
@@ -657,17 +699,229 @@ def test_real_preflight_builds_valid_device_probe_without_importing_hardware(ass
         calls.append((command, environment, log, timeout))
         code = command[command.index("-c") + 1]
         compile(code, "npu_environment_probe", "exec")
+        Path(command[-1]).write_text("{}", encoding="utf-8")
         return 0
 
     monkeypatch.setattr(driver, "execute", probe)
     assets.results.mkdir()
-    driver.preflight(driver.parse_args(assets.argv), assets.results)
+    evidence = driver.preflight(driver.parse_args(assets.argv), assets.results)
     assert len(calls) == 1
     command, environment, log, timeout = calls[0]
     assert command[0] == sys.executable and "pytest" not in command
     assert environment["ASCEND_RT_VISIBLE_DEVICES"] == "4,5"
     assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "1"
     assert log == assets.results / "environment.log" and timeout > 0
+    assert command[-3:] == [str(assets.library), str(assets.binary), str(assets.results / "native-preflight.json")]
+    assert evidence["file"] == command[-1]
+    assert evidence["sha256"] == hashlib.sha256(b"{}").hexdigest()
+
+
+@pytest.mark.parametrize("failure", [None, "ABI mismatch", "manifest SHA mismatch", "schema mismatch"])
+def test_preflight_executes_shared_native_validation_before_any_weight_stage(
+    assets, driver, monkeypatch, capsys, failure
+):
+    calls = []
+
+    def verify(library, execution, fusion, binary):
+        calls.append((library, execution, fusion, binary))
+        if failure:
+            raise RuntimeError(failure)
+        return {"full_ffn_device": "checked schema"}
+
+    monkeypatch.setattr(driver.sys, "platform", "linux")
+    modules = {
+        "torch": NS(
+            __version__="cpu-fixture",
+            npu=NS(is_available=lambda: True, device_count=lambda: 2, get_device_name=lambda index: "Ascend950"),
+        ),
+        "torch_npu": NS(__version__="fixture"),
+        "triton": NS(__version__="fixture"),
+        "vllm": NS(__version__="fixture"),
+        "vllm_ascend": NS(__file__=str(REPO_ROOT / "vllm_ascend/__init__.py")),
+        "tools.build_vq2a8_gs32_stage": NS(
+            verify_loaded_library=verify,
+            verify_runtime_artifacts=lambda library, binary: {"abi_version": 4, "library": library, "kernel": binary},
+        ),
+    }
+
+    def probe(command, environment, log, timeout):
+        assert "pytest" not in command, "Native validation must finish before running weight-loading stages"
+        with monkeypatch.context() as context:
+            for name, module in modules.items():
+                context.setitem(sys.modules, name, module)
+            context.setattr(sys, "argv", ["-c", *command[command.index("-c") + 2 :]])
+            try:
+                exec(command[command.index("-c") + 1], {})
+            except RuntimeError as error:
+                log.write_text(str(error), encoding="utf-8")
+                return 1
+        return 0
+
+    monkeypatch.setattr(driver, "execute", probe)
+    if failure:
+        assert driver.main(assets.argv) == 1
+        report, directory = read_report(assets)
+        assert all(stage["status"] == "not_run" for stage in report["stages"])
+        assert "native ABI preflight failed" in report["error"]
+        assert not (directory / "native-preflight.json").exists()
+        assert failure in (directory / "environment.log").read_text(encoding="utf-8")
+    else:
+        # Empty plan isolates successful preflight from the separate child tests.
+        monkeypatch.setattr(driver, "build_plan", lambda args: [])
+        assert driver.main(assets.argv) == 0
+        report, directory = read_report(assets)
+        evidence = directory / "native-preflight.json"
+        saved = json.loads(evidence.read_text(encoding="utf-8"))
+        assert saved["native_artifacts"]["abi_version"] == 4
+        assert saved["schemas"] == {"full_ffn_device": "checked schema"}
+        assert "no weights loaded" in saved["scope"]
+        assert report["preflight"] == {
+            "file": str(evidence),
+            "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+        }
+        assert "native_artifacts" in capsys.readouterr().out
+    assert calls == [(str(assets.library), "full_graph", "full_ffn", str(assets.binary))]
+
+
+@pytest.fixture
+def full_profile_plan(driver, monkeypatch):
+    def configure(lines, *, returncode=0):
+        code = (
+            "import sys\nfrom pathlib import Path\n"
+            "path = next(item.split('=', 1)[1] for item in sys.argv if item.startswith('--junitxml='))\n"
+            'Path(path).write_text(\'<testsuite tests="1"><testcase name="profile"/></testsuite>\', '
+            "encoding='utf-8')\n"
+        )
+        stages = [
+            {
+                "name": name,
+                "command": [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    code + "\n".join(f"print({line!r})" for line in lines) + f"\nsys.exit({returncode})",
+                ],
+                "environment": {},
+            }
+            for name in ("full_ffn", "later")
+        ]
+        monkeypatch.setattr(driver, "build_plan", lambda args: stages)
+        monkeypatch.setattr(driver, "preflight", lambda *args: None)
+
+    return configure
+
+
+def test_real_profile_json_is_preserved_outside_pytest_temp_and_linked_in_summary(
+    assets, driver, full_ep_profile, full_profile_plan
+):
+    # Pytest -vv may prefix the marker with the current test node on the same line.
+    full_profile_plan(
+        [
+            "tests/e2e/nightly/test_vq2a8_gs32_full_ffn.py::test_gs32_full_ffn_full_ep_inventory_profile "
+            + driver.FULL_EP_PROFILE_MARKER
+            + json.dumps(full_ep_profile)
+        ]
+    )
+    assert driver.main(assets.argv) == 0
+    report, directory = read_report(assets)
+    destination = directory / "full-ep-ffn-profile.json"
+    assert json.loads(destination.read_text(encoding="utf-8")) == full_ep_profile
+    assert not Path(full_ep_profile["report_file"]).exists()
+    assert (
+        report["full_ep_profile"]
+        == report["stages"][0]["full_ep_profile"]
+        == {
+            "file": str(destination),
+            "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            "status": "PASS",
+        }
+    )
+    assert [stage["status"] for stage in report["stages"]] == ["passed", "passed"]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "source_only",
+        "malformed",
+        "duplicate",
+        "not_object",
+        "schema",
+        "capture_missing",
+        "timing_missing",
+        "wrong_model",
+        "wrong_library",
+        "wrong_kernel",
+        "wrong_manifest",
+        "bad_status",
+        "inconsistent_stability",
+        "nonfinite",
+    ],
+)
+def test_missing_or_invalid_profile_cannot_pass_even_with_green_pytest(
+    assets, driver, full_ep_profile, full_profile_plan, fault
+):
+    if fault == "schema":
+        full_ep_profile["schema_version"] = 2
+    elif fault == "capture_missing":
+        del full_ep_profile["captures"]
+    elif fault == "timing_missing":
+        full_ep_profile["timings"] = []
+    elif fault == "wrong_model":
+        full_ep_profile["model_path"] += "-other"
+    elif fault.startswith("wrong_"):
+        key = "build_manifest_sha256" if fault == "wrong_manifest" else fault.removeprefix("wrong_") + "_sha256"
+        full_ep_profile[key] = "0" * 64
+    elif fault == "bad_status":
+        full_ep_profile["status"] = "UNKNOWN"
+    elif fault == "inconsistent_stability":
+        full_ep_profile["replay_stability"]["allocated_stable"] = False
+    elif fault == "nonfinite":
+        full_ep_profile["timings"][0]["rows"] = float("nan")
+    payload = "{" if fault == "malformed" else json.dumps(None if fault == "not_object" else full_ep_profile)
+    lines = [driver.FULL_EP_PROFILE_MARKER + payload] * (0 if fault == "missing" else 2 if fault == "duplicate" else 1)
+    if fault == "source_only":
+        lines = [f'    print("{driver.FULL_EP_PROFILE_MARKER}" + json.dumps(report))']
+    full_profile_plan(lines)
+    assert driver.main(assets.argv) == 1
+    report, directory = read_report(assets)
+    failed, later = report["stages"]
+    assert failed["returncode"] == 0 and failed["counts"]["passed"] == 1
+    assert failed["status"] == "failed" and failed["profile_error"]
+    if fault in ("missing", "source_only", "duplicate"):
+        assert f"found {2 if fault == 'duplicate' else 0}" in failed["profile_error"]
+    assert "profile acceptance failed" in failed["error"]
+    assert later["status"] == "not_run"
+    assert report["full_ep_profile"] is None
+    assert not (directory / "full-ep-ffn-profile.json").exists()
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+@pytest.mark.parametrize("with_traceback", [False, True])
+def test_allocation_growth_report_is_preserved_but_cannot_turn_stage_green(
+    assets, driver, full_ep_profile, full_profile_plan, returncode, with_traceback
+):
+    full_ep_profile["status"] = "ALLOCATION_GROWTH"
+    full_ep_profile["replay_stability"]["allocated_stable"] = False
+    lines = [driver.FULL_EP_PROFILE_MARKER + json.dumps(full_ep_profile)]
+    if with_traceback:
+        lines += [
+            f'    print("{driver.FULL_EP_PROFILE_MARKER}" + json.dumps(report), flush=True)',
+            f"    print('{driver.FULL_EP_PROFILE_MARKER}' + json.dumps(report), flush=True)",
+            ">   assert allocated_stable",
+            "E   AssertionError: Repeated graph replay changed live allocation bytes after warmup",
+        ]
+    full_profile_plan(lines, returncode=returncode)
+    assert driver.main(assets.argv) == 1
+    report, directory = read_report(assets)
+    failed, later = report["stages"]
+    assert failed["status"] == "failed" and "allocation growth" in failed["profile_error"]
+    if returncode:
+        assert "return code 1" in failed["error"]
+    assert later["status"] == "not_run"
+    assert report["full_ep_profile"]["status"] == "ALLOCATION_GROWTH"
+    assert json.loads((directory / "full-ep-ffn-profile.json").read_text(encoding="utf-8")) == full_ep_profile
 
 
 def test_success_executes_sequential_children_and_saves_commands_counts_logs(assets, driver, child_plan):

@@ -11,6 +11,7 @@ import argparse
 import csv
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import math
 import shlex
@@ -27,6 +28,47 @@ MAX_LOCAL_SEQUENCES = 64
 REQUEST_WAVES = 4
 LATENCY_FIELDS = ("mean_ttft_ms", "p99_ttft_ms", "mean_tpot_ms", "p99_tpot_ms", "p99_e2el_ms")
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def runtime_contract():
+    # Read the packaged, stdlib-only contract without initializing the plugin.
+    path = REPO_ROOT / "vllm_ascend/quantization/vq2a8_gs32_runtime.py"
+    spec = importlib.util.spec_from_file_location("vq2a8_gs32_runtime_benchmark", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.FULL_FFN_ABI_VERSION, module.KERNEL_ENTRY
+
+
+def validate_artifact_record(artifacts):
+    """Check recorded identity only; server paths need not exist on this client."""
+    abi_version, kernel_entry = runtime_contract()
+    if not isinstance(artifacts, dict):
+        raise ValueError("runtime-record requires complete native_artifacts from the current server startup")
+    kernel = artifacts.get("kernel")
+    if (
+        type(artifacts.get("abi_version")) is not int
+        or artifacts["abi_version"] != abi_version
+        or not isinstance(kernel, dict)
+        or type(kernel.get("abi_version")) is not int
+        or kernel["abi_version"] != abi_version
+        or kernel.get("entry") != kernel_entry
+    ):
+        raise ValueError(
+            f"runtime-record requires native_artifacts ABI {abi_version} and kernel entry {kernel_entry}; "
+            "rebuild the current runtime and use its new server startup record"
+        )
+    if kernel.get("present") is not True or type(kernel.get("bytes")) is not int or kernel["bytes"] < 4:
+        raise ValueError("runtime-record requires a present, non-empty kernel artifact")
+    for value in (artifacts.get("library"), artifacts.get("build_manifest"), kernel.get("path")):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("runtime-record requires library, build_manifest and kernel paths")
+    for value in (artifacts.get("library_sha256"), kernel.get("sha256")):
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("runtime-record requires library and kernel SHA256 identities")
 
 
 def parse_args(argv=None):
@@ -280,6 +322,7 @@ def runtime_context(args):
         raise ValueError("runtime-record requires fused/full_graph execution")
     if not isinstance(record.get("model_path"), str) or not record["model_path"].strip():
         raise ValueError("runtime-record must include model_path")
+    validate_artifact_record(record.get("native_artifacts"))
     with urlopen(args.base_url + "/v1/models", timeout=30) as response:
         snapshot = json.load(response)
     models = snapshot.get("data") if isinstance(snapshot, dict) else None

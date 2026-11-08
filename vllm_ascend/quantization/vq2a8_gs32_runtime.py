@@ -10,8 +10,8 @@ import hashlib
 import json
 from pathlib import Path
 
-KERNEL_ENTRY = "mixed_w2w4_moe_ffn_v3"
-FULL_FFN_ABI_VERSION = 3
+KERNEL_ENTRY = "mixed_w2w4_moe_ffn_v4"
+FULL_FFN_ABI_VERSION = 4
 
 REQUIRED_FULL_FFN_SCHEMAS = (
     ("initialize", "vq2a8_gs32_stage::initialize(str binary) -> ()"),
@@ -33,12 +33,13 @@ REQUIRED_FULL_FFN_SCHEMAS = (
     (
         "prepare_full_ffn",
         "vq2a8_gs32_stage::prepare_full_ffn(Tensor anchor, int n, int d, Tensor gate_w4, Tensor down_w4, "
-        "float swiglu_limit) -> __torch__.torch.classes.vq2a8_gs32_stage.FullFFNPlan",
+        "float swiglu_limit, Tensor gate_weight, Tensor gate_table, Tensor gate_row_scale, "
+        "Tensor down_weight, Tensor down_table, Tensor down_row_scale) -> "
+        "__torch__.torch.classes.vq2a8_gs32_stage.FullFFNPlan",
     ),
     (
         "full_ffn_device",
-        "vq2a8_gs32_stage::full_ffn_device(Tensor input_bytes, Tensor input_scale, Tensor gate_weight, "
-        "Tensor gate_table, Tensor gate_row_scale, Tensor down_weight, Tensor down_table, Tensor down_row_scale, "
+        "vq2a8_gs32_stage::full_ffn_device(Tensor input_bytes, Tensor input_scale, "
         "__torch__.torch.classes.vq2a8_gs32_stage.DeviceRoutes routes, "
         "__torch__.torch.classes.vq2a8_gs32_stage.FullFFNPlan plan, Tensor(a!) hidden, "
         "Tensor(b!) hidden_scale, Tensor(c!) output) -> ()",
@@ -129,6 +130,6 @@ def verify_runtime_artifacts(library, binary, *, require_full_ffn=True):
         or manifest.get("library_sha256") != library_hash
         or manifest.get("deployed_kernel_sha256") != kernel["sha256"]
     ):
-        raise ValueError("Full FFN bridge/kernel do not match the completed ABI v3 build manifest; rebuild both")
+        raise ValueError("Full FFN bridge/kernel do not match the completed ABI v4 build manifest; rebuild both")
     result.update(abi_version=FULL_FFN_ABI_VERSION, build_manifest=str(manifest_path))
     return result

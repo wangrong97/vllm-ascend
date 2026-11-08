@@ -295,7 +295,7 @@ public:
     __aicore__ inline void Init(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list, __gm__ void *a,
                                __gm__ void *a_scale, __gm__ void *b, __gm__ void *b_scale,
                                __gm__ void *h, __gm__ void *h_scale, __gm__ void *tiling,
-                               __gm__ void *route_mask, float swiglu_limit = 0.0F)
+                               __gm__ void *route_mask, __gm__ void *weight_offsets, float swiglu_limit = 0.0F)
     {
         G = g;
         K = k;
@@ -308,6 +308,7 @@ public:
         h_gm = h;
         h_scale_gm = h_scale;
         route_mask_gm = route_mask;
+        weight_offsets_gm = weight_offsets;
         swiglu_limit_ = swiglu_limit;
         __gm__ MatFP4TilingData *tiling_data = (__gm__ MatFP4TilingData *)tiling;
         narrow_nbs = tiling_data->narrow_nbs;
@@ -342,26 +343,23 @@ public:
 
         __gm__ uint8_t *b_base = (__gm__ uint8_t *)b_gm;
         __gm__ int64_t *group_list = (__gm__ int64_t *)group_list_gm;
-        const uint64_t w2_b_group_bytes = N * K / 4;
-        const uint64_t w4_b_group_bytes = N * K / 2;
         uint64_t row_begin = 0;
-        uint64_t b_offset = 0;
         PendingPost pending_post {};
 
         // AIC/AIV 同步跳过空组，event 保护跨组复用的共享 L1B。
         for (uint64_t group_id = 0; group_id < G; ++group_id) {
-            const bool route_w4 = ::MixedRouteBit((__gm__ uint32_t *)route_mask_gm, group_id);
-            __gm__ uint8_t *group_b = b_base + b_offset;
-            b_offset += route_w4 ? w4_b_group_bytes : w2_b_group_bytes;
             const int64_t signed_group_m = group_list[group_id];
             if (signed_group_m <= 0) {
                 continue;
             }
             const uint64_t group_m = static_cast<uint64_t>(signed_group_m);
+            const bool route_w4 = ::MixedRouteBit((__gm__ uint32_t *)route_mask_gm, group_id);
             if (!route_w4) {
                 row_begin += group_m;
                 continue;
             }
+            // Static offsets include all resident experts, including empty/opposite-precision ones.
+            __gm__ uint8_t *group_b = b_base + ((__gm__ uint64_t *)weight_offsets_gm)[group_id];
             const bool wide_group = MatFP4IsWideGroup(group_m, n_only_mode, wide_m_start);
             uint64_t cnt_k = 0;
             if (n_only_mode != 0) {
@@ -452,6 +450,7 @@ public:
     __gm__ void *h_gm = nullptr;
     __gm__ void *h_scale_gm = nullptr;
     __gm__ void *route_mask_gm = nullptr;
+    __gm__ void *weight_offsets_gm = nullptr;
     float swiglu_limit_ = 0.0F;
     __ubuf__ void *packed_w[kInputBufferCount] {};
     __ubuf__ void *decoded_w[kOutputBufferCount] {};
@@ -460,14 +459,14 @@ public:
 };
 
 #ifndef MAT_FP4_COMPONENT_ONLY
-extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v3_mix_aiv(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list,
+extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_v4_mix_aiv(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list,
                                                        __gm__ void *a, __gm__ void *a_scale, __gm__ void *b,
                                                        __gm__ void *b_scale, __gm__ void *h,
                                                        __gm__ void *h_scale, __gm__ void *tiling,
-                                                       __gm__ void *route_mask)
+                                                       __gm__ void *route_mask, __gm__ void *weight_offsets)
 {
     MatFP4 mat;
-    mat.Init(g, k, n, group_list, a, a_scale, b, b_scale, h, h_scale, tiling, route_mask);
+    mat.Init(g, k, n, group_list, a, a_scale, b, b_scale, h, h_scale, tiling, route_mask, weight_offsets);
     mat.process();
 }
 #endif
