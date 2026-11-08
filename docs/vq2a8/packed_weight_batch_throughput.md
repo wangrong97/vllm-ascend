@@ -1,5 +1,7 @@
 # 无 perm VQ2A8 混精模型：四卡并发吞吐测试
 
+单卡 98G、显存比例 0.97 的试验请使用[单卡并发吞吐测试](single_card_batch_throughput.md)。
+
 适用分支：`test/vq2a8-perf-20261024`；更新日期：2026-11-08。
 模型为 `/mnt/share/g00872988/DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3-export-20261103`。
 Linux 路径按内网实际存放位置调整，服务端和客户端使用同一份模型；本地已检查的目录为 `D:\models\DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3-export-20261103`。

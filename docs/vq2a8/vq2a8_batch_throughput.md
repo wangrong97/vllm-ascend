@@ -1,4 +1,10 @@
-# VQ2A8 四卡吞吐测试入口
+# VQ2A8 并发吞吐测试入口
+
+单卡 98G 测试使用[单卡启动与压测命令](single_card_batch_throughput.md)：TP1/EP1、MRV2、B64，
+显存比例 0.97，起步配置为 1 GiB KV、1024-token 调度预算，扫描并发 1～64。
+单卡显存容量需实测确认，完整 FFN 和图回放保持启用。
+
+以下为四卡测试口径：
 
 当前主线模型为 `DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3`。
 使用 [四卡启动与压测命令](packed_weight_batch_throughput.md)：终端 A 启动服务，终端 B 扫描并发。
