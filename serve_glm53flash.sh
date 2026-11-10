@@ -1,5 +1,6 @@
 #!/bin/bash
 # GLM-5.3-Flash 单机纯服务启动脚本 (8x Ascend950DT, 96GB x 8)
+# 2026-11-10: main 分支验证版(源自 glm53flash_v0.30.0 分支); 差异: 移除 VLLM_USE_V2_MODEL_RUNNER=0(main 已无 V1), 新增 INDEXER_KV_DTYPE 开关注入 --attention-config
 # 与 run_glm53flash.sh 同参数, 但只起服务: 不做对话验证、不挂 profiler。
 # 布局: dp1 x tp8 x ep8, 288 experts (每 EP rank 36 个)。
 #
@@ -35,7 +36,7 @@ QUANT_METHOD=${QUANT_METHOD:-}
 COMPILATION_CONFIG=${COMPILATION_CONFIG:-'{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1,2,4,8,16,32,64,96,128]}'}
 
 # ---- 教程要求的环境变量 (GLM5.3-Flash 仅支持 model runner V1) ----
-export VLLM_USE_V2_MODEL_RUNNER=0
+# main 分支: V1 已移除, 必须用 V2 (不再 export VLLM_USE_V2_MODEL_RUNNER=0)
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_BUFFSIZE=1024
 
@@ -98,6 +99,11 @@ QUANT_ARGS=()
 if [[ -n "${QUANT_METHOD}" ]]; then
     QUANT_ARGS=(--quantization "${QUANT_METHOD}")
 fi
+# INDEXER_KV_DTYPE=fp8 时启用 GLM kpool indexer 的 C8 量化(main 分支 #18447)
+ATTN_ARGS=()
+if [[ -n "${INDEXER_KV_DTYPE:-}" ]]; then
+    ATTN_ARGS=(--attention-config "{\"indexer_kv_dtype\": \"${INDEXER_KV_DTYPE}\"}")
+fi
 
 # SPEC_TOKENS=0 时关闭 MTP 投机解码(A/B 对照用)
 SPEC_ARGS=()
@@ -128,6 +134,7 @@ SERVE_CMD=(
   "${SPEC_ARGS[@]}"
   "${LOAD_ARGS[@]}"
   "${QUANT_ARGS[@]}"
+  "${ATTN_ARGS[@]}"
 )
 
 if [[ "${FG}" == "1" ]]; then
