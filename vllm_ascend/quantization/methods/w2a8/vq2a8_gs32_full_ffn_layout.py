@@ -107,7 +107,7 @@ def build_full_ffn_bank(layer, layer_spec, *, swiglu_limit, spare_slots=None):
         rows, columns = spec.rows, spec.columns
         quant_types = layer_spec.quant_types[kind]
         typed_slots = {
-            quant_type: {expert: slot for slot, expert in enumerate(e for e in experts if quant_types[e] == quant_type)}
+            quant_type: {expert: slot for slot, expert in enumerate(e for e in experts if e >= 0 and quant_types[e] == quant_type)}
             for quant_type in ("vq2", "mxfp4")
         }
         offsets = [0]

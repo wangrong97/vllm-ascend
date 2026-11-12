@@ -162,6 +162,9 @@ class _FakeOps:
     def require_padding_support(self):
         return None
 
+    def prepare_full_ffn_plan(self, *args, **kwargs):
+        return types.SimpleNamespace()  # plan stub; never executed on CPU
+
     def project(self, *args, **kwargs):
         # The real kernel writes the projection; fill zeros so the serial
         # path's NaN-poisoned output buffer passes the finiteness gate.
@@ -194,29 +197,44 @@ def _make_layer(specs, num_experts=8, ep_size=2, capacity_scale=1):
     return layer
 
 
+def _apply_capture(weights):
+    original = weights._apply_full_ffn
+    weights._apply_full_ffn = lambda *args, **kwargs: (
+        torch.zeros((args[0].shape[0], weights.specs["down"].rows), dtype=args[0].dtype),
+        None,
+    )[0]
+    return original
+
+
+def _restore_apply(weights, original):
+    weights._apply_full_ffn = original
+
+
 def _make_weights(mode, ep_size=2):
-    from vllm_ascend.eplb.mp.config import OFF_OPTIONS
+    """Full-FFN GS32ExpertWeights with optional MP-EPLB spare capacity."""
+    from vllm_ascend.eplb.mp.config import OFF_OPTIONS, get_mp_eplb_options
     from vllm_ascend.ops.fused_moe.vq2a8_gs32 import GS32ExpertWeights
     from vllm_ascend.quantization.methods.w2a8.vq2a8_gs32_format import GS32ProjectionSpec
+    from vllm_ascend.quantization.methods.w2a8.vq2a8_gs32_full_ffn_layout import build_full_ffn_bank
 
-    # Geometry must be self-consistent: down.K == gate_up.rows // 2 (the
-    # SwiGLU output width feeding the down projection).
     specs = {
         "gate_up": GS32ProjectionSpec(128, 256),
         "down": GS32ProjectionSpec(64, 64),
     }
     layer = _make_layer(specs, ep_size=ep_size)
     local = 8 // ep_size
+    live_ids = tuple(range(local))
     layer_spec = types.SimpleNamespace(
         specs=specs,
-        expert_ids=tuple(range(local)),
-        quant_types={kind: {e: "vq2" for e in range(local)} for kind in ("gate_up", "down")},
+        expert_ids=live_ids,
+        quant_types={kind: {e: "vq2" for e in live_ids} for kind in ("gate_up", "down")},
     )
-    options = {"gs32_execution": "serial"}
     mp = get_mp_eplb_options({"eplb": mode}) if mode else OFF_OPTIONS
+    spare = {q: mp.replica_slots[q] // ep_size for q in ("vq2", "mxfp4")} if mp.enabled else None
+    layer.vq2a8_full_ffn_bank = build_full_ffn_bank(layer, layer_spec, swiglu_limit=0.0, spare_slots=spare)
     return GS32ExpertWeights(
-        layer, layer_spec, options, mp_eplb=mp, _test_ops=_FakeOps(),
-        _test_activation=types.SimpleNamespace(), _test_mxfp4=lambda *a: None,
+        layer, layer_spec, {"gs32_execution": "fused"}, mp_eplb=mp, _test_ops=_FakeOps(),
+        _test_activation=types.SimpleNamespace(),
     )
 
 
@@ -225,39 +243,44 @@ class TestGS32SwitchGating:
         weights = _make_weights("off")
         assert not weights.eplb_enabled
         assert weights.moe_load is None
-        # eager + off: no device indexes are built (baseline behavior).
-        assert all("expert_ids_tensor" not in bank for kind in weights.banks.values() for bank in kind.values())
+        assert weights.full_ffn_bank["spare_slots"] == {}
 
     def test_on_adds_accounting_and_capacity(self):
         weights = _make_weights("static", ep_size=2)
         assert weights.eplb_enabled
         assert weights.moe_load is not None and tuple(weights.moe_load.shape) == (8,)
-        bank = weights.banks["gate_up"]["vq2"]
         # spare = R_vq2(default 4) // ep_size(2) = 2 extra tail slots.
-        assert bank["spare_slots"] == 2
-        assert int(bank["expert_ids_tensor"][-1]) == -1  # EMPTY sentinel
-        assert int(bank["expert_ids_tensor"][0]) == 0
-        assert int(bank["logical_slots"][0]) == 0 and int(bank["logical_slots"][7]) == -1
+        assert weights.full_ffn_bank["spare_slots"] == {"vq2": 2, "mxfp4": 1}
+        ids = weights.full_ffn_expert_ids.tolist()
+        assert ids[:4] == [0, 1, 2, 3] and ids[-3:] == [-1, -1, -1]
+        slots = weights.full_ffn_logical_slots.tolist()
+        assert slots[0] == 0 and slots[7] == -1
+        assert bool(weights.resident_mask[:4].all()) and not bool(weights.resident_mask[4:].any())
 
     def test_apply_records_load_only_when_enabled(self):
-        weights_off = _make_weights("off")
-        weights_on = _make_weights("static", ep_size=1)
+        # group_list counts (type 1) for 8 logical experts.
         group_list = torch.tensor([2, 1, 0, 1, 0, 0, 0, 0], dtype=torch.int64)
-        hidden = torch.zeros(4, 256, dtype=torch.bfloat16)  # gate_up K = 256
+        hidden = torch.zeros((4, 256), dtype=torch.bfloat16)
+        weights_off = _make_weights("off")
+        weights_on = _make_weights("static", ep_size=2)
+        original_off = _apply_capture(weights_off)
+        original_on = _apply_capture(weights_on)
         weights_off.apply(hidden, group_list, 1, None)
         weights_on.apply(hidden, group_list, 1, None)
         assert weights_off.moe_load is None
         assert weights_on.moe_load.tolist() == [2, 1, 0, 1, 0, 0, 0, 0]
+        _restore_apply(weights_off, original_off)
+        _restore_apply(weights_on, original_on)
 
     def test_commit_hooks_update_indexes(self):
         weights = _make_weights("static", ep_size=2)
-        weights.commit_fill("vq2", 5, 6)  # spare slot 5 on this rank
-        bank = weights.banks["gate_up"]["vq2"]
-        assert int(bank["expert_ids_tensor"][5]) == 6
-        assert int(bank["logical_slots"][6]) == 5
+        spare_slot = 4  # first trailing EMPTY(-1) slot (local experts 0..3)
+        weights.commit_fill(spare_slot, 6)
+        assert int(weights.full_ffn_expert_ids[spare_slot]) == 6
+        assert int(weights.full_ffn_logical_slots[6]) == spare_slot
         assert bool(weights.resident_mask[6])
-        outgoing = weights.commit_swap("vq2", 0, 6)
+        outgoing = weights.commit_swap(0, 6)
         assert outgoing == 0
-        assert int(bank["logical_slots"][0]) == -1 and int(bank["logical_slots"][6]) == 0
-        weights.commit_evict("vq2", 0, 6)
-        assert int(bank["logical_slots"][6]) == -1 and not bool(weights.resident_mask[6])
+        assert int(weights.full_ffn_logical_slots[0]) == -1 and int(weights.full_ffn_logical_slots[6]) == 0
+        weights.commit_evict(0, 6)
+        assert int(weights.full_ffn_logical_slots[6]) == -1 and not bool(weights.resident_mask[6])

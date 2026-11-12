@@ -182,8 +182,13 @@ class GS32ExpertWeights:
 
         self.full_ffn_bank = layer.vq2a8_full_ffn_bank
         bank = self.full_ffn_bank
-        if bank["expert_ids"] != tuple(self.expert_slots):
-            raise ValueError("Full FFN resident expert order does not match the loaded layer.")
+        resident_order = tuple(bank["expert_ids"])
+        if resident_order[: len(self.expert_slots)] != tuple(self.expert_slots) or any(
+            expert != -1 for expert in resident_order[len(self.expert_slots) :]
+        ):
+            raise ValueError(
+                "Full FFN resident expert order does not match the loaded layer (trailing EMPTY(-1) spares allowed)."
+            )
         if not 1 <= self.num_experts <= MAX_GROUPED_EXPERTS or len(self.expert_slots) > MAX_GROUPED_EXPERTS:
             raise ValueError("GS32 full_ffn requires 1..256 logical and at most 256 resident experts.")
         resident_ids = bank["expert_ids"]
