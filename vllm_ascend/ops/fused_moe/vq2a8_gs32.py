@@ -167,7 +167,12 @@ class GS32ExpertWeights:
 
             self.activation = vq2a8_gs32_activation
         self.specs = layer_spec.specs
-        self.expert_slots = {expert: slot for slot, expert in enumerate(layer_spec.expert_ids)}
+        # MP-EPLB: trailing EMPTY(-1) sentinels stay out of the live mapping;
+        # they exist only as packed capacity (spare_slots on the bank).
+        self.expert_slots = {
+            expert: slot for slot, expert in enumerate(layer_spec.expert_ids) if expert >= 0
+        }
+        self.bank_capacity = len(layer_spec.expert_ids)
         self.num_experts = layer.vq2a8_num_experts
         self.allow_padding = getattr(layer, "vq2a8_ep_size", 1) > 1
         self._initialize_full_ffn(layer, options, _test_ops, startup_state)
@@ -182,11 +187,24 @@ class GS32ExpertWeights:
         if not 1 <= self.num_experts <= MAX_GROUPED_EXPERTS or len(self.expert_slots) > MAX_GROUPED_EXPERTS:
             raise ValueError("GS32 full_ffn requires 1..256 logical and at most 256 resident experts.")
         resident_ids = bank["expert_ids"]
-        if any(type(expert) is not int or not 0 <= expert < self.num_experts for expert in resident_ids) or tuple(
-            resident_ids
-        ) != tuple(sorted(set(resident_ids))):
-            raise ValueError("Full FFN identity routes require sorted unique resident expert IDs in logical range.")
+        live_ids = tuple(expert for expert in resident_ids if expert >= 0)
+        spare_tail = tuple(resident_ids[len(live_ids) :])
+        if any(type(expert) is not int or not 0 <= expert < self.num_experts for expert in live_ids) or tuple(
+            live_ids
+        ) != tuple(sorted(set(live_ids))) or any(expert != -1 for expert in spare_tail):
+            raise ValueError("Full FFN identity routes require sorted unique resident IDs and trailing EMPTY(-1) spares.")
         self.device = layer.vq2a8_anchor.device
+        # MP-EPLB switch: accounting and slot remapping only when enabled.
+        self.eplb_enabled = self.mp_eplb.enabled if self.mp_eplb is not None else False
+        self.moe_load = None
+        self.resident_mask = None
+        if self.eplb_enabled:
+            # Slot-level load accounting (doc C.5): raw routed rows per
+            # logical expert, consumed by the slow ring only.
+            self.moe_load = torch.zeros(self.num_experts, dtype=torch.int64, device=self.device)
+            self.resident_mask = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
+            self.resident_mask[list(self.expert_slots)] = True
+        self.full_ffn_spare_slots = dict(bank.get("spare_slots") or {})
         self.device_router = vq2a8_gs32_routes
         if test_ops is not None:
             self.ops = test_ops
@@ -213,7 +231,8 @@ class GS32ExpertWeights:
         self.full_ffn_expert_ids = torch.tensor(bank["expert_ids"], dtype=torch.int64, device=self.device)
         self.full_ffn_logical_slots = torch.full((self.num_experts,), -1, dtype=torch.int64, device=self.device)
         if self.expert_slots:
-            self.full_ffn_logical_slots[self.full_ffn_expert_ids] = torch.arange(
+            live_ids_tensor = self.full_ffn_expert_ids[: len(self.expert_slots)]
+            self.full_ffn_logical_slots[live_ids_tensor] = torch.arange(
                 len(self.expert_slots), device=self.device
             )
             self.full_ffn_plan = self.ops.prepare_full_ffn_plan(
@@ -345,4 +364,47 @@ class GS32ExpertWeights:
             raise ValueError("GS32 group_list must have an integer count/prefix for every logical expert.")
         if self.execution == "full_graph" and group_list.device != self.device:
             raise ValueError("GS32 graph group_list must be on the same device as hidden states.")
+        if self.eplb_enabled:
+            # MP-EPLB accounting (doc C.5 raw quantities): accumulate this
+            # step's logical-expert row counts; consumed by the slow ring.
+            counts = group_list.to(device=self.device, dtype=torch.int64).clamp_min(0)
+            if group_list_type == 0:
+                counts = counts - torch.cat((counts.new_zeros(1), counts[:-1]))
+            self.moe_load[: counts.numel()].add_(counts)
         return self._apply_full_ffn(hidden_states, group_list, group_list_type, limit, capturing), None
+
+    # -- MP-EPLB P2 commit hooks (value-only index refresh; doc 2.5) ---------
+
+    def commit_fill(self, slot, expert):
+        """P2 for a fill move on this rank: EMPTY slot becomes ``expert``."""
+        if not self.eplb_enabled:
+            raise ValueError("MP-EPLB commit hooks require eplb enabled.")
+        if int(self.full_ffn_expert_ids[slot]) != -1:
+            raise ValueError("commit_fill targets an occupied slot.")
+        self.full_ffn_expert_ids[slot] = expert
+        self.full_ffn_logical_slots[expert] = slot
+        self.resident_mask[expert] = True
+
+    def commit_evict(self, slot, expert):
+        """P2 for an evict move (index only; weight bytes stay resident)."""
+        if not self.eplb_enabled:
+            raise ValueError("MP-EPLB commit hooks require eplb enabled.")
+        if int(self.full_ffn_expert_ids[slot]) != expert:
+            raise ValueError("commit_evict slot mismatch.")
+        self.full_ffn_expert_ids[slot] = -1
+        self.full_ffn_logical_slots[expert] = -1
+        self.resident_mask[expert] = False
+
+    def commit_swap(self, slot, incoming_expert):
+        """P2 for the local end of a swap: outgoing expert leaves this rank."""
+        if not self.eplb_enabled:
+            raise ValueError("MP-EPLB commit hooks require eplb enabled.")
+        outgoing = int(self.full_ffn_expert_ids[slot])
+        if outgoing < 0:
+            raise ValueError("commit_swap targets an empty slot.")
+        self.full_ffn_expert_ids[slot] = incoming_expert
+        self.full_ffn_logical_slots[outgoing] = -1
+        self.full_ffn_logical_slots[incoming_expert] = slot
+        self.resident_mask[outgoing] = False
+        self.resident_mask[incoming_expert] = True
+        return outgoing

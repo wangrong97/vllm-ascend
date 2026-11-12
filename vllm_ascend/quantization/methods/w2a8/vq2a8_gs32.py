@@ -160,12 +160,19 @@ class AscendGS32FusedMoEScheme(AscendMoEScheme):
             }
             for kind in self.layer_spec.specs
         }
+        # MP-EPLB capacity (doc 2.5-D): trailing EMPTY(-1) sentinel slots keep
+        # the packed bank dim-0 constant; plans/graphs never need rebuilding.
+        spare_slots = (
+            {quant: self.mp_eplb.replica_slots[quant] // placement.ep_size for quant in ("vq2", "mxfp4")}
+            if self.mp_eplb.enabled
+            else None
+        )
         local_spec = replace(
             self.layer_spec,
             expert_ids=placement.local_ids,
             quant_types=local_types,
         )
-        bank = build_full_ffn_bank(layer, local_spec, swiglu_limit=self.swiglu_limit)
+        bank = build_full_ffn_bank(layer, local_spec, swiglu_limit=self.swiglu_limit, spare_slots=spare_slots)
         for name, tensor in bank["fields"].items():
             layer.register_buffer(f"vq2a8_full_ffn_{name}", tensor, persistent=False)
         layer.vq2a8_full_ffn_bank = bank

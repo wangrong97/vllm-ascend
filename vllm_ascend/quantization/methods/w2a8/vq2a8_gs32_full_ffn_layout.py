@@ -76,23 +76,32 @@ def validate_full_ffn_spec(layer_spec):
             raise ValueError(f"Complete FFN does not support expert {expert} precision pair {pair}.")
 
 
-def build_full_ffn_bank(layer, layer_spec, *, swiglu_limit):
+def build_full_ffn_bank(layer, layer_spec, *, swiglu_limit, spare_slots=None):
     """Pack both projections in one resident-expert order, without requantizing.
 
     Call only after source-v3 field validation. The returned bank owns newly
     allocated storage, allowing the caller to release every source parameter.
     CPU precision flags are consumed by the native plan during initialization;
     they are never read back from the device in a model forward.
+
+    ``spare_slots`` (mixed-precision EPLB, doc 2.5-D) maps quant type to a
+    count of trailing EMPTY(-1) capacity slots. Spare slots keep the packed
+    tensors' dim-0 constant for the whole run so the native plan and captured
+    graphs never need rebuilding when replicas are filled or evicted.
     """
     if isinstance(swiglu_limit, bool) or not isinstance(swiglu_limit, (int, float)):
         raise ValueError("Complete FFN SwiGLU limit must be a finite non-negative number.")
     if not math.isfinite(swiglu_limit) or swiglu_limit < 0:
         raise ValueError("Complete FFN SwiGLU limit must be a finite non-negative number.")
+    spare_slots = {quant: int(count) for quant, count in (spare_slots or {}).items() if int(count) > 0}
+    for quant in spare_slots:
+        if quant not in ("vq2", "mxfp4"):
+            raise ValueError(f"Complete FFN spare capacity quant type must be vq2/mxfp4, got {quant!r}.")
     validate_full_ffn_spec(layer_spec)
-    experts = tuple(layer_spec.expert_ids)
-
+    spare_sequence = ("vq2",) * spare_slots.get("vq2", 0) + ("mxfp4",) * spare_slots.get("mxfp4", 0)
+    experts = tuple(layer_spec.expert_ids) + (-1,) * len(spare_sequence)
     device = layer.vq2a8_anchor.device
-    bank = {"expert_ids": experts, "fields": {}, "weight_offsets": {}, "stage_mask": 0}
+    bank = {"expert_ids": experts, "fields": {}, "weight_offsets": {}, "stage_mask": 0, "spare_slots": spare_slots}
     for kind, prefix, native_name, stage_shift in (("gate_up", "w13", "gate", 0), ("down", "w2", "down", 2)):
         spec = layer_spec.specs[kind]
         rows, columns = spec.rows, spec.columns
@@ -102,14 +111,20 @@ def build_full_ffn_bank(layer, layer_spec, *, swiglu_limit):
             for quant_type in ("vq2", "mxfp4")
         }
         offsets = [0]
-        for expert in experts:
-            offsets.append(offsets[-1] + rows * columns // (2 if quant_types[expert] == "mxfp4" else 4))
+        for slot, expert in enumerate(experts):
+            quant_type = quant_types[expert] if expert >= 0 else spare_sequence[slot - (len(experts) - len(spare_sequence))]
+            offsets.append(offsets[-1] + rows * columns // (2 if quant_type == "mxfp4" else 4))
         table_bytes = rows * columns // SCALE_GROUP
         weight = torch.empty(offsets[-1], dtype=torch.uint8, device=device)
-        table = torch.empty(len(experts) * table_bytes, dtype=torch.uint8, device=device)
+        table = torch.full((len(experts) * table_bytes,), 0, dtype=torch.uint8, device=device)
         row_scale = torch.full((len(experts), rows), FP32_ONE_BITS, dtype=torch.int64, device=device)
-        flags = tuple(quant_types[expert] == "mxfp4" for expert in experts)
+        flags = tuple(
+            (quant_types[expert] == "mxfp4") if expert >= 0 else (spare_sequence[slot - (len(experts) - len(spare_sequence))] == "mxfp4")
+            for slot, expert in enumerate(experts)
+        )
         for slot, expert in enumerate(experts):
+            if expert < 0:
+                continue  # EMPTY capacity: zeroed bytes, neutral one-scales.
             quant_type = quant_types[expert]
             source_slot = typed_slots[quant_type][expert]
             if quant_type == "vq2":
