@@ -147,6 +147,15 @@ def build_full_ffn_bank(layer, layer_spec, *, swiglu_limit, spare_slots=None):
         )
         bank[f"{native_name}_w4"] = torch.tensor(flags, dtype=torch.bool, device="cpu")
         bank["weight_offsets"][kind] = tuple(offsets)
+        bytes_by_quant = {
+            ("gate_up", "vq2"): spec.rows * spec.columns // 4,
+            ("gate_up", "mxfp4"): spec.rows * spec.columns // 2,
+            ("down", "vq2"): spec.rows * spec.columns // 4,
+            ("down", "mxfp4"): spec.rows * spec.columns // 2,
+        } if kind == "gate_up" else {}
+        bank.setdefault("geometry", {"rows": {}, "slot_bytes": {}})
+        bank["geometry"]["rows"][kind] = rows
+        bank["geometry"]["slot_bytes"].update(bytes_by_quant)
         if any(not flag for flag in flags):
             bank["stage_mask"] |= 1 << stage_shift
         if any(flags):

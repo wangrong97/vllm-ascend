@@ -173,8 +173,19 @@ class GS32ExpertWeights:
             expert: slot for slot, expert in enumerate(layer_spec.expert_ids) if expert >= 0
         }
         self.bank_capacity = len(layer_spec.expert_ids)
+        # MP-EPLB host mirror aid: per-expert quant types under w13/w2 keys.
+        self._quant_types = {
+            native: {
+                expert: layer_spec.quant_types[kind][expert]
+                for expert in layer_spec.expert_ids
+                if expert >= 0
+            }
+            for kind, native in (("gate_up", "w13"), ("down", "w2"))
+        }
         self.num_experts = layer.vq2a8_num_experts
-        self.allow_padding = getattr(layer, "vq2a8_ep_size", 1) > 1
+        self._ep_size = getattr(layer, "vq2a8_ep_size", 1)
+        self._ep_rank = getattr(layer, "vq2a8_ep_rank", 0)
+        self.allow_padding = self._ep_size > 1
         self._initialize_full_ffn(layer, options, _test_ops, startup_state)
 
     def _initialize_full_ffn(self, layer, options, test_ops, startup_state):
@@ -377,6 +388,19 @@ class GS32ExpertWeights:
                 counts = counts - torch.cat((counts.new_zeros(1), counts[:-1]))
             self.moe_load[: counts.numel()].add_(counts)
         return self._apply_full_ffn(hidden_states, group_list, group_list_type, limit, capturing), None
+
+    def _host_placement(self):
+        """Host BankSlotTable mirror of the current device index tensors."""
+        from vllm_ascend.eplb.mp.placement import EMPTY_SLOT, build_linear_baseline
+
+        spare = getattr(self, "full_ffn_spare_slots", None) or {}
+        return build_linear_baseline(
+            self.num_experts,
+            getattr(self, "_ep_size", 1),
+            getattr(self, "_ep_rank", 0),
+            self._quant_types,
+            spare,
+        )
 
     # -- MP-EPLB P2 commit hooks (value-only index refresh; doc 2.5) ---------
 

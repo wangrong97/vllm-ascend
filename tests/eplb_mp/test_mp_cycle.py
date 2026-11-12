@@ -284,3 +284,39 @@ class TestGS32SwitchGating:
         assert int(weights.full_ffn_logical_slots[0]) == -1 and int(weights.full_ffn_logical_slots[6]) == 0
         weights.commit_evict(0, 6)
         assert int(weights.full_ffn_logical_slots[6]) == -1 and not bool(weights.resident_mask[6])
+
+
+class TestFullFFNRuntimeWiring:
+    def _bank_and_weights(self, mode="static"):
+        weights = _make_weights(mode)
+        return weights, weights.full_ffn_bank
+
+    def test_slicer_send_slice_uses_slot_offsets(self):
+        from vllm_ascend.eplb.mp.full_ffn_runtime import FullFFNBankSlicer
+        from vllm_ascend.eplb.mp.migrator import P2POp
+        from vllm_ascend.eplb.mp.placement import EMPTY_SLOT
+
+        weights, bank = self._bank_and_weights()
+        placement = weights._host_placement()
+        slicer = FullFFNBankSlicer(lambda _layer: bank, lambda _rank: placement)
+        op = P2POp(kind="send", peer_rank=0, expert_id=1, quant_type="vq2", projection="w13", field="packed_zn")
+        descriptors = slicer.send_slices(0, [op], rank=0)
+        offsets = bank["weight_offsets"]["gate_up"]
+        assert len(descriptors) == 1
+        slot = placement.slot_of(1, "w13")[1]
+        assert descriptors[0]["bytes"] == offsets[slot + 1] - offsets[slot]
+
+    def test_staging_install_roundtrip(self):
+        from vllm_ascend.eplb.mp.full_ffn_runtime import FullFFNStaging
+
+        weights, bank = self._bank_and_weights()
+        offsets = bank["weight_offsets"]["gate_up"]
+        slot = 0  # occupied live slot
+        source = bank["fields"]["gate_weight"][offsets[slot] : offsets[slot + 1]].clone()
+        staging = FullFFNStaging(num_stages=2)
+        table_bytes = bank["fields"]["gate_table"].numel() // len(bank["expert_ids"])
+        staging.bind_layer(0, [{"rows": 0, "weight_bytes": source.numel(), "table_bytes": table_bytes}], source.device)
+        staged = staging.slot(0, 0)
+        staged["weight"].copy_(source)
+        staging.install(0, 0, bank, "w13", slot)
+        assert torch.equal(bank["fields"]["gate_weight"][offsets[slot] : offsets[slot + 1]], source)
