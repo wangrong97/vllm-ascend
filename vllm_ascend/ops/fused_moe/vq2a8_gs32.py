@@ -144,9 +144,14 @@ class GS32ExpertWeights:
         *,
         graph_row_capacity=DEFAULT_GRAPH_ROW_CAPACITY,
         startup_state=None,
+        mp_eplb=None,
         _test_ops=None,
         _test_activation=None,
     ):
+        # Mixed-precision EPLB options (parsed upstream); the full-FFN bank
+        # port of spare-slot reservation and slot remapping is pending —
+        # stored now so the config chain stays intact.
+        self.mp_eplb = mp_eplb
         if type(graph_row_capacity) is not int or graph_row_capacity < 1:
             raise ValueError("GS32 graph routed row capacity must be a positive integer.")
         # The serving configuration derives this from the largest decode graph

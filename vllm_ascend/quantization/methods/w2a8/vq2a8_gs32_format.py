@@ -326,7 +326,7 @@ def validate_gs32_options(config, options):
 
     if (
         not artifacts.issubset(options)
-        or set(options) - artifacts - {"gs32_execution", "gs32_fusion", "gs32_backend"}
+        or set(options) - artifacts - {"gs32_execution", "gs32_fusion", "gs32_backend", "eplb", "eplb_options"}
         or any(
             not isinstance(options[key], str) or not Path(options[key]).is_absolute()
             for key in artifacts & set(options)
@@ -334,7 +334,7 @@ def validate_gs32_options(config, options):
     ):
         raise ValueError(
             "GS32 native requires absolute gs32_library/gs32_binary paths; "
-            "optional settings are gs32_execution/gs32_fusion/gs32_backend only."
+            "optional settings are gs32_execution/gs32_fusion/gs32_backend/eplb/eplb_options only."
         )
     execution = resolved["gs32_execution"]
     graph = execution == "full_graph"
