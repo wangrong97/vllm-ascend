@@ -40,6 +40,17 @@ def parse_args(argv=None):
         help="keep the current path, or fuse SwiGLU, Down permutation and MXFP8 preparation; independent of execution",
     )
     parser.add_argument(
+        "--eplb",
+        choices=("off", "static", "dynamic", "static_uniform", "dynamic_uniform"),
+        default="off",
+        help="EPLB mode: off (default) | static | dynamic (mixed-precision aware) | *_uniform (width-agnostic)",
+    )
+    parser.add_argument(
+        "--eplb-options",
+        default="",
+        help='eplb_options JSON, e.g. \'{"K":8,"R_vq2":16,"R_mx4":8,"n_stage":2,"w_lo":0.2,"w_hi":5.0,"ewma_lambda":0.05}\'',
+    )
+    parser.add_argument(
         "--max-model-len",
         type=int,
         help="default 128; longer contexts use chunked prefill; full_graph keeps B1 decode graph replay",
@@ -127,6 +138,11 @@ def build_command(args):
         additional["vq2a8"]["gs32_execution"] = args.gs32_execution
     if args.gs32_fusion != "none":
         additional["vq2a8"]["gs32_fusion"] = args.gs32_fusion
+    # EPLB 透传: off(默认,不注入) | static | dynamic(混精感知) | *_uniform(标准)
+    if args.eplb != "off":
+        additional["vq2a8"]["eplb"] = args.eplb
+        if args.eplb_options:
+            additional["vq2a8"]["eplb_options"] = json.loads(args.eplb_options)
     command = [
         sys.executable,
         "-m",

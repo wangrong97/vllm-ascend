@@ -482,11 +482,12 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         # This is a naive implementation for experts load balance so as to
         # avoid accumulating too much tokens on a single rank. It is only
         # activated when doing profile runs.
-        if enable_force_load_balance and self.quant_type == QuantType.VQ2A8:
-            stored_ids = torch.tensor(self.vq2a8_expert_ids, device=topk_ids.device, dtype=topk_ids.dtype)
-            slots = torch.randint(len(self.vq2a8_expert_ids), topk_ids.shape, device=topk_ids.device)
-            topk_ids = stored_ids[slots]
-        elif enable_force_load_balance:
+        # DEBUG 2026-10-31: the VQ2A8-specific replacement (resident-only
+        # ids) is disabled — under EP4 the MC2 dispatch expects global expert
+        # ids, and resident ids can desynchronize the group layout. Fall
+        # through to the generic branch which samples across all logical
+        # experts.
+        if enable_force_load_balance:
             random_matrix = torch.rand(
                 topk_ids.size(0),
                 num_logical_experts,

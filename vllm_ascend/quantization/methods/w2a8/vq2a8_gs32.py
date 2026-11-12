@@ -79,7 +79,15 @@ class AscendGS32FusedMoEScheme(AscendMoEScheme):
                     # MP-EPLB capacity reservation (doc 2.5-D): tail spare
                     # slots keep the bank's dim-0 constant for the whole run
                     # so plans/captured graphs never need rebuilding.
-                    spare = self.mp_eplb.replica_slots[quant_type] // placement.ep_size
+                    # Gate on `enabled`: R_vq2/R_mx4 stay parsed when the
+                    # switch is off, but a disabled run must not reserve
+                    # capacity (bank == experts, matching the runtime-side
+                    # spare_slots=0 contract and the documented baseline).
+                    spare = (
+                        self.mp_eplb.replica_slots[quant_type] // self.placement.ep_size
+                        if self.mp_eplb.enabled
+                        else 0
+                    )
                     result[name] = torch.empty((len(ids) + spare, *shape), dtype=dtype)
                     self.parameter_experts[name] = {expert: slot for slot, expert in enumerate(ids)}
                     self.loaded_experts[name] = set()

@@ -81,9 +81,10 @@ def validate_vq2a8_config(config) -> dict:
             raise ValueError("GS32 EP requires evenly divisible logical experts with linear placement.")
         if getattr(config.model_config.hf_config, "model_type", None) != "deepseek_v4":
             raise ValueError("GS32 EP currently requires DeepSeek-V4.")
+    # NOTE: data_parallel_size is allowed with dp-attention replicas; experts
+    # stay unsharded per replica (EP spans the DP group).
     for name in (
         "pipeline_parallel_size",
-        "data_parallel_size",
         "prefill_context_parallel_size",
         "decode_context_parallel_size",
     ):
@@ -149,10 +150,10 @@ def validate_vq2a8_config(config) -> dict:
             raise ValueError("GS32 full_graph requires multistream_dsv4_dsa_overlap=false.")
     elif not config.model_config.enforce_eager or graph_mode not in ("NONE", "0"):
         raise ValueError("GS32 staged execution requires eager execution and graph mode NONE.")
-    if any(
-        getattr(config, name, None) is not None for name in ("speculative_config", "lora_config", "kv_transfer_config")
-    ):
-        raise ValueError("VQ2A8 does not yet support speculation, LoRA or KV transfer.")
+    # NOTE: kv_transfer_config is allowed for PD disaggregation
+    # (MooncakeHybridConnector producer/consumer).
+    if any(getattr(config, name, None) is not None for name in ("speculative_config", "lora_config")):
+        raise ValueError("VQ2A8 does not yet support speculation or LoRA.")
     if getattr(config.scheduler_config, "async_scheduling", False):
         raise ValueError("VQ2A8 currently requires synchronous scheduling.")
     additional = config.additional_config or {}

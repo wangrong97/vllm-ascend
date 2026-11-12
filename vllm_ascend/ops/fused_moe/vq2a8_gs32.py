@@ -15,7 +15,12 @@ from vllm_ascend.quantization.methods.w2a8.vq2a8_gs32_staged import quantize_mxf
 
 NATIVE_ALIGNMENT = 32
 MAX_GROUPED_EXPERTS = 256  # Imported mixed kernel host validation limit.
-MAX_GRAPH_ROUTED_ROWS = 8  # B1 decode with up to eight routed experts.
+MAX_GRAPH_ROUTED_ROWS = 8  # B1 decode with up to eight routed experts (single-rank view).
+# DP-attention gathers tokens across DP ranks before MoE: the whole-graph
+# capture therefore sees dp_size * B1 * topk routed rows (e.g. DP8 x 1 x 6 =
+# 48). The limit can be raised via the "gs32_graph_routed_rows" vq2a8 option
+# when the bridge supports dynamic routed rows (full_graph already requires
+# supports_dynamic_device_rows).
 
 
 def initialize_quantization_validity(runner, *, breakable=False):
@@ -183,6 +188,10 @@ class GS32ExpertWeights:
         self.execution = options.get("gs32_execution", "serial")
         if self.execution not in ("serial", "batched", "fused", "full_graph"):
             raise ValueError("GS32 execution must be serial, batched, fused, or full_graph.")
+        # Whole-graph routed-row budget during capture. Default keeps the
+        # single-rank B1 contract; DP-attention deployments set it to
+        # dp_size * max_query_len * topk via the vq2a8 option.
+        self.graph_routed_rows = max(1, int(options.get("gs32_graph_routed_rows", MAX_GRAPH_ROUTED_ROWS)))
         self.fusion = options.get("gs32_fusion", "none")
         if self.fusion not in ("none", "swiglu_quant"):
             raise ValueError("GS32 fusion must be none or swiglu_quant.")
@@ -542,7 +551,12 @@ class GS32ExpertWeights:
         quant_type, bank, slot = self._bank_for_expert(kind, expert)
         fields = bank["fields"]
         if quant_type == "mxfp4":
-            counts = torch.zeros(len(bank["expert_ids"]), dtype=torch.int64, device=self.device)
+            # Cover the MP-EPLB spare tail (zero token counts) so the group
+            # list matches the packed weight rows (experts + spare), mirroring
+            # the fused path; without EPLB spare_slots is absent and stays 0.
+            counts = torch.zeros(
+                len(bank["expert_ids"]) + bank.get("spare_slots", 0), dtype=torch.int64, device=self.device
+            )
             counts[slot] = data.shape[0]
             output.copy_(self._mxfp4(data, scales, bank, counts))
         else:
@@ -645,15 +659,31 @@ class GS32ExpertWeights:
                 device=self.device,
             )
             if quant_type == "vq2":
-                routes = self.ops.prepare_routes(
-                    physical, torch.tensor(physical_counts, dtype=torch.int64, device="cpu")
-                )
+                # MP-EPLB appends spare (redundancy) slots to the packed bank,
+                # so plan->Groups() == pair_lut.size(0) counts resident slots,
+                # not just experts. Zero-pad the group counts to the resident
+                # capacity so GroupedRoutes::CheckMatches sees the same group
+                # count as the projection plan.
+                counts_tensor = torch.tensor(physical_counts, dtype=torch.int64, device="cpu")
+                spare = bank.get("spare_slots", 0)
+                if spare:
+                    counts_tensor = torch.cat(
+                        [counts_tensor, torch.zeros(spare, dtype=torch.int64)]
+                    )
+                routes = self.ops.prepare_routes(physical, counts_tensor)
                 output = self._project_grouped(kind, physical, slots, routes, bank=bank, swiglu_limit=swiglu_limit)
             else:
                 data, scales = self._prepare_activation(physical, bank, slots, swiglu_limit=swiglu_limit)
-                output = self._mxfp4(
-                    data, scales, bank, torch.tensor(physical_counts, dtype=torch.int64, device=self.device)
-                )
+                # Same spare-slot capacity applies to the mxfp4 bank: the
+                # grouped matmul weight holds len(experts)+spare rows, so the
+                # group list must cover the spare tail (zero token counts).
+                counts_dev = torch.tensor(physical_counts, dtype=torch.int64, device=self.device)
+                spare = bank.get("spare_slots", 0)
+                if spare:
+                    counts_dev = torch.cat(
+                        [counts_dev, torch.zeros(spare, dtype=torch.int64, device=self.device)]
+                    )
+                output = self._mxfp4(data, scales, bank, counts_dev)
             self.activation.require_finite_fused(output, f"GS32 {kind} output")
             result.index_copy_(0, indices, output)
         return result
@@ -671,7 +701,7 @@ class GS32ExpertWeights:
         limit = 0.0 if swiglu_limit is None else swiglu_limit
         fused_limit = limit if self.fusion == "swiglu_quant" else None
         capturing = False
-        graph_rows = MAX_GRAPH_ROUTED_ROWS
+        graph_rows = self.graph_routed_rows
         if self.execution in ("full_graph",):
             capture_query = getattr(torch.npu, "is_current_stream_capturing", None)
             capturing = capture_query is not None and capture_query()

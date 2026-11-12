@@ -246,7 +246,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         group_list_type = kwargs_mc2["expert_token_nums_type"]
         return MoETokenDispatchOutput(
             hidden_states=expand_x,
-            dynamic_scale=dynamic_scale,
+            # BF16 communication (quant_mode=0) yields an uninitialized
+            # placeholder scale tensor from the dispatch op. Pass None unless
+            # activations are actually quantized before dispatch, mirroring
+            # the AllGather dispatcher contract consumed by unified_apply_mlp.
+            dynamic_scale=dynamic_scale if token_dispatch_input.quant.dispatch_with_quant else None,
             group_list=expert_token_nums,
             group_list_type=group_list_type,
             combine_metadata=MoEMC2CombineMetadata(

@@ -248,7 +248,9 @@ def read_gs32_header(path):
 
 def validate_gs32_options(config, options):
     required = {"gs32_library", "gs32_binary"}
-    optional = {"gs32_execution", "gs32_fusion", "eplb", "eplb_options"}
+    # gs32_graph_routed_rows: whole-graph routed-row budget for DP-attention
+    # captures (dp_size * max_query_len * topk); default keeps the B1 contract.
+    optional = {"gs32_execution", "gs32_fusion", "eplb", "eplb_options", "gs32_graph_routed_rows"}
 
     if (
         not required.issubset(options)
