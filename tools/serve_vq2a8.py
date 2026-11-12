@@ -36,6 +36,17 @@ def parse_args(argv=None):
     parser.add_argument("--gs32-library", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--gs32-binary", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--gs32-backend", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--eplb",
+        choices=("off", "static", "dynamic", "static_uniform", "dynamic_uniform"),
+        default="off",
+        help="mixed-precision EPLB mode (mp); off keeps baseline byte-identical",
+    )
+    parser.add_argument(
+        "--eplb-options",
+        default="",
+        help='eplb_options JSON, e.g. {"K":8,"R_vq2":16,"R_mx4":8,"n_stage":2,"w_lo":0.2,"w_hi":5.0,"ewma_lambda":0.05}',
+    )
     parser.add_argument("--enforce-eager", action="store_true", help="Run the same full FFN without decode graphs")
     parser.add_argument(
         "--dspark",
@@ -268,6 +279,11 @@ def build_command(args):
     if any(not path.is_file() for path in native.values()):
         raise ValueError("GS32 native library and kernel binary must be regular files.")
     additional["vq2a8"].update({name: str(path) for name, path in native.items()})
+    # Mixed-precision EPLB passthrough (mp): off by default (not injected).
+    if args.eplb != "off":
+        additional["vq2a8"]["eplb"] = args.eplb
+        if args.eplb_options:
+            additional["vq2a8"]["eplb_options"] = json.loads(args.eplb_options)
     command = [
         sys.executable,
         "-m",

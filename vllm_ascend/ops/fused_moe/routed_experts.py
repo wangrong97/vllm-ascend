@@ -680,8 +680,12 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             topk_weights = torch.cat([topk_weights, shared_expert_weights], dim=1)
         if get_ascend_config().enable_force_eplb:
             topk_ids = get_force_eplb_topk(topk_ids, num_logical_experts)
-        elif enable_force_load_balance and self.quant_type == QuantType.VQ2A8:
-            # Profile only experts present in this checkpoint's sparse inventory.
+        # DEBUG 2026-10-31: the VQ2A8-specific replacement (resident-only
+        # ids) is disabled — under EP4 the MC2 dispatch expects global expert
+        # ids, and resident ids can desynchronize the group layout. Fall
+        # through to the generic branch which samples across all logical
+        # experts.
+        if False and enable_force_load_balance and self.quant_type == QuantType.VQ2A8:
             stored_ids = torch.tensor(self.vq2a8_expert_ids, device=topk_ids.device, dtype=topk_ids.dtype)
             slots = torch.randint(len(self.vq2a8_expert_ids), topk_ids.shape, device=topk_ids.device)
             topk_ids = stored_ids[slots]

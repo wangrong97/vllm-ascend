@@ -198,7 +198,9 @@ def validate_vq2a8_config(config) -> dict:
             raise ValueError("GS32 full_graph requires multistream_dsv4_dsa_overlap=false.")
     elif not config.model_config.enforce_eager or graph_mode not in ("NONE", "0"):
         raise ValueError("GS32 staged execution requires eager execution and graph mode NONE.")
-    if any(getattr(config, name, None) is not None for name in ("lora_config", "kv_transfer_config")):
+    # NOTE: kv_transfer_config is allowed for PD disaggregation
+    # (MooncakeHybridConnector producer/consumer).
+    if any(getattr(config, name, None) is not None for name in ("lora_config",)):
         raise ValueError("VQ2A8 does not yet support LoRA or KV transfer.")
     if getattr(config.scheduler_config, "async_scheduling", False):
         raise ValueError("VQ2A8 currently requires synchronous scheduling.")
