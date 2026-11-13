@@ -10,7 +10,8 @@ tools/eplb/
 │   ├── eplb_tools/       # 专家分配与负载采集
 │   └── kv_debug/         # KV block/layer dump hook(E5/E6 实验)
 ├── convert/              # 权重格式转换(W4A4→vq2a8 / 反量化)
-└── eval/                 # 评测编排(baseline vs W2A8 对比)
+├── eval/                 # 评测编排(baseline vs W2A8 对比)
+└── serve/                # 服务启动(PD 分离 eager+graph / 详见 serve/README.md)
 ```
 
 ## 1. collect/eplb_tools — 专家分配与负载采集
