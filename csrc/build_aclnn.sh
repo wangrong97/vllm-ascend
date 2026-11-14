@@ -259,7 +259,9 @@ log_selected_ops
   cd "${ROOT_DIR}/csrc"
   log "subshell cwd after cd=$(pwd)"
   log "preserving csrc/build and cleaning output dirs"
-  rm -rf -- output build_out
+  # build_cache 也必须清: 主 cmake(Makefiles) configure 时子算子会在其中留
+  # Makefiles cache, 与 build.sh 的 -G Ninja 冲突(generator mismatch)
+  rm -rf -- output build_out build_cache
 
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"
   : "${SOC_VERSION:?SOC_VERSION is not set}"

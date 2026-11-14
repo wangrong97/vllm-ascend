@@ -141,7 +141,7 @@ function set_env() {
 
 function build() {
     cd ${PATH_TO_BUILD}
-    cmake ${PATH_TO_SOURCE} \
+    cmake -G Ninja ${PATH_TO_SOURCE} \
         -DBUILD_OPEN_PROJECT=${BUILD_OPEN_PROJECT} \
         -DPREPARE_BUILD=ON \
         -DCUSTOM_ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH} \
@@ -166,7 +166,7 @@ function build() {
         -DVERSION=${VERSION} \
         -DENABLE_OOM=${ENABLE_OOM}
         
-    make ${JOB_NUM} prepare_build
+    cmake --build . --target prepare_build -- -j${JOB_NUM}
 }
 
 function main() {

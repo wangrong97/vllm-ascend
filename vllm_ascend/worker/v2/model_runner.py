@@ -670,7 +670,22 @@ class NPUModelRunner(GPUModelRunner):
             *(table for table, *_ in borrowed),
             *cache_views,
         ]
+        # Fix 561103: CANN AsStrided tiling rejects non-contiguous slices whose
+        # element count can exceed the (narrower) backing array on some DP ranks.
+        # Clamp every slice to its own capacity and materialize contiguous
+        # copies so clone() takes the plain d2d path.
+        sm_capacity = self.block_tables.slot_mappings.shape[-1]
+        buffers[6] = self.block_tables.slot_mappings[:, : min(num_tokens, sm_capacity)]
+        buffers = [b.contiguous() if b.is_npu and not b.is_contiguous() else b for b in buffers]
         torch.npu.synchronize()
+        # DEBUG 561103: dump buffer shapes before clone
+        import logging as _logging
+        _logger = _logging.getLogger("vllm_ascend.gs32_warmup_probe")
+        for _bi, _buf in enumerate(buffers):
+            try:
+                _logger.warning("PROBE buf[%d] shape=%s dtype=%s ptr_ok=%s", _bi, tuple(_buf.shape), _buf.dtype, _buf.is_npu)
+            except Exception as _e:
+                _logger.warning("PROBE buf[%d] FAILED: %s", _bi, _e)
         snapshots = [(buffer, buffer.clone()) for buffer in buffers]
         old_metadata = getattr(self.model_state, "attn_metadata", None)
         try:

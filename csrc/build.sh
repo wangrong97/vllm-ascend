@@ -393,7 +393,10 @@ function cmake_config()
 {
     local extra_option="$1"
     log "Info: cmake config generator=${CMAKE_GENERATOR_ARGS[*]:-<default>} ${CUSTOM_OPTION} ${extra_option} build_cache=${BUILD_CACHE_DIR} ."
-    cmake "${CMAKE_GENERATOR_ARGS[@]}" .. ${CUSTOM_OPTION} ${extra_option} -DVLLM_ASCEND_BUILD_CACHE_DIR="${BUILD_CACHE_DIR}"
+    # SUPPRESS_REGENERATION: NFS 时钟偏移(~52s)会让 ninja 误判 manifest dirty
+    # 触发 regenerate 死循环/失败; 写入 cache 后对复用 csrc/build 的主构建同样生效
+    cmake "${CMAKE_GENERATOR_ARGS[@]}" "${BASE_PATH}" ${CUSTOM_OPTION} ${extra_option} \
+        -DCMAKE_SUPPRESS_REGENERATION=ON -DVLLM_ASCEND_BUILD_CACHE_DIR="${BUILD_CACHE_DIR}"
 }
 
 function build()
@@ -561,7 +564,7 @@ build_lib() {
     mkdir -p "${BUILD_PATH}"
   fi
 
-  cd "${BUILD_PATH}" && cmake .. ${CUSTOM_OPTION} -DENABLE_BUILT_IN=ON
+  cd "${BUILD_PATH}" && cmake "${BASE_PATH}" ${CUSTOM_OPTION} -DENABLE_BUILT_IN=ON
 
   for lib in "${BUILD_LIBS[@]}"; do
     echo "Building target ${lib}"
@@ -579,7 +582,7 @@ build_static_lib() {
     echo "Start to build static lib."
 
     git submodule init && git submodule update
-    cd "${BUILD_PATH}" && cmake ${CUSTOM_OPTION} .. -DENABLE_STATIC=ON -DASCEND_COMPUTE_UNIT=${unit}
+    cd "${BUILD_PATH}" && cmake ${CUSTOM_OPTION} "${BASE_PATH}" -DENABLE_STATIC=ON -DASCEND_COMPUTE_UNIT=${unit}
     local all_targets=$(cmake --build . --target help)
     rm -fr ${BUILD_PATH}/bin_tmp
     mkdir -p ${BUILD_PATH}/bin_tmp
@@ -596,7 +599,7 @@ build_static_lib() {
     python3 "${BASE_PATH}/scripts/util/build_opp_kernel_static.py" GenStaticOpResourceIni -s ${unit} -b ${BUILD_PATH} ${jit_command}   
     python3 "${BASE_PATH}/scripts/util/build_opp_kernel_static.py" StaticCompile -s ${unit} -b ${BUILD_PATH} -n=0 -a=${ARCH_INFO} ${jit_command}
 
-    cd "${BUILD_PATH}" && cmake ${CUSTOM_OPTION} .. -DENABLE_STATIC=ON -DASCEND_COMPUTE_UNIT=${unit}
+    cd "${BUILD_PATH}" && cmake ${CUSTOM_OPTION} "${BASE_PATH}" -DENABLE_STATIC=ON -DASCEND_COMPUTE_UNIT=${unit}
     cmake --build . --target cann_transformer_static ${JOB_NUM}
     echo "Build static lib success!"
 }
