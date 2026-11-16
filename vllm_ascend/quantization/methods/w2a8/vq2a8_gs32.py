@@ -93,11 +93,12 @@ class AscendGS32FusedMoEScheme(AscendMoEScheme):
                     native_field = SOURCE_TO_NATIVE[source_field]
                     name = f"{prefix}_{native_field}"
                     dtype, shape = native_fields[native_field]
-                    # MP-EPLB capacity reservation (doc 2.5-D): tail spare
-                    # slots keep the bank's dim-0 constant for the whole run
-                    # so plans/captured graphs never need rebuilding.
-                    spare = self.mp_eplb.replica_slots[quant_type] // self.placement.ep_size
-                    result[name] = torch.empty((len(ids) + spare, *shape), dtype=dtype)
+                    # Parameters stay at checkpoint shape: the weight loader
+                    # validates shape match and a +spare dim-0 silently kills
+                    # the worker during startup (DP Coordinator then hangs).
+                    # Spare capacity lives only in build_full_ffn_bank (a
+                    # non-parameter buffer) which is safe to resize.
+                    result[name] = torch.empty((len(ids), *shape), dtype=dtype)
                     self.parameter_experts[name] = {expert: slot for slot, expert in enumerate(ids)}
                     self.loaded_experts[name] = set()
                     self.parameter_metadata[name] = (kind, quant_type, source_field, spec)

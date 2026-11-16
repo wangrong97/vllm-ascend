@@ -164,9 +164,10 @@ function build() {
         -DCANN_3RD_LIB_PATH=${CANN_3RD_LIB_PATH} \
         -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
         -DVERSION=${VERSION} \
-        -DENABLE_OOM=${ENABLE_OOM}
-        
-    cmake --build . --target prepare_build -- -j${JOB_NUM}
+        -DENABLE_OOM=${ENABLE_OOM} \
+        -DCMAKE_SUPPRESS_REGENERATION=ON
+
+    cmake --build . --target prepare_build -- ${JOB_NUM}
 }
 
 function main() {

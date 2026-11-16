@@ -74,7 +74,7 @@ echo "[PD] P(eager·W2A8·dp4ep4) pid=$P_PID devices=0-3 :9001"
 # ---- D: graph B64 decode(卡4-7, :9002, consumer) ----
 ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=22500-25000 \
   python -u -m vllm.entrypoints.cli.main serve "$MODEL_D" "${COMMON[@]}" \
-  --compilation-config '{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64], "max_cudagraph_capture_size": 64, "cudagraph_num_of_warmups": 1}' \
+  --compilation-config '{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}' \
   --data-parallel-rpc-port 29551 --host 127.0.0.1 --port 9002 \
   --additional-config '{"enable_flashcomm1": false, "mix_placement": false, "multistream_dsv4_dsa_overlap": false, "vq2a8": {"gs32_execution": "full_graph", '"$VQ2A8_COMMON"', '"$D_EPLB_CFG"'}, "ascend_compilation_config": {"enable_npugraph_ex": false}}' \
   --kv-transfer-config '{"kv_connector": "MooncakeHybridConnector", "kv_role": "kv_consumer", "kv_port": "20002", "engine_id": "1", "kv_connector_extra_config": {"prefill": {"dp_size": 4, "tp_size": 1}, "decode": {"dp_size": 4, "tp_size": 1}}}' &
@@ -86,11 +86,14 @@ trap 'echo "[PD] stopping"; kill $P_PID $D_PID 2>/dev/null; sleep 10
   for p in $(npu-smi info | sed -n "/Process id/,\$p" | awk -F"|" "NF>4 {gsub(/ /,\"\",\$6); if (\$6+0>1000) print \$6}"); do kill -9 "$p" 2>/dev/null; done' INT TERM EXIT
 
 if [[ "${1:-}" == "--with-proxy" ]]; then
-  (sleep 5; until curl -s --max-time 3 http://127.0.0.1:9001/v1/models >/dev/null 2>&1 && curl -s --max-time 3 http://127.0.0.1:9002/v1/models >/dev/null 2>&1; do sleep 10; done
-   nohup python3 "$REPO/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py" \
-     --host 127.0.0.1 --port 8000 --prefiller-ports 9001 --decoder-ports 9002 --workers 1 \
-     > "$REPO/proxy_8000.log" 2>&1 &
-   echo "[PD] proxy :8000 就绪") &
+  # NOTE: 不用子shell+wait — proxy 的子shell fork nohup后立即退出,
+  # 会被下方 wait -n 捕获为"one instance exited"导致误杀 P/D。
+  # 改为直接后台 nohup(proxy内部有uvicorn retry, 无需等PD就绪):
+  nohup python3 "$REPO/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py" \
+    --host 127.0.0.1 --port 8000 --prefiller-ports 9001 --decoder-ports 9002 --workers 1 \
+    > "$REPO/proxy_8000.log" 2>&1 &
+  PROXY_WRAPPER_PID=$!
+  echo "[PD] proxy :8000 后台启动(直连,无子shell) wrapper_pid=$PROXY_WRAPPER_PID"
 fi
 
 wait -n

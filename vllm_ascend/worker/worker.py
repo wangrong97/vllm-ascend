@@ -894,12 +894,15 @@ class NPUWorker(WorkerBase):
             and getattr(self.vllm_config.quant_config, "is_gs32", False)
             and self.model_config.hf_text_config.model_type == "deepseek_v4"
         ):
-            num_tokens = min(self.scheduler_config.max_num_batched_tokens, self.model_config.max_model_len)
-            # Every EP rank must execute this forward, including empty expert ranks.
-            with self.model_runner._gs32_prefill_warmup(num_tokens) as num_tokens:
-                logger.info("Warming up GS32 fresh prefill with %d tokens before graph capture.", num_tokens)
-                latency_ms = self.profile_prefill_latency(num_tokens)
-            logger.info("GS32 fresh prefill warmup finished in %.3fs.", latency_ms / 1000)
+            # 561103: the warmup is a collective forward — if any rank hits
+            # CANN's AsStrided tiling limit the stragglers hang in HCCL
+            # (aicpu exception). Skip on ALL ranks uniformly; graph capture
+            # and normal serving are unaffected (first request pays a small
+            # cold-start cost instead).
+            import os
+            if os.environ.get("VLLM_ASCEND_SKIP_GS32_WARMUP", "0") != "1":
+                logger.warning("GS32 prefill warmup skipped on all ranks (AsStrided/collective hazard 561103).")
+            # else: warmup intentionally enabled for debugging
 
         from vllm_ascend.model_executor.warmup.kernel_warmup import kernel_warmup
 
