@@ -8,7 +8,7 @@ set -uo pipefail
 REPO=/mnt/share/w00608002/work/eplb/vllm-ascend
 SERVE="$REPO/tools/eplb/serve/run_pd_w2a8_eager_graph.sh"
 MODEL=/mnt/share/w00608002/weight/DeepSeek-V4-Flash-0731-32x32-noperm-hot5050125-identity-v3-export-20261103
-OUT="/mnt/share/w00608002/work/eplb/output/eplb_perf_$(date +%m%d_%H%M)"
+OUT="${EPLB_PERF_OUT:-/mnt/share/w00608002/work/eplb/output/eplb_perf_$(date +%m%d_%H%M)}"
 mkdir -p "$OUT"; echo "$OUT" > /tmp/eplb_perf_dir
 OPTS='{"K":8,"R_vq2":16,"R_mx4":8,"n_stage":2,"w_lo":0.2,"w_hi":5.0,"ewma_lambda":0.05}'
 PD_PID=""; PROXY_PID=""
@@ -91,11 +91,18 @@ run_group() {  # $1=tag $2=eplb模式
   return 0
 }
 
-run_group off off
-run_group dynamic dynamic
-run_group uniform dynamic_uniform
+# 组列表可由环境变量指定(autopilot 增量重跑失败组); 默认三组全跑
+GROUPS_RUN="${EPLB_PERF_GROUPS:-off dynamic uniform}"
+for g in $GROUPS_RUN; do
+  case "$g" in
+    off)     run_group off off ;;
+    dynamic) run_group dynamic dynamic ;;
+    uniform) run_group uniform dynamic_uniform ;;
+    *) echo "[skip] 未知组: $g" | tee -a "$OUT/summary.txt" ;;
+  esac
+done
 echo "===== 全部完成 $(date '+%F %T') =====" | tee -a "$OUT/summary.txt"
-for tag in off dynamic uniform; do
+for tag in $GROUPS_RUN; do
   echo "----- [$tag] perf 摘要 -----"
   find "$OUT/$tag/aisbench/summary" -name '*.md' 2>/dev/null | head -1 | xargs cat 2>/dev/null | head -25
 done

@@ -244,12 +244,26 @@ class GS32ExpertWeights:
         self.full_ffn_graph_captures = 0
         self.full_ffn_plan = None
         self.full_ffn_limit = bank["swiglu_limit"]
-        self.full_ffn_expert_ids = torch.tensor(bank["expert_ids"], dtype=torch.int64, device=self.device)
+        # Spare slots must NOT carry -1 as expert ID into the kernel — the
+        # native routing interprets it as an invalid index, corrupting the
+        # route metadata (strictly-increasing violation → garbage output).
+        #
+        # Initial state: spare slots alias the FIRST live expert as a safe
+        # placeholder (count=0, kernel treats them like any count-0 group).
+        # `full_ffn_spare_indices` tracks which slots are spare (by position,
+        # derived from bank expert_ids == -1). commit hooks use this set,
+        # NOT expert_ids == -1, to identify empty slots.
+        bank_ids = list(bank["expert_ids"])
+        first_live = next((e for e in bank_ids if e >= 0), 0)
+        routed_ids = [e if e >= 0 else first_live for e in bank_ids]
+        self.full_ffn_spare_indices = frozenset(i for i, e in enumerate(bank_ids) if e < 0)
+        self.full_ffn_expert_ids = torch.tensor(routed_ids, dtype=torch.int64, device=self.device)
         self.full_ffn_logical_slots = torch.full((self.num_experts,), -1, dtype=torch.int64, device=self.device)
         if self.expert_slots:
-            live_ids_tensor = self.full_ffn_expert_ids[: len(self.expert_slots)]
+            live_ids_list = [e for e in bank_ids if e >= 0]
+            live_ids_tensor = torch.tensor(live_ids_list, dtype=torch.int64, device=self.device)
             self.full_ffn_logical_slots[live_ids_tensor] = torch.arange(
-                len(self.expert_slots), device=self.device
+                len(live_ids_list), device=self.device
             )
             self.full_ffn_plan = self.ops.prepare_full_ffn_plan(
                 torch.empty((1, self.specs["gate_up"].columns), dtype=torch.uint8, device=self.device),
@@ -278,6 +292,8 @@ class GS32ExpertWeights:
             return result
         # Sorted resident IDs and zero counts for every missing logical expert
         # make the dispatched live prefix already match the packed bank order.
+        # ALL bank entries (including MXFP4-filled spare sentinels) must be
+        # passed — the kernel validates route count against full bank size.
         counts, route_flags, route_metadata = self.device_router.prepare_identity_metadata(
             hidden,
             group_list,
@@ -405,11 +421,11 @@ class GS32ExpertWeights:
     # -- MP-EPLB P2 commit hooks (value-only index refresh; doc 2.5) ---------
 
     def commit_fill(self, slot, expert):
-        """P2 for a fill move on this rank: EMPTY slot becomes ``expert``."""
+        """P2 for a fill move: SPARE slot becomes ``expert`` (actual selected replica)."""
         if not self.eplb_enabled:
             raise ValueError("MP-EPLB commit hooks require eplb enabled.")
-        if int(self.full_ffn_expert_ids[slot]) != -1:
-            raise ValueError("commit_fill targets an occupied slot.")
+        if slot not in self.full_ffn_spare_indices:
+            raise ValueError("commit_fill targets a non-spare slot.")
         self.full_ffn_expert_ids[slot] = expert
         self.full_ffn_logical_slots[expert] = slot
         self.resident_mask[expert] = True
@@ -420,7 +436,9 @@ class GS32ExpertWeights:
             raise ValueError("MP-EPLB commit hooks require eplb enabled.")
         if int(self.full_ffn_expert_ids[slot]) != expert:
             raise ValueError("commit_evict slot mismatch.")
-        self.full_ffn_expert_ids[slot] = -1
+        # Reset to placeholder (first live expert), NOT -1 (kernel safety).
+        first_live = next(iter(self.expert_slots.values()), 0)
+        self.full_ffn_expert_ids[slot] = first_live
         self.full_ffn_logical_slots[expert] = -1
         self.resident_mask[expert] = False
 
@@ -428,9 +446,9 @@ class GS32ExpertWeights:
         """P2 for the local end of a swap: outgoing expert leaves this rank."""
         if not self.eplb_enabled:
             raise ValueError("MP-EPLB commit hooks require eplb enabled.")
+        if slot not in self.full_ffn_spare_indices:
+            raise ValueError("commit_swap targets a non-spare slot.")
         outgoing = int(self.full_ffn_expert_ids[slot])
-        if outgoing < 0:
-            raise ValueError("commit_swap targets an empty slot.")
         self.full_ffn_expert_ids[slot] = incoming_expert
         self.full_ffn_logical_slots[outgoing] = -1
         self.full_ffn_logical_slots[incoming_expert] = slot

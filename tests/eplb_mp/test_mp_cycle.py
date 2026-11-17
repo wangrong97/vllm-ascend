@@ -252,7 +252,9 @@ class TestGS32SwitchGating:
         # spare = R_vq2(default 4) // ep_size(2) = 2 extra tail slots.
         assert weights.full_ffn_bank["spare_slots"] == {"vq2": 2, "mxfp4": 1}
         ids = weights.full_ffn_expert_ids.tolist()
-        assert ids[:4] == [0, 1, 2, 3] and ids[-3:] == [-1, -1, -1]
+        # spare slots carry first_live placeholder (NOT -1 — kernel safety).
+        assert ids[:4] == [0, 1, 2, 3] and ids[-3:] == [0, 0, 0]
+        assert weights.full_ffn_spare_indices == frozenset({4, 5, 6})
         slots = weights.full_ffn_logical_slots.tolist()
         assert slots[0] == 0 and slots[7] == -1
         assert bool(weights.resident_mask[:4].all()) and not bool(weights.resident_mask[4:].any())
@@ -274,16 +276,16 @@ class TestGS32SwitchGating:
 
     def test_commit_hooks_update_indexes(self):
         weights = _make_weights("static", ep_size=2)
-        spare_slot = 4  # first trailing EMPTY(-1) slot (local experts 0..3)
+        spare_slot = 4  # first trailing spare slot (local experts 0..3)
         weights.commit_fill(spare_slot, 6)
-        assert int(weights.full_ffn_expert_ids[spare_slot]) == 6
+        assert int(weights.full_ffn_expert_ids[spare_slot]) == 6  # actual expert ID
         assert int(weights.full_ffn_logical_slots[6]) == spare_slot
         assert bool(weights.resident_mask[6])
-        outgoing = weights.commit_swap(0, 6)
-        assert outgoing == 0
-        assert int(weights.full_ffn_logical_slots[0]) == -1 and int(weights.full_ffn_logical_slots[6]) == 0
-        weights.commit_evict(0, 6)
-        assert int(weights.full_ffn_logical_slots[6]) == -1 and not bool(weights.resident_mask[6])
+        outgoing = weights.commit_swap(spare_slot, 7)
+        assert outgoing == 6  # expert 6 leaves, expert 7 arrives
+        assert int(weights.full_ffn_logical_slots[6]) == -1 and int(weights.full_ffn_logical_slots[7]) == spare_slot
+        weights.commit_evict(spare_slot, 7)
+        assert int(weights.full_ffn_logical_slots[7]) == -1 and not bool(weights.resident_mask[7])
 
 
 class TestFullFFNRuntimeWiring:

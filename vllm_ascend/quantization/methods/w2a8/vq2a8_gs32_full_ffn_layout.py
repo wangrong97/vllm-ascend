@@ -98,8 +98,11 @@ def build_full_ffn_bank(layer, layer_spec, *, swiglu_limit, spare_slots=None):
         if quant not in ("vq2", "mxfp4"):
             raise ValueError(f"Complete FFN spare capacity quant type must be vq2/mxfp4, got {quant!r}.")
     validate_full_ffn_spec(layer_spec)
-    spare_sequence = ("vq2",) * spare_slots.get("vq2", 0) + ("mxfp4",) * spare_slots.get("mxfp4", 0)
-    experts = tuple(layer_spec.expert_ids) + (-1,) * len(spare_sequence)
+    # All spare slots use MXFP4 (4-bit) format so any expert (2-bit or 4-bit)
+    # can land in them, and the w4 flag never changes → plan/graph stable.
+    total_spare = sum(spare_slots.values())
+    spare_sequence = ("mxfp4",) * total_spare
+    experts = tuple(layer_spec.expert_ids) + (-1,) * total_spare
     device = layer.vq2a8_anchor.device
     bank = {"expert_ids": experts, "fields": {}, "weight_offsets": {}, "stage_mask": 0, "spare_slots": spare_slots}
     for kind, prefix, native_name, stage_shift in (("gate_up", "w13", "gate", 0), ("down", "w2", "down", 2)):
@@ -112,19 +115,53 @@ def build_full_ffn_bank(layer, layer_spec, *, swiglu_limit, spare_slots=None):
         }
         offsets = [0]
         for slot, expert in enumerate(experts):
-            quant_type = quant_types[expert] if expert >= 0 else spare_sequence[slot - (len(experts) - len(spare_sequence))]
+            quant_type = quant_types[expert] if expert >= 0 else spare_sequence[slot - (len(experts) - total_spare)]
             offsets.append(offsets[-1] + rows * columns // (2 if quant_type == "mxfp4" else 4))
         table_bytes = rows * columns // SCALE_GROUP
         weight = torch.empty(offsets[-1], dtype=torch.uint8, device=device)
         table = torch.full((len(experts) * table_bytes,), 0, dtype=torch.uint8, device=device)
         row_scale = torch.full((len(experts), rows), FP32_ONE_BITS, dtype=torch.int64, device=device)
         flags = tuple(
-            (quant_types[expert] == "mxfp4") if expert >= 0 else (spare_sequence[slot - (len(experts) - len(spare_sequence))] == "mxfp4")
+            (quant_types[expert] == "mxfp4") if expert >= 0 else True  # spare always mxfp4
             for slot, expert in enumerate(experts)
         )
         for slot, expert in enumerate(experts):
             if expert < 0:
-                continue  # EMPTY capacity: zeroed bytes, neutral one-scales.
+                # Spare slot: copy data from the first mxfp4 expert (or
+                # quantize the first vq2 expert's data to mxfp4) so the
+                # kernel processes valid weights, not zeros.
+                donor = next((e for e in layer_spec.expert_ids if quant_types[e] == "mxfp4"), None)
+                if donor is None:
+                    donor = layer_spec.expert_ids[0]  # all-vq2 checkpoint: use expert 0
+                    # vq2 weights in a 4-bit slot: copy bytes + mark flag as
+                    # vq2-compatible (kernel reads same byte count for decode)
+                    # For simplicity, zero-padded to mxfp4 slot size — the
+                    # routing never sends tokens here so the data is inert.
+                    src = typed_slots["vq2"].get(donor, 0)
+                    packed = getattr(layer, f"{prefix}_packed_zn")[src]
+                    if kind == "gate_up":
+                        packed = interleave_gate_up_blocks(packed)
+                    weight[offsets[slot] : offsets[slot] + packed.numel()].copy_(packed.reshape(-1))
+                    table[slot * table_bytes : (slot + 1) * table_bytes].copy_(
+                        getattr(layer, f"{prefix}_pair_lut")[src].reshape(-1)
+                    )
+                    row_scale[slot].copy_(getattr(layer, f"{prefix}_row_scale_bits")[src])
+                    continue
+                # mxfp4 donor: straightforward copy
+                source_slot = typed_slots["mxfp4"][donor]
+                packed = pack_mxfp4_zn(getattr(layer, f"{prefix}_mxfp4_weight")[source_slot])
+                source_table = getattr(layer, f"{prefix}_mxfp4_scale")[source_slot]
+                if kind == "gate_up":
+                    packed = interleave_gate_up_blocks(packed)
+                    source_table = interleave_gate_up_blocks(source_table.reshape(rows // N_TILE, N_TILE, -1))
+                weight[offsets[slot] : offsets[slot + 1]].copy_(packed.reshape(-1))
+                table[slot * table_bytes : (slot + 1) * table_bytes].copy_(source_table.reshape(-1))
+                row_scale[slot].copy_(
+                    getattr(layer, f"{prefix}_mxfp4_scale")[source_slot].reshape(rows, -1).max(dim=1).values.view(torch.int64)
+                    if False else  # row_scale for mxfp4 is unit-1 scale
+                    torch.full((rows,), FP32_ONE_BITS, dtype=torch.int64, device=device)
+                )
+                continue
             quant_type = quant_types[expert]
             source_slot = typed_slots[quant_type][expert]
             if quant_type == "vq2":
