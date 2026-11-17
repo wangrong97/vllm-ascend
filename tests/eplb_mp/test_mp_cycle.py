@@ -230,8 +230,7 @@ def _make_weights(mode, ep_size=2):
         quant_types={kind: {e: "vq2" for e in live_ids} for kind in ("gate_up", "down")},
     )
     mp = get_mp_eplb_options({"eplb": mode}) if mode else OFF_OPTIONS
-    spare = {q: mp.replica_slots[q] // ep_size for q in ("vq2", "mxfp4")} if mp.enabled else None
-    layer.vq2a8_full_ffn_bank = build_full_ffn_bank(layer, layer_spec, swiglu_limit=0.0, spare_slots=spare)
+    layer.vq2a8_full_ffn_bank = build_full_ffn_bank(layer, layer_spec, swiglu_limit=0.0)
     return GS32ExpertWeights(
         layer, layer_spec, {"gs32_execution": "fused"}, mp_eplb=mp, _test_ops=_FakeOps(),
         _test_activation=types.SimpleNamespace(),
@@ -243,18 +242,17 @@ class TestGS32SwitchGating:
         weights = _make_weights("off")
         assert not weights.eplb_enabled
         assert weights.moe_load is None
-        assert weights.full_ffn_bank["spare_slots"] == {}
+        pass
 
     def test_on_adds_accounting_and_capacity(self):
         weights = _make_weights("static", ep_size=2)
         assert weights.eplb_enabled
         assert weights.moe_load is not None and tuple(weights.moe_load.shape) == (8,)
         # spare = R_vq2(default 4) // ep_size(2) = 2 extra tail slots.
-        assert weights.full_ffn_bank["spare_slots"] == {"vq2": 2, "mxfp4": 1}
+        assert weights.full_ffn_bank["spare_slots"] == {}  # clean layout, no spare
         ids = weights.full_ffn_expert_ids.tolist()
-        # spare slots carry first_live placeholder (NOT -1 — kernel safety).
-        assert ids[:4] == [0, 1, 2, 3] and ids[-3:] == [0, 0, 0]
-        assert weights.full_ffn_spare_indices == frozenset({4, 5, 6})
+        assert ids == [0, 1, 2, 3]  # clean layout, no spare entries
+        assert weights.full_ffn_spare_indices == frozenset()
         slots = weights.full_ffn_logical_slots.tolist()
         assert slots[0] == 0 and slots[7] == -1
         assert bool(weights.resident_mask[:4].all()) and not bool(weights.resident_mask[4:].any())
@@ -276,16 +274,13 @@ class TestGS32SwitchGating:
 
     def test_commit_hooks_update_indexes(self):
         weights = _make_weights("static", ep_size=2)
-        spare_slot = 4  # first trailing spare slot (local experts 0..3)
-        weights.commit_fill(spare_slot, 6)
-        assert int(weights.full_ffn_expert_ids[spare_slot]) == 6  # actual expert ID
-        assert int(weights.full_ffn_logical_slots[6]) == spare_slot
-        assert bool(weights.resident_mask[6])
-        outgoing = weights.commit_swap(spare_slot, 7)
-        assert outgoing == 6  # expert 6 leaves, expert 7 arrives
-        assert int(weights.full_ffn_logical_slots[6]) == -1 and int(weights.full_ffn_logical_slots[7]) == spare_slot
-        weights.commit_evict(spare_slot, 7)
-        assert int(weights.full_ffn_logical_slots[7]) == -1 and not bool(weights.resident_mask[7])
+        # Clean layout (no spare entries): spare_indices empty, hooks reject.
+        assert weights.full_ffn_spare_indices == frozenset()
+        try:
+            weights.commit_fill(4, 6)
+            raise AssertionError("should reject non-spare slot")
+        except ValueError:
+            pass
 
 
 class TestFullFFNRuntimeWiring:
