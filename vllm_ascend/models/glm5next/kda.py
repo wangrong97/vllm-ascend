@@ -269,10 +269,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 ):
                     kda_quantized = True
                     break
+        saved_quant_config = vllm_config.quant_config
         if kda_quantized:
             super().__init__(config, vllm_config, prefix)
         else:
-            saved_quant_config = vllm_config.quant_config
             try:
                 vllm_config.quant_config = None
                 super().__init__(config, vllm_config, prefix)

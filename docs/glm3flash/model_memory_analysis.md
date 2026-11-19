@@ -1,6 +1,6 @@
 # GLM-5.3-Flash 与 10T 外推版：参数对比与 TP/DP/EP 显存分析
 
-> 数据源: 320B 版为 W4A4 量化产物实测 (`/mnt/share/w00608002/weight/GLM-5.3-Flash-w4a4`); 10T 版为 `/mnt/share/w00608002/config.json` 结构推算(同 W4A4 量化策略)。
+> 数据源: 320B 版为 W4A4 量化产物实测 (`/mnt/share/w00608002/weight/GLM-5.3-Flash-BF16-w4a4`); 10T 版为 `/mnt/share/w00608002/config.json` 结构推算(同 W4A4 量化策略)。
 > 创建: 2026-11-05 | 硬件基准: Ascend950DT 96GB/卡 (可用 91.75 GiB, util=0.9 预算 82.6 GiB)
 
 ## 1. 模型参数对比

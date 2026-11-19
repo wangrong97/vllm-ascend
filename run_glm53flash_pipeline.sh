@@ -27,7 +27,7 @@ VLLM_ASCEND=/mnt/share/w00608002/work/vllm-ascend
 BENCH=/mnt/share/w00608002/work/benchmark
 MSMODELSLIM=/mnt/share/w00608002/work/msmodelslim
 BASELINE_WEIGHTS=/mnt/share/w00936111/weights/GLM-5.3-Flash
-W4A4_WEIGHTS=/mnt/share/w00608002/weight/GLM-5.3-Flash-w4a4
+W4A4_WEIGHTS=/mnt/share/w00608002/weight/GLM-5.3-Flash-BF16-w4a4
 SERVE_PORT=9000    # ais_bench 模型配置 vllm_api_general_chat_glm 写死 9000
 
 cd "${VLLM_ASCEND}"   # 固定工作目录, 避免依赖调用处的 cwd

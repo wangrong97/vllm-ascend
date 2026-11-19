@@ -21,7 +21,7 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/server_single_$(date +%m%d_%H%M%S).log"
 
 # ---- 参数(可用环境变量覆盖) ----
-export MAX_MODEL_LEN=${MAX_MODEL_LEN:-132096}
+export MAX_MODEL_LEN=${MAX_MODEL_LEN:-166912}   # 2026-11-12: 132096→166912, 配合官方 max_out 163840(截断分析见 experiment_tracking §6.20)
 export MAX_NUM_SEQS=${MAX_NUM_SEQS:-64}
 export MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 export GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.9}
@@ -31,6 +31,9 @@ LOAD_FORMAT=${LOAD_FORMAT:-}                           # 置 dummy 则跳过真�
 # 注册的 AscendFp8Config 自动接管, 不能显式传 --quantization ascend (两者冲突)。
 # 若换成 quant_method=ascend 的 ModelSlim checkpoint, 设 QUANT_METHOD=ascend。
 QUANT_METHOD=${QUANT_METHOD:-}
+# TP_SIZE: 默认 8(全机); 4=后四卡, 2=前四卡等, 配合 ASCEND_RT_VISIBLE_DEVICES
+# KV_CACHE_DTYPE: fp8(默认, MLA KV 量化) / bfloat16(全精度 KV, 基线实验用)
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8}
 # 编译配置: 可用 COMPILATION_CONFIG 整体覆盖(如 A/B 实验关 quant_fp8 融合:
 # COMPILATION_CONFIG='{"cudagraph_mode":"FULL_DECODE_ONLY","custom_ops":["all","-quant_fp8"]}')
 COMPILATION_CONFIG=${COMPILATION_CONFIG:-'{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1,2,4,8,16,32,64,96,128]}'}
@@ -115,11 +118,11 @@ SERVE_CMD=(
   vllm serve "${MODEL_PATH}"
   --host 0.0.0.0
   --port "${PORT}"
-  --tensor-parallel-size 8
+  --tensor-parallel-size "${TP_SIZE:-8}"
   --enable-expert-parallel
   --seed 1024
   --served-model-name glm
-  --kv-cache-dtype fp8
+  --kv-cache-dtype "${KV_CACHE_DTYPE}"
   --max-model-len "${MAX_MODEL_LEN}"
   --max-num-seqs "${MAX_NUM_SEQS}"
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"

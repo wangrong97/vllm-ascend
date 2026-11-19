@@ -455,6 +455,7 @@ def bootstrap_custom_op_env(*, include_vendor_lib: bool = False) -> None:
         return
     _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_path)
 
+
     if include_vendor_lib:
         vendor_lib_path = os.path.join(vendor_path, "op_api", "lib")
         if os.path.exists(vendor_lib_path):

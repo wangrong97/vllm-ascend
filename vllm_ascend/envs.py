@@ -92,6 +92,26 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+
+    # Kpool indexer MXFP4 伪量化(A4/C4 数值验证): 1 时 q 打分前与 k 池化写缓存前
+    # 各过一次 MXFP4(e2m1+per-32 E8M0) 量化->反量化往返, 存储/算子路径不变
+    # (bf16 或 fp8 均可叠加)。默认 0 关闭。非敏感变量。
+    "VLLM_ASCEND_KPOOL_MXFP4_SIM": lambda: _bool_env("VLLM_ASCEND_KPOOL_MXFP4_SIM", False),
+
+    # Kpool indexer MXFP8 伪量化: 1 时 q/k 过 MXFP8(e4m3 + per-32 E8M0) 量化->反量化往返,
+    # 注入点与 MXFP4_SIM 相同; 与 MXFP4_SIM 同时开启时 MXFP4 优先。默认 0。
+    "VLLM_ASCEND_KPOOL_MXFP8_SIM": lambda: _bool_env("VLLM_ASCEND_KPOOL_MXFP8_SIM", False),
+
+    # Kpool indexer Hadamard 旋转预处理: 1 时在 indexer 量化(真 C8 / MXFP4 / MXFP8 伪量化)
+    # 前对 q/k 施加 128 维归一化 Hadamard 旋转, 抑制离群值。真量化路径在旋转域存取/打分
+    # (正交不变性保持点积); 伪量化路径旋转->往返->逆旋转回原域。默认 0。
+    "VLLM_ASCEND_KPOOL_HADAMARD_PRE": lambda: _bool_env("VLLM_ASCEND_KPOOL_HADAMARD_PRE", False),
+
+    # Kpool indexer OSCAR 旋转(数据驱动协方差拟合, 见 tools/glm53flash/oscar_indexer_rotation):
+    # =1 时 q/k/尾池 改用 per-layer OSCAR 矩阵(替换 Hadamard; 两者同开时 OSCAR 优先)。
+    # checkpoint 由 tools/glm53flash/oscar_indexer_rotation/oscar_indexer_rotation.py 拟合。
+    "VLLM_ASCEND_KPOOL_OSCAR_ROTATION": lambda: _bool_env("VLLM_ASCEND_KPOOL_OSCAR_ROTATION", False),
+    "VLLM_ASCEND_KPOOL_OSCAR_CKPT": lambda: os.getenv("VLLM_ASCEND_KPOOL_OSCAR_CKPT", ""),
 }
 
 # end-env-vars-definition

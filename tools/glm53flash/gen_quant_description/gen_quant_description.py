@@ -5,7 +5,7 @@
   python3 gen_quant_description.py [config.yaml] [model_dir] [output_json]
 
 默认:
-  config:  /mnt/share/w00608002/weight/GLM-5.3-Flash-w4a4/GLM-5.3-Flash_best_practice.yaml
+  config:  /mnt/share/w00608002/weight/GLM-5.3-Flash-BF16-w4a4/GLM-5.3-Flash_best_practice.yaml
   model:   /mnt/share/w00608002/weight/GLM-5.3-Flash-BF16-fixcfg (读取权重键清单)
   output:  <config 同目录>/quant_model_description.json
 
@@ -25,7 +25,7 @@ import sys
 
 import yaml
 
-DEFAULT_CONFIG = "/mnt/share/w00608002/weight/GLM-5.3-Flash-w4a4/GLM-5.3-Flash_best_practice.yaml"
+DEFAULT_CONFIG = "/mnt/share/w00608002/weight/GLM-5.3-Flash-BF16-w4a4/GLM-5.3-Flash_best_practice.yaml"
 DEFAULT_MODEL = "/mnt/share/w00608002/weight/GLM-5.3-Flash-BF16-fixcfg"
 FLOAT = "FLOAT"
 

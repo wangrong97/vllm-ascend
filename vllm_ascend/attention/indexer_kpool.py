@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cache metadata and execution backends for the GLM-Next pooled indexer."""
 
+import os
+import re
 from dataclasses import dataclass
 from functools import partial
 from importlib import import_module
@@ -20,6 +22,141 @@ from vllm.distributed import (
     get_tp_group,
 )
 from vllm.forward_context import get_forward_context
+
+
+# ---- MXFP4 (e2m1 + per-32 E8M0) 往返工具: A4/C4 数值保真验证 ----
+_E2M1_POSITIVE = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_e2m1_lut_cache: dict = {}
+
+
+def _e2m1_lut(device) -> torch.Tensor:
+    lut = _e2m1_lut_cache.get(device)
+    if lut is None:
+        pos = torch.tensor(_E2M1_POSITIVE, dtype=torch.float32, device=device)
+        lut = torch.cat([pos, -pos]).contiguous()
+        _e2m1_lut_cache[device] = lut
+    return lut
+
+
+def _mxfp4_roundtrip(x: torch.Tensor) -> torch.Tensor:
+    """MXFP4 "C7.25" 量化->反量化往返(伪量化, 仅数值验证, 不改存储/算子路径)。
+
+    权威实现 = CANN npu_dynamic_mx_quant(fp4x2, scale_alg=2, dst_type_max=7.25):
+    scale 为 ceil(log2(amax/7.25)) 的 E8M0 指数, 数据舍入为最近偶(RN-even,
+    实测平局 0.25→0, 0.75→1.0, 1.25→1.0...)。q 打分前与 k 写 cache 前共用
+    本函数, 构造上逐位一致。注: scale_alg=2 为 fp4 专属(fp8 dst 被拒)。
+    """
+    shape = x.shape
+    flat = x.reshape(-1, shape[-1]).contiguous()
+    packed, scale = torch_npu.npu_dynamic_mx_quant(
+        flat, dst_type=torch_npu.float4_e2m1fn_x2, scale_alg=2, dst_type_max=7.25
+    )
+    lut = _e2m1_lut(flat.device)
+    lo = lut[(packed & 0xF).long()]
+    hi = lut[(packed >> 4).long()]
+    deq = torch.stack((lo, hi), dim=-1).flatten(-2)
+    n, d = flat.shape
+    # scale 按 E8M0 对打包([N, groups//2, 2]), 组数为奇时末位是补位, 截取前 groups 个
+    factor = torch.pow(2.0, scale.reshape(n, -1)[:, : d // 32].int() - 127)
+    deq = (deq.view(n, d // 32, 32) * factor.unsqueeze(-1)).view(n, d)
+    return deq.view(shape).to(x.dtype)
+
+
+def _mxfp8_roundtrip(x: torch.Tensor) -> torch.Tensor:
+    """MXFP8 量化->反量化往返(伪量化, 数值验证用)。
+
+    标准 MX: e4m3 数据 + per-32 组 E8M0 scale。CANN npu_dynamic_mx_quant
+    对 fp8 dst 的默认路径(alg0)即此语义(scale=ceil(amax/448) 的 E8M0),
+    舍入为算子原生 RN。注: fp8 dst 不支持 scale_alg=2(仅 fp4 专属)。
+    """
+    shape = x.shape
+    flat = x.reshape(-1, shape[-1]).contiguous()
+    quantized, scale = torch_npu.npu_dynamic_mx_quant(flat, dst_type=torch.float8_e4m3fn)
+    n, d = flat.shape
+    factor = torch.pow(2.0, scale.reshape(n, -1)[:, : d // 32].int() - 127)
+    deq = quantized.float().view(n, d // 32, 32) * factor.unsqueeze(-1)
+    return deq.view(n, d).view(shape).to(x.dtype)
+
+_HADAMARD_128: dict = {}
+
+
+def _get_hadamard128(device) -> torch.Tensor:
+    """归一化 128 阶 Hadamard(对称正交, 逆=自身), 与 DeepSeek LI 路径同构造。"""
+    h = _HADAMARD_128.get(device)
+    if h is None:
+        import scipy.linalg
+
+        h = torch.tensor(scipy.linalg.hadamard(128), dtype=torch.bfloat16, device=device) / (128**0.5)
+        _HADAMARD_128[device] = h
+    return h
+
+
+def _hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+    """对最后一维(128)做 Hadamard 旋转: x @ H。"""
+    return x @ _get_hadamard128(x.device)
+
+
+def _pseudo_quant_with_hadamard(x: torch.Tensor, roundtrip_fn, layer: int = -1) -> torch.Tensor:
+    """伪量化 + 旋转预处理: R -> 量化往返 -> R⁻¹, 返回原域。
+    Hadamard 对称(R⁻¹=R); OSCAR 一般非对称, 用转置(正交保证 RᵀR=I)。"""
+    if _enable_oscar_rotation():
+        mats = _load_oscar_matrices(x.device)
+        r = mats.get(layer)
+        if r is None:
+            return roundtrip_fn(x)  # 该层未拟合, 退化为无旋转
+        return (roundtrip_fn(x @ r)) @ r.T
+    if not _enable_hadamard_pre():
+        return roundtrip_fn(x)
+    return _hadamard_rotate(roundtrip_fn(_hadamard_rotate(x)))
+
+
+def _enable_hadamard_pre() -> bool:
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_KPOOL_HADAMARD_PRE
+
+_OSCAR_MATRICES: dict = {}   # device -> {layer: Tensor[128,128]}
+_OSCAR_LOADED_DEVICES: set = set()
+
+
+def _load_oscar_matrices(device) -> dict:
+    """加载 OSCAR checkpoint 到指定 device(每 device 一次)。"""
+    from vllm_ascend import envs
+
+    key = str(device)
+    if key in _OSCAR_LOADED_DEVICES:
+        return _OSCAR_MATRICES[key]
+    ckpt_path = envs.VLLM_ASCEND_KPOOL_OSCAR_CKPT
+    if not ckpt_path:
+        raise FileNotFoundError(
+            "VLLM_ASCEND_KPOOL_OSCAR_ROTATION=1 需要同时设置 VLLM_ASCEND_KPOOL_OSCAR_CKPT=<oscar ckpt .pt>"
+        )
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    mats = {
+        int(k): v["k_rotation"].to(device=device, dtype=torch.bfloat16)
+        for k, v in ckpt["layers"].items()
+    }
+    if not mats:
+        raise ValueError(f"OSCAR checkpoint {ckpt_path} 无 layers")
+    _OSCAR_MATRICES[key] = mats
+    _OSCAR_LOADED_DEVICES.add(key)
+    return mats
+
+
+def _enable_oscar_rotation() -> bool:
+    from vllm_ascend import envs
+
+    return envs.VLLM_ASCEND_KPOOL_OSCAR_ROTATION
+
+
+def _indexer_rotate(x: torch.Tensor, layer: int) -> torch.Tensor:
+    """统一旋转入口: OSCAR 优先, 否则 Hadamard(由各自开关决定, 两者同开时 OSCAR)。"""
+    if _enable_oscar_rotation():
+        mats = _load_oscar_matrices(x.device)
+        if layer not in mats:
+            raise KeyError(f"OSCAR checkpoint 缺少 layer {layer}(可用: {sorted(mats)})")
+        return x @ mats[layer]
+    return _hadamard_rotate(x)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -806,6 +943,22 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         self.index_kpool_compress_gate = vllm_indexer.index_kpool_compress_gate
         self.k_cache: Any = vllm_indexer.k_cache
         self.tail_cache: Any = vllm_indexer.tail_cache
+        # OSCAR per-layer 旋转层号(k_cache.prefix 形如 ...layers.{N}.self_attn...)
+        _m = re.search(r"layers\.(\d+)\.", getattr(vllm_indexer.k_cache, "prefix", "") or "")
+        self._oscar_layer = int(_m.group(1)) if _m else -1
+        # 激活值抓取懒安装(必须在模块完全加载后, 故放构造函数; 类级一次性)
+        if os.environ.get("VLLM_ASCEND_INDEXER_DUMP", "0") == "1" and not getattr(
+            type(self), "_act_dump_installed", False
+        ):
+            try:
+                import importlib.util, pathlib
+                _p = pathlib.Path(__file__).parent.parent.parent / "tools/glm53flash/dump_indexer_activations/dump_indexer_activations.py"
+                _spec = importlib.util.spec_from_file_location("_idx_dump", _p)
+                _m = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_m)
+                _m.install()
+            except Exception as _e:  # noqa: BLE001 - 分析工具, 失败不影响服务
+                print(f"[indexer-dump] lazy install failed: {_e}")
         self.topk_indices_buffer: torch.Tensor | None = vllm_indexer.topk_indices_buffer
         # Reserve the shared exchange workspace at model-build time: backend
         # init runs before the memory profile on every runner, so the KV-cache
@@ -846,6 +999,26 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
     @property
     def enable_sparse_li_c8(self) -> bool:
         return self.k_cache.dtype == torch.float8_e4m3fn
+
+    @property
+    def enable_mxfp8_pseudo_quant(self) -> bool:
+        """VLLM_ASCEND_KPOOL_MXFP8_SIM=1: MXFP8 伪量化(与 MXFP4 版注入点相同)。"""
+        from vllm_ascend import envs
+
+        return envs.VLLM_ASCEND_KPOOL_MXFP8_SIM
+
+    @property
+    def enable_mxfp4_pseudo_quant(self) -> bool:
+        """VLLM_ASCEND_KPOOL_MXFP4_SIM=1: MXFP4 伪量化(A4/C4 数值验证)。
+
+        q 打分前、k(池化结果)写 cache 前各过一次 MXFP4(e2m1 + per-32 E8M0)
+        量化->反量化往返; 存储与打分算子路径不变(bf16 / fp8 均可叠加),
+        进入算子的数值与真 A4C4 计算的 fp4 可表示集合一致。
+        与 MXFP8_SIM 同时开启时本项优先。
+        """
+        from vllm_ascend import envs
+
+        return envs.VLLM_ASCEND_KPOOL_MXFP4_SIM
 
     @property
     def num_cache_tensors(self) -> int:
@@ -957,6 +1130,9 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             ) from exc
 
     def _pool_key_indexer_fp8(self, query: torch.Tensor, *args, k_descale: torch.Tensor, **kwargs):
+        if _enable_hadamard_pre() or _enable_oscar_rotation():
+            # 旋转域打分(k 已旋转存储, 点积不变); OSCAR 优先于 Hadamard
+            query = _indexer_rotate(query, self._oscar_layer)
         query, q_descale = torch_npu.npu_dynamic_quant(query, dst_type=torch.float8_e4m3fn)
         # Zero rows, including the sentinel, use a unit descale.
         q_descale.masked_fill_(q_descale == 0, 1.0)
@@ -1057,7 +1233,18 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
                 tail_key = F.layer_norm(
                     tail_key, (self.head_dim,), self._norm_weight_f32, self._norm_bias_f32, norm_eps
                 )
+            if (_enable_hadamard_pre() or _enable_oscar_rotation()) and self.enable_sparse_li_c8:
+                tail_key = _indexer_rotate(tail_key, self._oscar_layer)  # 尾池 k 同旋转域
             tail_gate = F.linear(tail_hidden, self._gate_weight).float()
+        if self.enable_mxfp4_pseudo_quant:
+            # C4 伪量化(可选 Hadamard 预处理, 往返后回原域)
+            pooled_key = _pseudo_quant_with_hadamard(pooled_key, _mxfp4_roundtrip, self._oscar_layer)
+        elif self.enable_mxfp8_pseudo_quant:
+            # C8 伪量化
+            pooled_key = _pseudo_quant_with_hadamard(pooled_key, _mxfp8_roundtrip, self._oscar_layer)
+        elif (_enable_hadamard_pre() or _enable_oscar_rotation()) and self.enable_sparse_li_c8:
+            # 真 C8 + 旋转预处理(Hadamard 或 OSCAR): k 在旋转域存储
+            pooled_key = _indexer_rotate(pooled_key, self._oscar_layer)
         self._write_keypool_caches(
             tail_cache,
             indexer_cache,
@@ -1097,6 +1284,10 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         else:
             scoring = indexer_metadata
             output_buffer = self.topk_indices_buffer
+        if self.enable_mxfp4_pseudo_quant:
+            q_values = _pseudo_quant_with_hadamard(q_values, _mxfp4_roundtrip, self._oscar_layer)  # A4 伪量化
+        elif self.enable_mxfp8_pseudo_quant:
+            q_values = _pseudo_quant_with_hadamard(q_values, _mxfp8_roundtrip, self._oscar_layer)  # A8 伪量化
         if quantized:
             assert indexer_scale_cache is not None
             query = q_values
