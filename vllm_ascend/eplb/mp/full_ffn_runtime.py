@@ -167,21 +167,31 @@ class HCCLCommBackend(CommBackend):
 class MPRuntime:
     """Per-rank bridge: controller <-> GS32ExpertWeights layers."""
 
-    def __init__(self, options, layers, *, ep_size: int, ep_rank: int, quant_types, comm=None):
+    def __init__(self, options, layers, *, ep_size: int, ep_rank: int, quant_types, comm=None,
+                 plan_only: bool = False):
         from .controller import MPEplbController
 
         first = next(iter(layers.values()))
         self.layers = layers
         self.controller = MPEplbController(
             options,
-            num_experts=first.num_experts,
+            num_experts=first.num_experts * ep_size,
             ep_size=ep_size,
             ep_rank=ep_rank,
             quant_types=quant_types,
             num_layers=len(layers),
             comm=comm,
+            plan_only=plan_only,
         )
         self.controller.executor.device_index_writer = self._sync_device_indexes
+        # Local-slot -> global-expert mapping per layer (identical across
+        # layers under the linear baseline; rebuilt on commit via the host
+        # mirror). Needed because moe_load is indexed by LOCAL slot while the
+        # controller's window is keyed by GLOBAL logical expert id.
+        self._local_to_global: dict[int, list[int]] = {
+            layer: [g for g, _s in sorted(weights.expert_slots.items(), key=lambda kv: kv[1])]
+            for layer, weights in layers.items()
+        }
 
     def _sync_device_indexes(self, rank: int, quant_type: str | None = None) -> None:
         """Rebuild device index tensors from the host placement mirror (P2)."""
@@ -201,13 +211,49 @@ class MPRuntime:
                     weights.resident_mask[expert] = True
 
     def on_step_end(self) -> None:
-        """Feed per-layer logical row counters, then advance the slow ring."""
+        """Feed per-layer logical row counters, then advance the slow ring.
+
+        Local ``moe_load`` rows are indexed by LOCAL slot; translate to GLOBAL
+        logical expert ids via ``expert_slots`` before recording (the original
+        ``enumerate`` version wrongly reported every rank's experts as 0..N).
+        """
         window = {}
         for layer, weights in self.layers.items():
             if weights.moe_load is None:
                 continue
-            window[layer] = weights.moe_load.tolist()
+            rows = weights.moe_load.tolist()
+            global_ids = self._local_to_global[layer]
+            window[layer] = {global_ids[i]: rows[i] for i in range(len(rows)) if i < len(global_ids)}
             weights.moe_load.zero_()
         for layer, rows in window.items():
-            self.controller.record_step({expert: {layer: count} for expert, count in enumerate(rows)})
+            self.controller.record_step({expert: {layer: count} for expert, count in rows.items()})
+        self.controller.on_step_end()
+
+    def stacked_local_loads(self) -> "torch.Tensor | None":
+        """Stack every layer's local moe_load into one [num_layers, local] tensor.
+
+        Batches the per-layer device buffers so the driver can ship the whole
+        window with a single collective instead of one sync per layer.
+        Returns None when accounting is disabled (moe_load is None).
+        """
+        bufs = [w.moe_load for w in self.layers.values() if w.moe_load is not None]
+        if not bufs:
+            return None
+        stacked = torch.stack(bufs)
+        for w in self.layers.values():
+            if w.moe_load is not None:
+                w.moe_load.zero_()
+        return stacked
+
+    def feed_global_window(self, global_rows: "list[list[int]]") -> None:
+        """Feed one stacked window of GLOBAL per-expert rows into the controller.
+
+        ``global_rows[layer][global_expert] = rows`` — typically produced by
+        all-gathering ``stacked_local_loads()`` across the EP group.
+        """
+        for layer, rows in enumerate(global_rows):
+            self.controller.record_step(
+                {expert: {layer: count} for expert, count in enumerate(rows) if count > 0}
+            )
+        self.controller.on_step_begin()
         self.controller.on_step_end()

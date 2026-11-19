@@ -322,6 +322,12 @@ class NPUModelRunner(GPUModelRunner):
         )
         self._quantization_validity_pending = False
 
+        # MP-EPLB (plan-only rollout): create the slow-ring driver when
+        # additional_config.vq2a8.eplb selects a dynamic mode.
+        from vllm_ascend.worker.v2.eplb_mp_driver import create_mp_eplb_driver
+
+        self._mp_eplb_driver = create_mp_eplb_driver(self)
+
     def _check_quantization_validity(self) -> None:
         from vllm_ascend.ops.fused_moe.vq2a8_gs32 import check_quantization_validity
 
@@ -829,6 +835,16 @@ class NPUModelRunner(GPUModelRunner):
             self.execute_model_state = state._replace(
                 input_batch=replace(state.input_batch, num_reqs=len(scheduler_output.num_scheduled_tokens))
             )
+
+        # MP-EPLB slow ring: one collective flush per execute_model call.
+        # MUST run on every rank for every step (including dummy/profile):
+        # flush contains an EP-group all_gather, and DP ranks may disagree on
+        # dummy_run — skipping on a subset deadlocks the collective. Dummy
+        # load pollution is smoothed by the controller's EWMA window.
+        driver = getattr(self, "_mp_eplb_driver", None)
+        if driver is not None:
+            driver.flush()
+
         return output
 
     def _maybe_send_draft_kv(self, scheduler_output: SchedulerOutput) -> None:

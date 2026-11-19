@@ -21,12 +21,15 @@ needs; both are no-ops unless ``enabled``.
 
 from __future__ import annotations
 
+
 from .config import MPEplbOptions
 from .cost_model import CostTable, amortized_unit_cost
 from .migrator import InMemoryCommBackend, MigrationExecutor
 from .placement import BankSlotTable, build_linear_baseline
 from .planner import ReplicaAllocator, TCSBPlanner
 from .split_table import SplitTable
+
+from vllm.logger import logger
 
 PHASE_HEAT = "heat"
 PHASE_PLAN = "plan"
@@ -47,9 +50,15 @@ class MPEplbController:
         layer_load_hook=None,
         comm=None,
         cost_table: CostTable | None = None,
+        plan_only: bool = False,
     ):
         self.options = options
         self.enabled = options.enabled
+        # plan_only: run accounting + planning but never touch placements or
+        # device indexes — the migrate phase is logged and skipped. Used to
+        # validate the slow ring on production traffic before enabling real
+        # weight migration.
+        self.plan_only = plan_only
         self.num_experts = num_experts
         self.ep_size = ep_size
         self.ep_rank = ep_rank
@@ -174,6 +183,8 @@ class MPEplbController:
         if not (self.enabled and self.options.dynamic):
             return
         if self.phase == PHASE_MIGRATE:
+            if self.plan_only:
+                return
             layer = self._migrate_layer
             moves = self._plan_moves_by_layer.get(layer, [])
             ops = self.executor.prepare_layer(layer, moves, self.options.staging_buffers)
@@ -186,6 +197,18 @@ class MPEplbController:
         if self.phase == PHASE_HEAT and self._heat_done():
             self._run_planning()
         elif self.phase == PHASE_MIGRATE:
+            if self.plan_only:
+                # Log the would-be migration and finish the cycle without
+                # touching placements/device indexes.
+                total_moves = sum(len(m) for m in self._plan_moves_by_layer.values())
+                logger.info(
+                    "[mp-eplb] cycle=%d plan-only: would migrate %d move(s) across %d layer(s), "
+                    "expected_cost=%s",
+                    self.cycle_count, total_moves, self.num_layers,
+                    self.last_expected_cost,
+                )
+                self._finish_cycle_plan_only()
+                return
             self.executor.commit_layer(self._migrate_layer)
             self._migrate_layer += 1
             if self._migrate_layer >= self.num_layers:
@@ -230,6 +253,24 @@ class MPEplbController:
             self._plan_moves_by_layer[index % self.num_layers].append(move)
         self._migrate_layer = 0
         self.phase = PHASE_MIGRATE
+        # Observability for the slow ring: load skew + plan outcome per cycle.
+        nonzero = {e: v for e, v in loads.items() if v > 0}
+        if nonzero:
+            top = sorted(nonzero.items(), key=lambda kv: -kv[1])[:5]
+            total_load = sum(loads.values())
+            rank_loads = [0.0] * self.ep_size
+            for expert, v in nonzero.items():
+                rank_loads[expert // (self.num_experts // self.ep_size)] += v
+            logger.info(
+                "[mp-eplb] cycle=%d planned: experts_active=%d/%d total_rows=%.0f "
+                "rank_loads=%s top5_experts=%s moves=%d expected_cost=%s",
+                self.cycle_count, len(nonzero), self.num_experts, total_load,
+                [f"{v:.0f}" for v in rank_loads],
+                [(e, f"{v:.0f}") for e, v in top],
+                len(all_moves), self.last_expected_cost,
+            )
+        else:
+            logger.info("[mp-eplb] cycle=%d planned: empty window (no load observed)", self.cycle_count)
 
     def _finish_cycle(self) -> None:
         # Swap the host mirror to the committed working copy is already done
@@ -237,6 +278,20 @@ class MPEplbController:
         # the EWMA snapshot (doc C.3 / E1: the only place weights change).
         for split in self.split_tables.values():
             split.refresh_weights(self._rank_shares_snapshot())
+        self._window_rows = {e: {} for e in range(self.num_experts)}
+        self._window_launches = {e: 0 for e in range(self.num_experts)}
+        self.step = 0
+        self.phase = PHASE_HEAT
+        self.cycle_count += 1
+
+    def _finish_cycle_plan_only(self) -> None:
+        """Reset the window and phase without applying any placement change.
+
+        Placements stay at the linear baseline, so the next planning cycle
+        observes the same starting state (identical input -> identical plan
+        across ranks, which also keeps ranks consistent for a later switch
+        from plan_only to real migration).
+        """
         self._window_rows = {e: {} for e in range(self.num_experts)}
         self._window_launches = {e: 0 for e in range(self.num_experts)}
         self.step = 0

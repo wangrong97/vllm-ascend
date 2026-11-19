@@ -43,6 +43,9 @@ def dequant_vq2(packed, codebooks, perm, out_dim_scale, device):
     bits32 = (out_dim_scale.view(torch.int64) & 0xFFFFFFFF).to(torch.int32)
     scale = bits32.view(torch.float32).to(device)
     W *= scale[:, None]
+    if perm.shape[0] != W.shape[1]:
+        # noperm-export: 恒等 perm, W 列数 = packed.shape[1] * 16 (通常 4096)
+        perm = torch.arange(W.shape[1], dtype=torch.int64, device=device)
     W_out = torch.empty_like(W); W_out[:, perm.to(device).to(torch.int64)] = W
     return W_out
 
@@ -92,7 +95,8 @@ def main():
         shard = next(iter(fields.values())); ts = tensors_of(shard)
         pre = f"layers.{L}.ffn.experts.{E}.{P}."
         if "packed_indices" in fields:
-            W = dequant_vq2(ts[pre + "packed_indices"], ts[pre + "codebooks"], ts[pre + "perm"], ts[pre + "out_dim_scale"], device)
+            _perm = ts.get(pre + "perm", torch.arange(256, dtype=torch.int64, device=device))
+            W = dequant_vq2(ts[pre + "packed_indices"], ts[pre + "codebooks"], _perm, ts[pre + "out_dim_scale"], device)
         else:
             W = dequant_mxfp4(ts[pre + "weight"], ts[pre + "scale"], device)
         W = W.to(torch.bfloat16).cpu()
@@ -112,7 +116,9 @@ def main():
     if not args.limit:
         nr_out = {}
         for key, shard in sorted(non_routed.items()):
-            nr_out[rename_non_routed(key)] = tensors_of(shard)[key].to(torch.bfloat16).cpu()
+            # 原样保留 dtype(F8_E4M3/E8M0/F32): msmodelslim auto_dequant 期望 FP8 原格式,
+            # 转 bf16 会落入 decode_fp4 分支导致 shape 崩(16384 vs 1024, 2026-11-18 教训)
+            nr_out[rename_non_routed(key)] = tensors_of(shard)[key].contiguous().cpu()
         save_file(nr_out, os.path.join(args.output, "non_routed.safetensors"), metadata={"format": "pt"})
         for k in nr_out: new_idx[k] = "non_routed.safetensors"
     json.dump({"metadata": {"total_size": 0}, "weight_map": new_idx},

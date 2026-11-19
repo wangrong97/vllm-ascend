@@ -153,7 +153,15 @@ def prepare_vq2a8_dspark_config(config: VllmConfig) -> VllmConfig:
     quant_config = getattr(config, "quant_config", None)
     validate_runtime = getattr(quant_config, "validate_runtime_config", None)
     if getattr(quant_config, "is_gs32", False) and callable(validate_runtime):
-        validate_runtime(config)
+        if not getattr(quant_config, "layers", None):
+            # Speculator construction runs during worker init_device, before
+            # the target model constructor calls bind_checkpoint. Bind here so
+            # the inventory is ready; the first full validate_runtime happens
+            # later on the model-construction path (get_quant_method), which
+            # owns the startup-state binding for this process. Validating here
+            # instead would pin the startup state to this speculator config
+            # object and trip require_unchanged at model build time.
+            quant_config.bind_checkpoint(config.model_config)
     else:
         validate_vq2a8_dspark_config(config)
     # Lazy worker-side import: this module is also used by the CPU preflight.
